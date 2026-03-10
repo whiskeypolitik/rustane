@@ -1,0 +1,6 @@
+[package]
+name = "metal-decode"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

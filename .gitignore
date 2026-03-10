@@ -1,0 +1,6 @@
+/target
+dev/
+models/
+*.gguf
+.env
+.DS_Store

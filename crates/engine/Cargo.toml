@@ -1,0 +1,8 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ane-bridge = { path = "../ane-bridge" }
+metal-decode = { path = "../metal-decode" }
