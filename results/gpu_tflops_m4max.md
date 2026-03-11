@@ -19,15 +19,17 @@
 ## Key Findings
 
 - **Peak measured: 14.74 TFLOPS** (fp16, 4K×4K matmul)
-- **Apple claimed: ~36.86 TFLOPS** (M4 Max fp16 peak)
-- **Utilization: ~40%** of claimed peak — consistent with SYNTHESIS.md's ~29% MFU estimate for MLX (that was for sustained training, this is pure matmul)
-- **fp32 nearly matches fp16**: 13.07 vs 14.74 — only 11% faster in fp16, suggesting matmul is memory-bandwidth bound at 4K
-- **Training-relevant sizes underperform**: 7-9 TFLOPS at gpt_karpathy dimensions — smaller matrices don't saturate the GPU
+- ~~Apple claimed: ~36.86 TFLOPS (M4 Max fp16 peak)~~
+- **CORRECTION (2026-03-11):** Apple's 36.86T assumes fp16 runs at 2x fp32. **M4 GPU does NOT have fp16 double rate.** Real fp32 peak is ~18.4T. fp16 and fp32 have identical ALU throughput on M1-M4.
+- **Actual utilization: ~80%** of real 18.4T peak — this is good!
+- **fp32 nearly matches fp16**: 13.07 vs 14.74 — only 12% faster. This proves fp16≠2x on M4 (the 12% gain is from reduced memory traffic, not faster ALUs).
+- **Training-relevant sizes**: 7-9 TFLOPS at gpt_karpathy dimensions — smaller matrices don't saturate the GPU
 - **8K peak similar to 4K**: No significant scaling benefit going larger, confirms 4K already saturates compute
 
 ## Implications for Rustane
 
-1. GPU at training-relevant sizes: ~8 TFLOPS fp16
-2. ANE target (from papers): ~19 TFLOPS fp16 — if true, ANE would be **2.4x faster** at the ops that matter
-3. The 40% MFU ceiling is real — Apple's peak numbers are theoretical, not achievable
-4. This confirms the dual-accelerator strategy: even at lower utilization, ANE trains while GPU is free for inference
+1. **GPU is already well-utilized at ~80% MFU.** Custom Metal shaders could gain 10-15% more.
+2. **25 TFLOPS is physically impossible on M4 Max** (would need 135% of real peak). Revise targets.
+3. ANE with fused mega-kernels (~17-19T) could match or exceed GPU at training-relevant matmul sizes (7-9T)
+4. Dual-accelerator strategy confirmed: ANE trains while GPU is free for inference
+5. **Note:** M5 (Apple10 GPU) genuinely doubles fp16 throughput — our Metal shaders will benefit automatically

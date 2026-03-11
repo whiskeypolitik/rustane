@@ -4,7 +4,8 @@
 
 | Date | Phase | Test | Result | Log |
 |------|-------|------|--------|-----|
-| 2026-03-10 | 0.5.1 | GPU TFLOPS (MLX matmul) | Peak 14.74 TFLOPS fp16, 40% of Apple's claimed 36.86 | [gpu_tflops_m4max.md](gpu_tflops_m4max.md) |
+| 2026-03-11 | — | Performance analysis & optimization | GPU at 80% real MFU (not 40%). ANE needs fused kernels (32+ ops) for 19T. | [performance_analysis.md](performance_analysis.md) |
+| 2026-03-10 | 0.5.1 | GPU TFLOPS (MLX matmul) | Peak 14.74 TFLOPS fp16, **80% of real 18.4T peak** (Apple's 36.86T claim is misleading) | [gpu_tflops_m4max.md](gpu_tflops_m4max.md) |
 | 2026-03-10 | 0 | ANE crate source analysis | IOSurface layout matches, weight blobs work, 1 gap (write helpers) | [phase0_analysis.md](phase0_analysis.md) |
 | 2026-03-10 | 0 | Phase 0 verification (5 tests) | ALL PASS — multi-blob compile, ANE eval (1+1)*2=4.0, IOSurface roundtrip, RAII guards, interleaved layout | tests/phase0_verify.rs |
 | 2026-03-10 | 0.5.2 | ANE TFLOPS (conv1x1) | Peak 7.3 TFLOPS at 768→3072 w=512. Single kernels = 38% of Orion's 19 TFLOPS claim. | [ane_tflops_m4max.md](ane_tflops_m4max.md) |
