@@ -4,7 +4,7 @@
 //! Exit criteria: loss decreases over 10 steps.
 
 use crate::cpu::adam::{self, AdamConfig};
-use crate::layer::{self, CompiledKernels, LayerWeights, LayerGrads, LayerScratch};
+use crate::layer::{self, CompiledKernels, LayerWeights, LayerGrads};
 use crate::model::ModelConfig;
 
 /// Adam optimizer state for one layer's weights.
@@ -73,8 +73,7 @@ pub fn train_step(
     let n = dim * seq;
 
     // Forward
-    let mut scratch = LayerScratch::allocate(cfg);
-    let (x_next, cache) = layer::forward(cfg, kernels, weights, x, &mut scratch);
+    let (x_next, cache) = layer::forward(cfg, kernels, weights, x);
 
     // MSE loss = mean(x_next²)
     let loss: f32 = x_next.iter().map(|v| v * v).sum::<f32>() / n as f32;
@@ -88,7 +87,7 @@ pub fn train_step(
 
     // Backward
     grads.zero_out();
-    let _dx = layer::backward(cfg, kernels, weights, &cache, &dy, grads, &mut scratch);
+    let _dx = layer::backward(cfg, kernels, weights, &cache, &dy, grads);
 
     // Update weights
     update_weights(weights, grads, opt, t, adam_cfg);

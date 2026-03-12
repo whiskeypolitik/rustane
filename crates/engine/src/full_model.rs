@@ -4,7 +4,7 @@
 //! Tied embedding weights (embedding table = output projection transposed).
 
 use crate::cpu::{rmsnorm, cross_entropy, embedding, vdsp};
-use crate::layer::{self, CompiledKernels, LayerWeights, LayerGrads, ForwardCache, LayerScratch};
+use crate::layer::{self, CompiledKernels, LayerWeights, LayerGrads, ForwardCache};
 use crate::model::ModelConfig;
 use crate::training::LayerOptState;
 use crate::cpu::adam::{self, AdamConfig};
@@ -156,10 +156,9 @@ pub fn forward(
     }
 
     // 2. Forward through NL layers
-    let mut scratch = LayerScratch::allocate(cfg);
     let mut caches = Vec::with_capacity(cfg.nlayers);
     for l in 0..cfg.nlayers {
-        let (x_next, cache) = layer::forward(cfg, kernels, &weights.layers[l], &x, &mut scratch);
+        let (x_next, cache) = layer::forward(cfg, kernels, &weights.layers[l], &x);
         caches.push(cache);
         x = x_next;
     }
@@ -309,9 +308,8 @@ pub fn backward(
     }
 
     // 5. Backward through NL layers (reverse order)
-    let mut scratch = LayerScratch::allocate(cfg);
     for l in (0..cfg.nlayers).rev() {
-        dy = layer::backward(cfg, kernels, &weights.layers[l], &fwd.caches[l], &dy, &mut grads.layers[l], &mut scratch);
+        dy = layer::backward(cfg, kernels, &weights.layers[l], &fwd.caches[l], &dy, &mut grads.layers[l]);
     }
 
     // 6. Input embedding backward: scatter-add dy into dembed
@@ -522,9 +520,8 @@ pub fn forward_losses(
     }
 
     // Layers
-    let mut scratch = LayerScratch::allocate(cfg);
     for l in 0..cfg.nlayers {
-        let (x_next, _) = layer::forward(cfg, kernels, &weights.layers[l], &x, &mut scratch);
+        let (x_next, _) = layer::forward(cfg, kernels, &weights.layers[l], &x);
         x = x_next;
     }
 

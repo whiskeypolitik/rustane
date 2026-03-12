@@ -328,21 +328,23 @@ fn random_vec(n: usize, scale: f32) -> Vec<f32> {
 /// Stage activations into IOSurface spatial dimension.
 /// `dst` is [channels * sp_width], `src` is [channels * src_width].
 /// Writes src at spatial offset `sp_offset`.
+/// Uses copy_from_slice for vectorized memcpy on inner dimension.
 fn stage_spatial(dst: &mut [f32], channels: usize, sp_width: usize, src: &[f32], src_width: usize, sp_offset: usize) {
     for c in 0..channels {
-        for w in 0..src_width {
-            dst[c * sp_width + sp_offset + w] = src[c * src_width + w];
-        }
+        let d = c * sp_width + sp_offset;
+        let s = c * src_width;
+        dst[d..d + src_width].copy_from_slice(&src[s..s + src_width]);
     }
 }
 
 /// Read a slice of channels from ANE output buffer into a pre-allocated destination.
 /// No-alloc version of the former `read_channels`.
+/// Uses copy_from_slice for vectorized memcpy on inner dimension.
 fn read_channels_into(src: &[f32], _total_ch: usize, seq: usize, ch_start: usize, ch_count: usize, dst: &mut [f32]) {
     for c in 0..ch_count {
-        for s in 0..seq {
-            dst[c * seq + s] = src[(ch_start + c) * seq + s];
-        }
+        let d = c * seq;
+        let s = (ch_start + c) * seq;
+        dst[d..d + seq].copy_from_slice(&src[s..s + seq]);
     }
 }
 
@@ -350,13 +352,11 @@ fn read_channels_into(src: &[f32], _total_ch: usize, seq: usize, ch_start: usize
 
 /// Run forward pass for one transformer layer.
 /// Returns (x_next, cache) where x_next is [DIM * SEQ].
-/// `scratch` is a pre-allocated staging buffer reused across all kernel calls.
 pub fn forward(
     cfg: &ModelConfig,
     kernels: &CompiledKernels,
     weights: &LayerWeights,
     x: &[f32],
-    scratch: &mut LayerScratch,
 ) -> (Vec<f32>, ForwardCache) {
     let dim = cfg.dim;
     let seq = cfg.seq;
@@ -376,18 +376,19 @@ pub fn forward(
         for c in 0..dim { xnorm[c * seq + s] = out_pos[c]; }
     }
 
-    // 2. Stage sdpaFwd input: [1, DIM, 1, SEQ+Q_DIM+KV_DIM+KV_DIM]
+    // 2. Stage sdpaFwd directly into IOSurface (skip scratch buffer)
     let sdpa_sp = sdpa_fwd::input_spatial_width(cfg);
-    let sdpa_stage_len = dim * sdpa_sp;
-    scratch.stage[..sdpa_stage_len].fill(0.0);
-    stage_spatial(&mut scratch.stage[..sdpa_stage_len], dim, sdpa_sp, &xnorm, seq, 0);
-    stage_spatial(&mut scratch.stage[..sdpa_stage_len], dim, sdpa_sp, &weights.wq, q_dim, seq);
-    stage_spatial(&mut scratch.stage[..sdpa_stage_len], dim, sdpa_sp, &weights.wk, kv_dim, seq + q_dim);
-    stage_spatial(&mut scratch.stage[..sdpa_stage_len], dim, sdpa_sp, &weights.wv, kv_dim, seq + q_dim + kv_dim);
-
-    // 3. Run sdpaFwd (ANE) — reuse pre-allocated buffers
     let sdpa_out_ch = sdpa_fwd::output_channels(cfg);
-    kernels.bufs.sdpa_fwd_in.copy_from_f32(&scratch.stage[..sdpa_stage_len]);
+    {
+        let mut locked = kernels.bufs.sdpa_fwd_in.as_f32_slice_mut();
+        let buf = &mut *locked;
+        stage_spatial(buf, dim, sdpa_sp, &xnorm, seq, 0);
+        stage_spatial(buf, dim, sdpa_sp, &weights.wq, q_dim, seq);
+        stage_spatial(buf, dim, sdpa_sp, &weights.wk, kv_dim, seq + q_dim);
+        stage_spatial(buf, dim, sdpa_sp, &weights.wv, kv_dim, seq + q_dim + kv_dim);
+    }
+
+    // 3. Run sdpaFwd (ANE)
     kernels.sdpa_fwd.run(&[&kernels.bufs.sdpa_fwd_in], &[&kernels.bufs.sdpa_fwd_out]).expect("ANE eval failed");
 
     // Extract: attn_out[Q_DIM,SEQ], Q_rope[Q_DIM,SEQ], K_rope[KV_DIM,SEQ], V[KV_DIM,SEQ]
@@ -403,15 +404,16 @@ pub fn forward(
         read_channels_into(&locked, sdpa_out_ch, seq, 2 * q_dim + kv_dim, kv_dim, &mut v);
     }
 
-    // 4. Stage woFwd input: [1, Q_DIM, 1, SEQ+DIM]
+    // 4. Stage woFwd directly into IOSurface
     let wo_sp = dyn_matmul::spatial_width(seq, dim);
-    let wo_stage_len = q_dim * wo_sp;
-    scratch.stage[..wo_stage_len].fill(0.0);
-    stage_spatial(&mut scratch.stage[..wo_stage_len], q_dim, wo_sp, &attn_out, seq, 0);
-    stage_spatial(&mut scratch.stage[..wo_stage_len], q_dim, wo_sp, &weights.wo, dim, seq);
+    {
+        let mut locked = kernels.bufs.wo_fwd_in.as_f32_slice_mut();
+        let buf = &mut *locked;
+        stage_spatial(buf, q_dim, wo_sp, &attn_out, seq, 0);
+        stage_spatial(buf, q_dim, wo_sp, &weights.wo, dim, seq);
+    }
 
-    // 5. Run woFwd (ANE) — reuse pre-allocated buffers
-    kernels.bufs.wo_fwd_in.copy_from_f32(&scratch.stage[..wo_stage_len]);
+    // 5. Run woFwd (ANE)
     kernels.wo_fwd.run(&[&kernels.bufs.wo_fwd_in], &[&kernels.bufs.wo_fwd_out]).expect("ANE eval failed");
 
     // Read o_out directly from output IOSurface
@@ -422,11 +424,9 @@ pub fn forward(
     }
 
     // 6. Residual + RMSNorm2 (CPU)
-    // x2 = x + alpha * o_out
+    // x2 = x + alpha * o_out  (vDSP: vsma = o_out * alpha + x)
     let mut x2 = vec![0.0f32; dim * seq];
-    for i in 0..dim * seq {
-        x2[i] = x[i] + alpha * o_out[i];
-    }
+    vdsp::vsma(&o_out, alpha, x, &mut x2);
     let mut x2norm = vec![0.0f32; dim * seq];
     let mut rms_inv2 = vec![0.0f32; seq];
     // Reuse scratch buffers from RMSNorm1 above
@@ -436,19 +436,20 @@ pub fn forward(
         for c in 0..dim { x2norm[c * seq + s] = out_pos[c]; }
     }
 
-    // 7. Stage ffnFused input: [1, DIM, 1, 2*SEQ+3*HIDDEN]
+    // 7. Stage ffnFused directly into IOSurface
     let ffn_sp = ffn_fused::input_spatial_width(cfg);
-    let ffn_stage_len = dim * ffn_sp;
-    scratch.stage[..ffn_stage_len].fill(0.0);
-    stage_spatial(&mut scratch.stage[..ffn_stage_len], dim, ffn_sp, &x2norm, seq, 0);
-    stage_spatial(&mut scratch.stage[..ffn_stage_len], dim, ffn_sp, &x2, seq, seq);
-    stage_spatial(&mut scratch.stage[..ffn_stage_len], dim, ffn_sp, &weights.w1, hidden, 2 * seq);
-    stage_spatial(&mut scratch.stage[..ffn_stage_len], dim, ffn_sp, &weights.w3, hidden, 2 * seq + hidden);
-    stage_spatial(&mut scratch.stage[..ffn_stage_len], dim, ffn_sp, &weights.w2, hidden, 2 * seq + 2 * hidden);
-
-    // 8. Run ffnFused (ANE) — reuse pre-allocated buffers
     let ffn_out_ch = ffn_fused::output_channels(cfg);
-    kernels.bufs.ffn_fused_in.copy_from_f32(&scratch.stage[..ffn_stage_len]);
+    {
+        let mut locked = kernels.bufs.ffn_fused_in.as_f32_slice_mut();
+        let buf = &mut *locked;
+        stage_spatial(buf, dim, ffn_sp, &x2norm, seq, 0);
+        stage_spatial(buf, dim, ffn_sp, &x2, seq, seq);
+        stage_spatial(buf, dim, ffn_sp, &weights.w1, hidden, 2 * seq);
+        stage_spatial(buf, dim, ffn_sp, &weights.w3, hidden, 2 * seq + hidden);
+        stage_spatial(buf, dim, ffn_sp, &weights.w2, hidden, 2 * seq + 2 * hidden);
+    }
+
+    // 8. Run ffnFused (ANE)
     kernels.ffn_fused.run(&[&kernels.bufs.ffn_fused_in], &[&kernels.bufs.ffn_fused_out]).expect("ANE eval failed");
 
     // Extract: x_next[DIM,SEQ], h1[HIDDEN,SEQ], h3[HIDDEN,SEQ], gate[HIDDEN,SEQ]
@@ -477,7 +478,6 @@ pub fn forward(
 /// Run backward pass for one transformer layer.
 /// `dy` is gradient of loss w.r.t. layer output [DIM * SEQ].
 /// Returns `dx` (gradient w.r.t. layer input) and fills `grads`.
-/// `scratch` is a pre-allocated staging buffer reused across all kernel calls.
 pub fn backward(
     cfg: &ModelConfig,
     kernels: &CompiledKernels,
@@ -485,7 +485,6 @@ pub fn backward(
     cache: &ForwardCache,
     dy: &[f32],
     grads: &mut LayerGrads,
-    scratch: &mut LayerScratch,
 ) -> Vec<f32> {
     let dim = cfg.dim;
     let seq = cfg.seq;
@@ -496,19 +495,18 @@ pub fn backward(
     let hd = cfg.hd;
     let alpha = 1.0 / (2.0 * cfg.nlayers as f32).sqrt();
 
-    // ── 1. Scale dy for FFN residual ──
+    // ── 1. Scale dy for FFN residual (vDSP vectorized) ──
     let mut dffn = vec![0.0f32; dim * seq];
-    for i in 0..dim * seq {
-        dffn[i] = dy[i] * alpha;
-    }
+    vdsp::vsmul(dy, alpha, &mut dffn);
 
     // ── 2. ffnBwdW2t(ANE): dffn @ W2 → dsilu_raw [HIDDEN, SEQ] ──
     let w2t_sp = dyn_matmul::spatial_width(seq, hidden);
-    let w2t_stage_len = dim * w2t_sp;
-    scratch.stage[..w2t_stage_len].fill(0.0);
-    stage_spatial(&mut scratch.stage[..w2t_stage_len], dim, w2t_sp, &dffn, seq, 0);
-    stage_spatial(&mut scratch.stage[..w2t_stage_len], dim, w2t_sp, &weights.w2, hidden, seq);
-    kernels.bufs.ffn_bwd_w2t_in.copy_from_f32(&scratch.stage[..w2t_stage_len]);
+    {
+        let mut locked = kernels.bufs.ffn_bwd_w2t_in.as_f32_slice_mut();
+        let buf = &mut *locked;
+        stage_spatial(buf, dim, w2t_sp, &dffn, seq, 0);
+        stage_spatial(buf, dim, w2t_sp, &weights.w2, hidden, seq);
+    }
     kernels.ffn_bwd_w2t.run(&[&kernels.bufs.ffn_bwd_w2t_in], &[&kernels.bufs.ffn_bwd_w2t_out]).expect("ANE eval failed");
 
     // Read dsilu_raw directly from output IOSurface
@@ -532,25 +530,31 @@ pub fn backward(
         dh1[i] = dsilu_raw[i] * cache.h3[i] * silu_deriv;
     }
 
-    // ── 4. dW2, dW1, dW3 accumulation (CPU, synchronous) ──
-    // dW2 += dffn^T @ gate  (but actually: dW2[dim,hidden] += dffn[dim,seq] @ gate[hidden,seq]^T)
-    // In our layout: dW2[d * hidden + h] += sum_s(dffn[d * seq + s] * gate[h * seq + s])
-    accumulate_dw(&dffn, dim, &cache.gate, hidden, seq, &mut grads.dw2);
-    // dW1[d * hidden + h] += sum_s(dh1[h * seq + s] * xnorm[d * seq + s])
-    accumulate_dw(&cache.x2norm, dim, &dh1, hidden, seq, &mut grads.dw1);
-    accumulate_dw(&cache.x2norm, dim, &dh3, hidden, seq, &mut grads.dw3);
-
-    // ── 5. ffnBwdW13t(ANE): dh1@W1^T + dh3@W3^T → dx_ffn [DIM, SEQ] ──
+    // ── 4. Stage ffnBwdW13t directly into IOSurface, then overlap dW with ANE ──
     let w13t_sp = dyn_matmul::dual_spatial_width(seq, dim);
-    let w13t_stage_len = hidden * w13t_sp;
-    scratch.stage[..w13t_stage_len].fill(0.0);
-    stage_spatial(&mut scratch.stage[..w13t_stage_len], hidden, w13t_sp, &dh1, seq, 0);
-    stage_spatial(&mut scratch.stage[..w13t_stage_len], hidden, w13t_sp, &dh3, seq, seq);
-    // W1 transposed: [DIM, HIDDEN] → pack as [HIDDEN, DIM] weights
-    stage_spatial_transposed(&mut scratch.stage[..w13t_stage_len], hidden, w13t_sp, &weights.w1, dim, hidden, 2 * seq);
-    stage_spatial_transposed(&mut scratch.stage[..w13t_stage_len], hidden, w13t_sp, &weights.w3, dim, hidden, 2 * seq + dim);
-    kernels.bufs.ffn_bwd_w13t_in.copy_from_f32(&scratch.stage[..w13t_stage_len]);
-    kernels.ffn_bwd_w13t.run(&[&kernels.bufs.ffn_bwd_w13t_in], &[&kernels.bufs.ffn_bwd_w13t_out]).expect("ANE eval failed");
+    {
+        let mut locked = kernels.bufs.ffn_bwd_w13t_in.as_f32_slice_mut();
+        let buf = &mut *locked;
+        stage_spatial(buf, hidden, w13t_sp, &dh1, seq, 0);
+        stage_spatial(buf, hidden, w13t_sp, &dh3, seq, seq);
+        stage_spatial_transposed(buf, hidden, w13t_sp, &weights.w1, dim, hidden, 2 * seq);
+        stage_spatial_transposed(buf, hidden, w13t_sp, &weights.w3, dim, hidden, 2 * seq + dim);
+    }
+
+    // ── 5. ASYNC: ANE ffnBwdW13t || CPU dW2+dW1+dW3 accumulation ──
+    std::thread::scope(|s| {
+        let ane_handle = s.spawn(|| {
+            kernels.ffn_bwd_w13t.run(
+                &[&kernels.bufs.ffn_bwd_w13t_in],
+                &[&kernels.bufs.ffn_bwd_w13t_out],
+            ).expect("ANE eval failed");
+        });
+        // CPU: dW accumulation while ANE runs (no data race — different memory)
+        accumulate_dw(&dffn, dim, &cache.gate, hidden, seq, &mut grads.dw2);
+        accumulate_dw(&cache.x2norm, dim, &dh1, hidden, seq, &mut grads.dw1);
+        accumulate_dw(&cache.x2norm, dim, &dh3, hidden, seq, &mut grads.dw3);
+        ane_handle.join().expect("ANE thread panicked");
+    });
 
     // Read dx_ffn directly from output IOSurface
     let mut dx_ffn = vec![0.0f32; dim * seq];
@@ -577,20 +581,18 @@ pub fn backward(
         dx2[i] += dy[i];
     }
 
-    // ── 7. Scale dx2 for attention residual ──
+    // ── 7. Scale dx2 for attention residual (vDSP vectorized) ──
     let mut dx2_scaled = vec![0.0f32; dim * seq];
-    for i in 0..dim * seq {
-        dx2_scaled[i] = dx2[i] * alpha;
-    }
+    vdsp::vsmul(&dx2, alpha, &mut dx2_scaled);
 
     // ── 8. wotBwd(ANE): dx2_scaled @ Wo → da [Q_DIM, SEQ] ──
     let wot_sp = dyn_matmul::spatial_width(seq, q_dim);
-    let wot_stage_len = dim * wot_sp;
-    scratch.stage[..wot_stage_len].fill(0.0);
-    stage_spatial(&mut scratch.stage[..wot_stage_len], dim, wot_sp, &dx2_scaled, seq, 0);
-    // Wo: [Q_DIM, DIM] → for wotBwd we need [DIM, Q_DIM] weights → transpose
-    stage_spatial_transposed(&mut scratch.stage[..wot_stage_len], dim, wot_sp, &weights.wo, q_dim, dim, seq);
-    kernels.bufs.wot_bwd_in.copy_from_f32(&scratch.stage[..wot_stage_len]);
+    {
+        let mut locked = kernels.bufs.wot_bwd_in.as_f32_slice_mut();
+        let buf = &mut *locked;
+        stage_spatial(buf, dim, wot_sp, &dx2_scaled, seq, 0);
+        stage_spatial_transposed(buf, dim, wot_sp, &weights.wo, q_dim, dim, seq);
+    }
     kernels.wot_bwd.run(&[&kernels.bufs.wot_bwd_in], &[&kernels.bufs.wot_bwd_out]).expect("ANE eval failed");
 
     // Read da directly from output IOSurface
@@ -600,21 +602,29 @@ pub fn backward(
         da.copy_from_slice(&locked[..q_dim * seq]);
     }
 
-    // dWo accumulation: dWo[q * dim + d] += sum_s(dx2_scaled[d * seq + s] * attn_out[q * seq + s])
-    accumulate_dw(&cache.attn_out, q_dim, &dx2_scaled, dim, seq, &mut grads.dwo);
-
-    // ── 9. sdpaBwd1(ANE): Q_rope, K_rope, V, da → dV, probs, dp ──
+    // ── 9. Stage sdpaBwd1 directly into IOSurface, then overlap dWo with ANE ──
     let bwd1_in_ch = sdpa_bwd::bwd1_input_channels(cfg);
     let bwd1_out_ch = sdpa_bwd::bwd1_output_channels(cfg);
-    let bwd1_stage_len = bwd1_in_ch * seq;
-    scratch.stage[..bwd1_stage_len].fill(0.0);
-    // Pack into channels: Q_rope, K_rope(=K_tiled for MHA), V, da
-    pack_channels(&mut scratch.stage[..bwd1_stage_len], bwd1_in_ch, seq, &cache.q_rope, q_dim, 0);
-    pack_channels(&mut scratch.stage[..bwd1_stage_len], bwd1_in_ch, seq, &cache.k_rope, q_dim, q_dim);
-    pack_channels(&mut scratch.stage[..bwd1_stage_len], bwd1_in_ch, seq, &cache.v, q_dim, 2 * q_dim);
-    pack_channels(&mut scratch.stage[..bwd1_stage_len], bwd1_in_ch, seq, &da, q_dim, 3 * q_dim);
-    kernels.bufs.sdpa_bwd1_in.copy_from_f32(&scratch.stage[..bwd1_stage_len]);
-    kernels.sdpa_bwd1.run(&[&kernels.bufs.sdpa_bwd1_in], &[&kernels.bufs.sdpa_bwd1_out]).expect("ANE eval failed");
+    {
+        let mut locked = kernels.bufs.sdpa_bwd1_in.as_f32_slice_mut();
+        let buf = &mut *locked;
+        pack_channels(buf, bwd1_in_ch, seq, &cache.q_rope, q_dim, 0);
+        pack_channels(buf, bwd1_in_ch, seq, &cache.k_rope, q_dim, q_dim);
+        pack_channels(buf, bwd1_in_ch, seq, &cache.v, q_dim, 2 * q_dim);
+        pack_channels(buf, bwd1_in_ch, seq, &da, q_dim, 3 * q_dim);
+    }
+
+    // ASYNC: ANE sdpaBwd1 || CPU dWo accumulation
+    std::thread::scope(|s| {
+        let ane_handle = s.spawn(|| {
+            kernels.sdpa_bwd1.run(
+                &[&kernels.bufs.sdpa_bwd1_in],
+                &[&kernels.bufs.sdpa_bwd1_out],
+            ).expect("ANE eval failed");
+        });
+        accumulate_dw(&cache.attn_out, q_dim, &dx2_scaled, dim, seq, &mut grads.dwo);
+        ane_handle.join().expect("ANE thread panicked");
+    });
 
     let score_ch = heads * seq;
     let mut dv_full = vec![0.0f32; q_dim * seq];
@@ -630,13 +640,14 @@ pub fn backward(
     // ── 10. sdpaBwd2(ANE): probs, dp, Q_rope, K_rope → dQ, dK ──
     let bwd2_in_ch = sdpa_bwd::bwd2_input_channels(cfg);
     let bwd2_out_ch = sdpa_bwd::bwd2_output_channels(cfg);
-    let bwd2_stage_len = bwd2_in_ch * seq;
-    scratch.stage[..bwd2_stage_len].fill(0.0);
-    pack_channels(&mut scratch.stage[..bwd2_stage_len], bwd2_in_ch, seq, &probs_flat, score_ch, 0);
-    pack_channels(&mut scratch.stage[..bwd2_stage_len], bwd2_in_ch, seq, &dp_flat, score_ch, score_ch);
-    pack_channels(&mut scratch.stage[..bwd2_stage_len], bwd2_in_ch, seq, &cache.q_rope, q_dim, 2 * score_ch);
-    pack_channels(&mut scratch.stage[..bwd2_stage_len], bwd2_in_ch, seq, &cache.k_rope, q_dim, 2 * score_ch + q_dim);
-    kernels.bufs.sdpa_bwd2_in.copy_from_f32(&scratch.stage[..bwd2_stage_len]);
+    {
+        let mut locked = kernels.bufs.sdpa_bwd2_in.as_f32_slice_mut();
+        let buf = &mut *locked;
+        pack_channels(buf, bwd2_in_ch, seq, &probs_flat, score_ch, 0);
+        pack_channels(buf, bwd2_in_ch, seq, &dp_flat, score_ch, score_ch);
+        pack_channels(buf, bwd2_in_ch, seq, &cache.q_rope, q_dim, 2 * score_ch);
+        pack_channels(buf, bwd2_in_ch, seq, &cache.k_rope, q_dim, 2 * score_ch + q_dim);
+    }
     kernels.sdpa_bwd2.run(&[&kernels.bufs.sdpa_bwd2_in], &[&kernels.bufs.sdpa_bwd2_out]).expect("ANE eval failed");
 
     let mut dq = vec![0.0f32; q_dim * seq];
@@ -653,20 +664,28 @@ pub fn backward(
     rope_backward_inplace(&mut dq, heads, hd, seq);
     rope_backward_inplace(&mut dk, heads, hd, seq);
 
-    // ── 12. dWq, dWk, dWv accumulation ──
-    accumulate_dw(&cache.xnorm, dim, &dq, q_dim, seq, &mut grads.dwq);
-    accumulate_dw(&cache.xnorm, dim, &dk, kv_dim, seq, &mut grads.dwk);
-    accumulate_dw(&cache.xnorm, dim, &dv, kv_dim, seq, &mut grads.dwv);
-
-    // ── 13. qBwd(ANE): dq @ Wq → dx_attn [DIM, SEQ] ──
+    // ── 12. Stage qBwd directly into IOSurface, then overlap dW with ANE ──
     let q_bwd_sp = dyn_matmul::spatial_width(seq, dim);
-    let q_bwd_stage_len = q_dim * q_bwd_sp;
-    scratch.stage[..q_bwd_stage_len].fill(0.0);
-    stage_spatial(&mut scratch.stage[..q_bwd_stage_len], q_dim, q_bwd_sp, &dq, seq, 0);
-    // Wq: [DIM, Q_DIM] → for qBwd we need [Q_DIM, DIM] = Wq transposed
-    stage_spatial_transposed(&mut scratch.stage[..q_bwd_stage_len], q_dim, q_bwd_sp, &weights.wq, dim, q_dim, seq);
-    kernels.bufs.q_bwd_in.copy_from_f32(&scratch.stage[..q_bwd_stage_len]);
-    kernels.q_bwd.run(&[&kernels.bufs.q_bwd_in], &[&kernels.bufs.q_bwd_out]).expect("ANE eval failed");
+    {
+        let mut locked = kernels.bufs.q_bwd_in.as_f32_slice_mut();
+        let buf = &mut *locked;
+        stage_spatial(buf, q_dim, q_bwd_sp, &dq, seq, 0);
+        stage_spatial_transposed(buf, q_dim, q_bwd_sp, &weights.wq, dim, q_dim, seq);
+    }
+
+    // ASYNC: ANE qBwd || CPU dWq+dWk+dWv accumulation
+    std::thread::scope(|s| {
+        let ane_handle = s.spawn(|| {
+            kernels.q_bwd.run(
+                &[&kernels.bufs.q_bwd_in],
+                &[&kernels.bufs.q_bwd_out],
+            ).expect("ANE eval failed");
+        });
+        accumulate_dw(&cache.xnorm, dim, &dq, q_dim, seq, &mut grads.dwq);
+        accumulate_dw(&cache.xnorm, dim, &dk, kv_dim, seq, &mut grads.dwk);
+        accumulate_dw(&cache.xnorm, dim, &dv, kv_dim, seq, &mut grads.dwv);
+        ane_handle.join().expect("ANE thread panicked");
+    });
 
     // Read dx_attn directly from output IOSurface
     let mut dx_attn = vec![0.0f32; dim * seq];
@@ -677,13 +696,14 @@ pub fn backward(
 
     // ── 14. kvBwd(ANE): dk@Wk + dv@Wv → dx_kv [DIM, SEQ] ──
     let kv_bwd_sp = dyn_matmul::dual_spatial_width(seq, dim);
-    let kv_bwd_stage_len = kv_dim * kv_bwd_sp;
-    scratch.stage[..kv_bwd_stage_len].fill(0.0);
-    stage_spatial(&mut scratch.stage[..kv_bwd_stage_len], kv_dim, kv_bwd_sp, &dk, seq, 0);
-    stage_spatial(&mut scratch.stage[..kv_bwd_stage_len], kv_dim, kv_bwd_sp, &dv, seq, seq);
-    stage_spatial_transposed(&mut scratch.stage[..kv_bwd_stage_len], kv_dim, kv_bwd_sp, &weights.wk, dim, kv_dim, seq + seq);
-    stage_spatial_transposed(&mut scratch.stage[..kv_bwd_stage_len], kv_dim, kv_bwd_sp, &weights.wv, dim, kv_dim, 2 * seq + dim);
-    kernels.bufs.kv_bwd_in.copy_from_f32(&scratch.stage[..kv_bwd_stage_len]);
+    {
+        let mut locked = kernels.bufs.kv_bwd_in.as_f32_slice_mut();
+        let buf = &mut *locked;
+        stage_spatial(buf, kv_dim, kv_bwd_sp, &dk, seq, 0);
+        stage_spatial(buf, kv_dim, kv_bwd_sp, &dv, seq, seq);
+        stage_spatial_transposed(buf, kv_dim, kv_bwd_sp, &weights.wk, dim, kv_dim, seq + seq);
+        stage_spatial_transposed(buf, kv_dim, kv_bwd_sp, &weights.wv, dim, kv_dim, 2 * seq + dim);
+    }
     kernels.kv_bwd.run(&[&kernels.bufs.kv_bwd_in], &[&kernels.bufs.kv_bwd_out]).expect("ANE eval failed");
 
     // Read dx_kv directly from output IOSurface
@@ -693,11 +713,9 @@ pub fn backward(
         dx_kv.copy_from_slice(&locked[..dim * seq]);
     }
 
-    // ── 15. Merge: dx_attn + dx_kv ──
+    // ── 15. Merge: dx_attn + dx_kv (vDSP vectorized) ──
     let mut dx_merged = vec![0.0f32; dim * seq];
-    for i in 0..dim * seq {
-        dx_merged[i] = dx_attn[i] + dx_kv[i];
-    }
+    vdsp::vadd(&dx_attn, &dx_kv, &mut dx_merged);
 
     // ── 16. RMSNorm1 backward (CPU) ──
     let mut dx_rms1 = vec![0.0f32; dim * seq];
@@ -711,11 +729,9 @@ pub fn backward(
         for c in 0..dim { dx_rms1[c * seq + s] = dx_pos[c]; }
     }
 
-    // ── 17. Final: dx = dx_rms1 + dx2 (residual from attention branch) ──
+    // ── 17. Final: dx = dx_rms1 + dx2 (residual from attention branch, vDSP vectorized) ──
     let mut dx = vec![0.0f32; dim * seq];
-    for i in 0..dim * seq {
-        dx[i] = dx_rms1[i] + dx2[i];
-    }
+    vdsp::vadd(&dx_rms1, &dx2, &mut dx);
 
     dx
 }
@@ -745,11 +761,12 @@ fn stage_spatial_transposed(
 }
 
 /// Pack activation data into the channel dimension of an IOSurface.
+/// Uses copy_from_slice for vectorized memcpy on inner dimension.
 fn pack_channels(dst: &mut [f32], _total_ch: usize, seq: usize, src: &[f32], src_ch: usize, ch_offset: usize) {
     for c in 0..src_ch {
-        for s in 0..seq {
-            dst[(ch_offset + c) * seq + s] = src[c * seq + s];
-        }
+        let d = (ch_offset + c) * seq;
+        let s = c * seq;
+        dst[d..d + seq].copy_from_slice(&src[s..s + seq]);
     }
 }
 
