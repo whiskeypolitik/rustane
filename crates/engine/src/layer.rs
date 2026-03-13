@@ -589,10 +589,21 @@ pub fn forward_into(
         }
     }
 
-    // 3. Run sdpaFwd (ANE)
-    kernels.sdpa_fwd.run(&[&kernels.bufs.sdpa_fwd_in], &[&kernels.bufs.sdpa_fwd_out]).expect("ANE eval failed");
+    // 3. Run sdpaFwd (ANE) || pre-stage woFwd weights
+    let wo_sp = dyn_matmul::spatial_width(seq, dim);
+    std::thread::scope(|s| {
+        let ane_handle = s.spawn(|| {
+            kernels.sdpa_fwd.run(&[&kernels.bufs.sdpa_fwd_in], &[&kernels.bufs.sdpa_fwd_out]).expect("ANE eval failed");
+        });
+        {
+            let mut locked = kernels.bufs.wo_fwd_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            stage_spatial(buf, q_dim, wo_sp, &weights.wo, dim, seq);
+        }
+        ane_handle.join().expect("ANE thread panicked");
+    });
 
-    // Extract
+    // Extract sdpaFwd output
     {
         let locked = kernels.bufs.sdpa_fwd_out.as_f32_slice();
         read_channels_into(&locked, sdpa_out_ch, seq, 0, q_dim, &mut cache.attn_out);
@@ -601,17 +612,33 @@ pub fn forward_into(
         read_channels_into(&locked, sdpa_out_ch, seq, 2 * q_dim + kv_dim, kv_dim, &mut cache.v);
     }
 
-    // 4. Stage woFwd
-    let wo_sp = dyn_matmul::spatial_width(seq, dim);
+    // 4. Stage woFwd activations only (weights already staged during sdpaFwd)
     {
         let mut locked = kernels.bufs.wo_fwd_in.as_f32_slice_mut();
         let buf = &mut *locked;
         stage_spatial(buf, q_dim, wo_sp, &cache.attn_out, seq, 0);
-        stage_spatial(buf, q_dim, wo_sp, &weights.wo, dim, seq);
     }
 
-    // 5. Run woFwd (ANE)
-    kernels.wo_fwd.run(&[&kernels.bufs.wo_fwd_in], &[&kernels.bufs.wo_fwd_out]).expect("ANE eval failed");
+    // 5. Run woFwd (ANE) || pre-stage ffnFused weights
+    let ffn_sp = ffn_fused::input_spatial_width(cfg);
+    let ffn_out_ch = ffn_fused::output_channels(cfg);
+    std::thread::scope(|s| {
+        let ane_handle = s.spawn(|| {
+            kernels.wo_fwd.run(&[&kernels.bufs.wo_fwd_in], &[&kernels.bufs.wo_fwd_out]).expect("ANE eval failed");
+        });
+        {
+            let mut locked = kernels.bufs.ffn_fused_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            let w_off = 2 * seq;
+            for c in 0..dim {
+                let row = c * ffn_sp;
+                buf[row + w_off..row + w_off + hidden].copy_from_slice(&weights.w1[c * hidden..c * hidden + hidden]);
+                buf[row + w_off + hidden..row + w_off + 2 * hidden].copy_from_slice(&weights.w3[c * hidden..c * hidden + hidden]);
+                buf[row + w_off + 2 * hidden..row + w_off + 3 * hidden].copy_from_slice(&weights.w2[c * hidden..c * hidden + hidden]);
+            }
+        }
+        ane_handle.join().expect("ANE thread panicked");
+    });
 
     // Read o_out
     {
@@ -623,9 +650,7 @@ pub fn forward_into(
     vdsp::vsma(&cache.o_out, alpha, x, &mut cache.x2);
     rmsnorm::forward_channel_first(&cache.x2, &weights.gamma2, &mut cache.x2norm, &mut cache.rms_inv2, dim, seq);
 
-    // 7. Stage ffnFused — fused single-pass over IOSurface
-    let ffn_sp = ffn_fused::input_spatial_width(cfg);
-    let ffn_out_ch = ffn_fused::output_channels(cfg);
+    // 7. Stage ffnFused activations only (weights already staged during woFwd)
     {
         let mut locked = kernels.bufs.ffn_fused_in.as_f32_slice_mut();
         let buf = &mut *locked;
@@ -633,10 +658,6 @@ pub fn forward_into(
             let row = c * ffn_sp;
             buf[row..row + seq].copy_from_slice(&cache.x2norm[c * seq..c * seq + seq]);
             buf[row + seq..row + 2 * seq].copy_from_slice(&cache.x2[c * seq..c * seq + seq]);
-            let w_off = 2 * seq;
-            buf[row + w_off..row + w_off + hidden].copy_from_slice(&weights.w1[c * hidden..c * hidden + hidden]);
-            buf[row + w_off + hidden..row + w_off + 2 * hidden].copy_from_slice(&weights.w3[c * hidden..c * hidden + hidden]);
-            buf[row + w_off + 2 * hidden..row + w_off + 3 * hidden].copy_from_slice(&weights.w2[c * hidden..c * hidden + hidden]);
         }
     }
 
@@ -723,9 +744,20 @@ pub fn forward_timed(
     }
     let stage_sdpa_ms = t.elapsed().as_secs_f32() * 1000.0;
 
-    // 3. ANE sdpaFwd
+    // 3. ANE sdpaFwd || pre-stage woFwd weights
     let t = Instant::now();
-    kernels.sdpa_fwd.run(&[&kernels.bufs.sdpa_fwd_in], &[&kernels.bufs.sdpa_fwd_out]).expect("ANE eval failed");
+    let wo_sp = dyn_matmul::spatial_width(seq, dim);
+    std::thread::scope(|s| {
+        let ane_handle = s.spawn(|| {
+            kernels.sdpa_fwd.run(&[&kernels.bufs.sdpa_fwd_in], &[&kernels.bufs.sdpa_fwd_out]).expect("ANE eval failed");
+        });
+        {
+            let mut locked = kernels.bufs.wo_fwd_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            stage_spatial(buf, q_dim, wo_sp, &weights.wo, dim, seq);
+        }
+        ane_handle.join().expect("ANE thread panicked");
+    });
     let ane_sdpa_ms = t.elapsed().as_secs_f32() * 1000.0;
 
     // 4. Read output
@@ -743,20 +775,32 @@ pub fn forward_timed(
     }
     let read_sdpa_ms = t.elapsed().as_secs_f32() * 1000.0;
 
-    // 5. Stage woFwd
+    // 5. Stage woFwd activations only (weights already staged during sdpaFwd)
     let t = Instant::now();
-    let wo_sp = dyn_matmul::spatial_width(seq, dim);
     {
         let mut locked = kernels.bufs.wo_fwd_in.as_f32_slice_mut();
         let buf = &mut *locked;
         stage_spatial(buf, q_dim, wo_sp, &attn_out, seq, 0);
-        stage_spatial(buf, q_dim, wo_sp, &weights.wo, dim, seq);
     }
     let stage_wo_ms = t.elapsed().as_secs_f32() * 1000.0;
 
-    // 6. ANE woFwd
+    // 6. ANE woFwd || pre-stage ffnFused weights
     let t = Instant::now();
-    kernels.wo_fwd.run(&[&kernels.bufs.wo_fwd_in], &[&kernels.bufs.wo_fwd_out]).expect("ANE eval failed");
+    let ffn_sp = ffn_fused::input_spatial_width(cfg);
+    let ffn_out_ch = ffn_fused::output_channels(cfg);
+    std::thread::scope(|s| {
+        let ane_handle = s.spawn(|| {
+            kernels.wo_fwd.run(&[&kernels.bufs.wo_fwd_in], &[&kernels.bufs.wo_fwd_out]).expect("ANE eval failed");
+        });
+        {
+            let mut locked = kernels.bufs.ffn_fused_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            stage_spatial(buf, dim, ffn_sp, &weights.w1, hidden, 2 * seq);
+            stage_spatial(buf, dim, ffn_sp, &weights.w3, hidden, 2 * seq + hidden);
+            stage_spatial(buf, dim, ffn_sp, &weights.w2, hidden, 2 * seq + 2 * hidden);
+        }
+        ane_handle.join().expect("ANE thread panicked");
+    });
     let ane_wo_ms = t.elapsed().as_secs_f32() * 1000.0;
 
     // 7. Read woFwd output
@@ -777,18 +821,13 @@ pub fn forward_timed(
     rmsnorm::forward_channel_first(&x2, &weights.gamma2, &mut x2norm, &mut rms_inv2, dim, seq);
     let residual_rmsnorm2_ms = t.elapsed().as_secs_f32() * 1000.0;
 
-    // 9. Stage ffnFused
+    // 9. Stage ffnFused activations only (weights already staged during woFwd)
     let t = Instant::now();
-    let ffn_sp = ffn_fused::input_spatial_width(cfg);
-    let ffn_out_ch = ffn_fused::output_channels(cfg);
     {
         let mut locked = kernels.bufs.ffn_fused_in.as_f32_slice_mut();
         let buf = &mut *locked;
         stage_spatial(buf, dim, ffn_sp, &x2norm, seq, 0);
         stage_spatial(buf, dim, ffn_sp, &x2, seq, seq);
-        stage_spatial(buf, dim, ffn_sp, &weights.w1, hidden, 2 * seq);
-        stage_spatial(buf, dim, ffn_sp, &weights.w3, hidden, 2 * seq + hidden);
-        stage_spatial(buf, dim, ffn_sp, &weights.w2, hidden, 2 * seq + 2 * hidden);
     }
     let stage_ffn_ms = t.elapsed().as_secs_f32() * 1000.0;
 
@@ -973,7 +1012,7 @@ pub fn backward_timed(
     ws.dx2.copy_from_slice(&ws.dx2_tmp);
     let rmsnorm2_bwd_ms = t.elapsed().as_secs_f32() * 1000.0;
 
-    // 7. wotBwd (mtrans Wo)
+    // 7. wotBwd (mtrans Wo) + async pre-stage sdpaBwd1
     let t = Instant::now();
     vdsp::vsmul(&ws.dx2, alpha, &mut ws.dx2_scaled);
     let wot_sp = dyn_matmul::spatial_width(seq, q_dim);
@@ -984,23 +1023,33 @@ pub fn backward_timed(
         stage_spatial(buf, dim, wot_sp, &ws.dx2_scaled, seq, 0);
         stage_spatial(buf, dim, wot_sp, &ws.wot, q_dim, seq);
     }
-    kernels.wot_bwd.run(&[&kernels.bufs.wot_bwd_in], &[&kernels.bufs.wot_bwd_out]).expect("ANE eval failed");
+    let bwd1_in_ch = sdpa_bwd::bwd1_input_channels(cfg);
+    let bwd1_out_ch = sdpa_bwd::bwd1_output_channels(cfg);
+    // ASYNC: ANE wotBwd || pre-stage 3 of 4 sdpaBwd1 inputs (from forward cache)
+    std::thread::scope(|s| {
+        let ane_handle = s.spawn(|| {
+            kernels.wot_bwd.run(&[&kernels.bufs.wot_bwd_in], &[&kernels.bufs.wot_bwd_out]).expect("ANE eval failed");
+        });
+        {
+            let mut locked = kernels.bufs.sdpa_bwd1_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            pack_channels(buf, bwd1_in_ch, seq, &cache.q_rope, q_dim, 0);
+            pack_channels(buf, bwd1_in_ch, seq, &cache.k_rope, q_dim, q_dim);
+            pack_channels(buf, bwd1_in_ch, seq, &cache.v, q_dim, 2 * q_dim);
+        }
+        ane_handle.join().expect("ANE thread panicked");
+    });
     {
         let locked = kernels.bufs.wot_bwd_out.as_f32_slice();
         ws.da.copy_from_slice(&locked[..q_dim * seq]);
     }
     let stage_run_wot_bwd_ms = t.elapsed().as_secs_f32() * 1000.0;
 
-    // 8. Stage sdpaBwd1
+    // 8. Stage remaining sdpaBwd1 input (da depends on wotBwd output)
     let t = Instant::now();
-    let bwd1_in_ch = sdpa_bwd::bwd1_input_channels(cfg);
-    let bwd1_out_ch = sdpa_bwd::bwd1_output_channels(cfg);
     {
         let mut locked = kernels.bufs.sdpa_bwd1_in.as_f32_slice_mut();
         let buf = &mut *locked;
-        pack_channels(buf, bwd1_in_ch, seq, &cache.q_rope, q_dim, 0);
-        pack_channels(buf, bwd1_in_ch, seq, &cache.k_rope, q_dim, q_dim);
-        pack_channels(buf, bwd1_in_ch, seq, &cache.v, q_dim, 2 * q_dim);
         pack_channels(buf, bwd1_in_ch, seq, &ws.da, q_dim, 3 * q_dim);
     }
     let stage_sdpa_bwd1_ms = t.elapsed().as_secs_f32() * 1000.0;
@@ -1243,22 +1292,32 @@ pub fn backward(
         stage_spatial(buf, dim, wot_sp, &ws.dx2_scaled, seq, 0);
         stage_spatial(buf, dim, wot_sp, &ws.wot, q_dim, seq);
     }
-    kernels.wot_bwd.run(&[&kernels.bufs.wot_bwd_in], &[&kernels.bufs.wot_bwd_out]).expect("ANE eval failed");
+    let bwd1_in_ch = sdpa_bwd::bwd1_input_channels(cfg);
+    let bwd1_out_ch = sdpa_bwd::bwd1_output_channels(cfg);
+    // ASYNC: ANE wotBwd || pre-stage 3 of 4 sdpaBwd1 inputs (from forward cache)
+    std::thread::scope(|s| {
+        let ane_handle = s.spawn(|| {
+            kernels.wot_bwd.run(&[&kernels.bufs.wot_bwd_in], &[&kernels.bufs.wot_bwd_out]).expect("ANE eval failed");
+        });
+        {
+            let mut locked = kernels.bufs.sdpa_bwd1_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            pack_channels(buf, bwd1_in_ch, seq, &cache.q_rope, q_dim, 0);
+            pack_channels(buf, bwd1_in_ch, seq, &cache.k_rope, q_dim, q_dim);
+            pack_channels(buf, bwd1_in_ch, seq, &cache.v, q_dim, 2 * q_dim);
+        }
+        ane_handle.join().expect("ANE thread panicked");
+    });
 
     {
         let locked = kernels.bufs.wot_bwd_out.as_f32_slice();
         ws.da.copy_from_slice(&locked[..q_dim * seq]);
     }
 
-    // ── 9. Stage sdpaBwd1 directly into IOSurface, then overlap dWo with ANE ──
-    let bwd1_in_ch = sdpa_bwd::bwd1_input_channels(cfg);
-    let bwd1_out_ch = sdpa_bwd::bwd1_output_channels(cfg);
+    // ── 9. Stage remaining sdpaBwd1 input (da depends on wotBwd output) ──
     {
         let mut locked = kernels.bufs.sdpa_bwd1_in.as_f32_slice_mut();
         let buf = &mut *locked;
-        pack_channels(buf, bwd1_in_ch, seq, &cache.q_rope, q_dim, 0);
-        pack_channels(buf, bwd1_in_ch, seq, &cache.k_rope, q_dim, q_dim);
-        pack_channels(buf, bwd1_in_ch, seq, &cache.v, q_dim, 2 * q_dim);
         pack_channels(buf, bwd1_in_ch, seq, &ws.da, q_dim, 3 * q_dim);
     }
 
@@ -1472,21 +1531,31 @@ pub fn backward_into(
         stage_spatial(buf, dim, wot_sp, &ws.dx2_scaled, seq, 0);
         stage_spatial(buf, dim, wot_sp, &ws.wot, q_dim, seq);
     }
-    kernels.wot_bwd.run(&[&kernels.bufs.wot_bwd_in], &[&kernels.bufs.wot_bwd_out]).expect("ANE eval failed");
+    let bwd1_in_ch = sdpa_bwd::bwd1_input_channels(cfg);
+    let bwd1_out_ch = sdpa_bwd::bwd1_output_channels(cfg);
+    // ASYNC: ANE wotBwd || pre-stage 3 of 4 sdpaBwd1 inputs (from forward cache)
+    std::thread::scope(|s| {
+        let ane_handle = s.spawn(|| {
+            kernels.wot_bwd.run(&[&kernels.bufs.wot_bwd_in], &[&kernels.bufs.wot_bwd_out]).expect("ANE eval failed");
+        });
+        {
+            let mut locked = kernels.bufs.sdpa_bwd1_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            pack_channels(buf, bwd1_in_ch, seq, &cache.q_rope, q_dim, 0);
+            pack_channels(buf, bwd1_in_ch, seq, &cache.k_rope, q_dim, q_dim);
+            pack_channels(buf, bwd1_in_ch, seq, &cache.v, q_dim, 2 * q_dim);
+        }
+        ane_handle.join().expect("ANE thread panicked");
+    });
     {
         let locked = kernels.bufs.wot_bwd_out.as_f32_slice();
         ws.da.copy_from_slice(&locked[..q_dim * seq]);
     }
 
-    // 8. Stage sdpaBwd1
-    let bwd1_in_ch = sdpa_bwd::bwd1_input_channels(cfg);
-    let bwd1_out_ch = sdpa_bwd::bwd1_output_channels(cfg);
+    // 8. Stage remaining sdpaBwd1 input (da depends on wotBwd output)
     {
         let mut locked = kernels.bufs.sdpa_bwd1_in.as_f32_slice_mut();
         let buf = &mut *locked;
-        pack_channels(buf, bwd1_in_ch, seq, &cache.q_rope, q_dim, 0);
-        pack_channels(buf, bwd1_in_ch, seq, &cache.k_rope, q_dim, q_dim);
-        pack_channels(buf, bwd1_in_ch, seq, &cache.v, q_dim, 2 * q_dim);
         pack_channels(buf, bwd1_in_ch, seq, &ws.da, q_dim, 3 * q_dim);
     }
 
