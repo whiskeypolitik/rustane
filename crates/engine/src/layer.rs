@@ -1462,13 +1462,20 @@ pub fn backward_into(
         stage_spatial(buf, dim, w2t_sp, &ws.dffn, seq, 0);
         stage_spatial(buf, dim, w2t_sp, &weights.w2, hidden, seq);
     }
-    // ASYNC: ANE ffnBwdW2t || pre-compute w1t, w3t for step 4
+    // ASYNC: ANE ffnBwdW2t || pre-compute w1t, w3t + sigmoid(h1) for steps 3+4
+    // Sigmoid chain (vsmul+expf+vsadd+recf) is the expensive part of SiLU backward.
+    // Moving it here hides ~0.6ms/layer behind ANE dispatch time.
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
             kernels.ffn_bwd_w2t.run(&[&kernels.bufs.ffn_bwd_w2t_in], &[&kernels.bufs.ffn_bwd_w2t_out]).expect("ANE eval failed");
         });
         vdsp::mtrans(&weights.w1, hidden, &mut ws.w1t, dim, dim, hidden);
         vdsp::mtrans(&weights.w3, hidden, &mut ws.w3t, dim, dim, hidden);
+        // Pre-compute sigmoid(h1) — doesn't need dsilu_raw (ANE output), safe to overlap
+        vdsp::vsmul(&cache.h1, -1.0, &mut ws.neg_h1);
+        vdsp::expf(&ws.neg_h1, &mut ws.exp_neg);
+        vdsp::vsadd(&ws.exp_neg, 1.0, &mut ws.neg_h1);  // neg_h1 = 1 + exp(-h1)
+        vdsp::recf_inplace(&mut ws.neg_h1);              // neg_h1 = sig = 1/(1+exp(-h1))
         ane_handle.join().expect("ANE thread panicked");
     });
     {
@@ -1476,14 +1483,9 @@ pub fn backward_into(
         ws.dsilu_raw.copy_from_slice(&locked[..hidden * seq]);
     }
 
-    // 3. SiLU derivative (vvexpf + vvrecf precompute sig, then division-free scalar loop)
+    // 3. SiLU backward scalar loop (sig already in neg_h1 from step 2 overlap)
     let n = hidden * seq;
     {
-        vdsp::vsmul(&cache.h1, -1.0, &mut ws.neg_h1);
-        vdsp::expf(&ws.neg_h1, &mut ws.exp_neg);
-        // Precompute sigmoid via vectorized reciprocal — eliminates scalar fdiv from hot loop
-        vdsp::vsadd(&ws.exp_neg, 1.0, &mut ws.neg_h1);  // neg_h1 = 1 + exp(-h1)
-        vdsp::recf_inplace(&mut ws.neg_h1);              // neg_h1 = sig = 1/(1+exp(-h1))
         for i in 0..n {
             let sig = ws.neg_h1[i];
             let silu_val = cache.h1[i] * sig;
