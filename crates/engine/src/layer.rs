@@ -1419,7 +1419,8 @@ pub fn backward(
         stage_spatial(buf, hidden, w13t_sp, &ws.w3t, dim, 2 * seq + dim);
     }
 
-    // ── 5. ASYNC: ANE ffnBwdW13t || CPU dW2+dW1+dW3 accumulation ──
+    // ── 5. ASYNC: ANE ffnBwdW13t || CPU dW1+dW3 accumulation ──
+    // dW2 moved to step 9 overlap (sdpaBwd1 has ANE headroom)
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
             kernels.ffn_bwd_w13t.run(
@@ -1427,7 +1428,6 @@ pub fn backward(
                 &[&kernels.bufs.ffn_bwd_w13t_out],
             ).expect("ANE eval failed");
         });
-        accumulate_dw(&ws.dffn, dim, &cache.gate, hidden, seq, &mut grads.dw2);
         accumulate_dw(&cache.x2norm, dim, &ws.dh1, hidden, seq, &mut grads.dw1);
         accumulate_dw(&cache.x2norm, dim, &ws.dh3, hidden, seq, &mut grads.dw3);
         ane_handle.join().expect("ANE thread panicked");
@@ -1485,7 +1485,8 @@ pub fn backward(
         pack_channels(buf, bwd1_in_ch, seq, &ws.da, q_dim, 3 * q_dim);
     }
 
-    // ASYNC: ANE sdpaBwd1 || CPU dWo accumulation
+    // ASYNC: ANE sdpaBwd1 || CPU dWo + dW2 accumulation
+    // dW2 moved from step 5 to rebalance CPU load across async blocks
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
             kernels.sdpa_bwd1.run(
@@ -1494,6 +1495,7 @@ pub fn backward(
             ).expect("ANE eval failed");
         });
         accumulate_dw(&cache.attn_out, q_dim, &ws.dx2_scaled, dim, seq, &mut grads.dwo);
+        accumulate_dw(&ws.dffn, dim, &cache.gate, hidden, seq, &mut grads.dw2);
         ane_handle.join().expect("ANE thread panicked");
     });
 
@@ -1677,7 +1679,8 @@ pub fn backward_into(
         }
     }
 
-    // 5. ASYNC: ANE ffnBwdW13t || CPU dW + pre-compute wot for step 7
+    // 5. ASYNC: ANE ffnBwdW13t || CPU dW1+dW3 + pre-compute wot for step 7
+    // dW2 moved to step 9 overlap (sdpaBwd1 has ~0.6ms ANE headroom)
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
             kernels.ffn_bwd_w13t.run(
@@ -1685,7 +1688,6 @@ pub fn backward_into(
                 &[&kernels.bufs.ffn_bwd_w13t_out],
             ).expect("ANE eval failed");
         });
-        accumulate_dw(&ws.dffn, dim, &cache.gate, hidden, seq, &mut grads.dw2);
         accumulate_dw(&cache.x2norm, dim, &ws.dh1, hidden, seq, &mut grads.dw1);
         accumulate_dw(&cache.x2norm, dim, &ws.dh3, hidden, seq, &mut grads.dw3);
         vdsp::mtrans(&weights.wo, dim, &mut ws.wot, q_dim, q_dim, dim);
@@ -1738,7 +1740,9 @@ pub fn backward_into(
         pack_channels(buf, bwd1_in_ch, seq, &ws.da, q_dim, 3 * q_dim);
     }
 
-    // 9. ASYNC: ANE sdpaBwd1 || CPU dWo
+    // 9. ASYNC: ANE sdpaBwd1 || CPU dWo + dW2 (moved from step 5 to rebalance CPU load)
+    // Step 5 was CPU-bound at ~2.3ms (3 sgemm); step 9 had ~0.6ms ANE headroom.
+    // dW2 = dffn @ gate^T — both available since step 1 (dffn) and forward cache (gate).
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
             kernels.sdpa_bwd1.run(
@@ -1747,6 +1751,7 @@ pub fn backward_into(
             ).expect("ANE eval failed");
         });
         accumulate_dw(&cache.attn_out, q_dim, &ws.dx2_scaled, dim, seq, &mut grads.dwo);
+        accumulate_dw(&ws.dffn, dim, &cache.gate, hidden, seq, &mut grads.dw2);
         ane_handle.join().expect("ANE thread panicked");
     });
 
