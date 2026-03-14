@@ -329,20 +329,17 @@ for i in $(seq 1 "$MAX_ITERS"); do
 
     gossip_write "ITERATION $i starting"
 
-    # Run Claude headless in the worktree directory
+    # Run Claude headless — stream output to terminal AND log file
     log "Launching claude -p --model ${MODEL} ..."
+    echo "--- Iteration $i output ---" >> "$LOGFILE"
     set +e
-    CLAUDE_OUTPUT=$(cd "$WORKTREE" && claude -p \
+    claude -p \
         --dangerously-skip-permissions \
         --model "$MODEL" \
-        "$PROMPT" 2>&1)
-    CLAUDE_EXIT=$?
+        "$PROMPT" 2>&1 | tee -a "$LOGFILE"
+    CLAUDE_EXIT=${PIPESTATUS[0]}
     set -e
-
-    # Log Claude's output
-    echo "--- Iteration $i output ---" >> "$LOGFILE"
-    echo "$CLAUDE_OUTPUT" >> "$LOGFILE"
-    echo "--- end ---" >> "$LOGFILE"
+    echo "--- end (exit=$CLAUDE_EXIT) ---" >> "$LOGFILE"
 
     if [ $CLAUDE_EXIT -ne 0 ]; then
         log "Claude exited with code $CLAUDE_EXIT. Pausing 30s."
