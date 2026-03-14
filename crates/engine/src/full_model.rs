@@ -490,13 +490,15 @@ pub fn update_weights(
     let embed_lr = lr * tc.embed_lr_scale;
 
     let (b1, b2, eps) = (tc.beta1, tc.beta2, tc.eps);
-    let mut batch = metal_adam.begin_batch();
+    // begin_batch pre-creates 6 shared scalar buffers (beta1,beta2,eps,bc1,bc2,grad_scale).
+    // add() only allocates 2 per-tensor scalars (lr, wd) — down from 8 per call.
+    let mut batch = metal_adam.begin_batch(t, b1, b2, eps, grad_scale);
 
     // Embedding (no weight decay)
-    batch.add(&mut weights.embed, &grads.dembed, &mut opt.embed_m, &mut opt.embed_v, t, embed_lr, b1, b2, eps, 0.0, grad_scale);
+    batch.add(&mut weights.embed, &grads.dembed, &mut opt.embed_m, &mut opt.embed_v, embed_lr, 0.0);
 
     // Final RMSNorm (no weight decay)
-    batch.add(&mut weights.gamma_final, &grads.dgamma_final, &mut opt.gamma_final_m, &mut opt.gamma_final_v, t, lr, b1, b2, eps, 0.0, grad_scale);
+    batch.add(&mut weights.gamma_final, &grads.dgamma_final, &mut opt.gamma_final_m, &mut opt.gamma_final_v, lr, 0.0);
 
     // Per-layer
     for l in 0..cfg.nlayers {
@@ -505,17 +507,17 @@ pub fn update_weights(
         let o = &mut opt.layers[l];
 
         // Weight matrices
-        batch.add(&mut w.wq, &g.dwq, &mut o.m_wq, &mut o.v_wq, t, matrix_lr, b1, b2, eps, wd, grad_scale);
-        batch.add(&mut w.wk, &g.dwk, &mut o.m_wk, &mut o.v_wk, t, matrix_lr, b1, b2, eps, wd, grad_scale);
-        batch.add(&mut w.wv, &g.dwv, &mut o.m_wv, &mut o.v_wv, t, matrix_lr, b1, b2, eps, wd, grad_scale);
-        batch.add(&mut w.wo, &g.dwo, &mut o.m_wo, &mut o.v_wo, t, matrix_lr, b1, b2, eps, wd, grad_scale);
-        batch.add(&mut w.w1, &g.dw1, &mut o.m_w1, &mut o.v_w1, t, matrix_lr, b1, b2, eps, wd, grad_scale);
-        batch.add(&mut w.w3, &g.dw3, &mut o.m_w3, &mut o.v_w3, t, matrix_lr, b1, b2, eps, wd, grad_scale);
-        batch.add(&mut w.w2, &g.dw2, &mut o.m_w2, &mut o.v_w2, t, matrix_lr, b1, b2, eps, wd, grad_scale);
+        batch.add(&mut w.wq, &g.dwq, &mut o.m_wq, &mut o.v_wq, matrix_lr, wd);
+        batch.add(&mut w.wk, &g.dwk, &mut o.m_wk, &mut o.v_wk, matrix_lr, wd);
+        batch.add(&mut w.wv, &g.dwv, &mut o.m_wv, &mut o.v_wv, matrix_lr, wd);
+        batch.add(&mut w.wo, &g.dwo, &mut o.m_wo, &mut o.v_wo, matrix_lr, wd);
+        batch.add(&mut w.w1, &g.dw1, &mut o.m_w1, &mut o.v_w1, matrix_lr, wd);
+        batch.add(&mut w.w3, &g.dw3, &mut o.m_w3, &mut o.v_w3, matrix_lr, wd);
+        batch.add(&mut w.w2, &g.dw2, &mut o.m_w2, &mut o.v_w2, matrix_lr, wd);
 
         // RMSNorm scales (no weight decay)
-        batch.add(&mut w.gamma1, &g.dgamma1, &mut o.m_gamma1, &mut o.v_gamma1, t, lr, b1, b2, eps, 0.0, grad_scale);
-        batch.add(&mut w.gamma2, &g.dgamma2, &mut o.m_gamma2, &mut o.v_gamma2, t, lr, b1, b2, eps, 0.0, grad_scale);
+        batch.add(&mut w.gamma1, &g.dgamma1, &mut o.m_gamma1, &mut o.v_gamma1, lr, 0.0);
+        batch.add(&mut w.gamma2, &g.dgamma2, &mut o.m_gamma2, &mut o.v_gamma2, lr, 0.0);
     }
 
     batch.execute();
