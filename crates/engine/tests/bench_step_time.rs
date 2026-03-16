@@ -107,3 +107,73 @@ fn bench_training_step() {
     println!("\n=== Benchmark complete ===\n");
 }
 
+#[test]
+#[ignore]
+fn bench_training_step_1024() {
+    bench_config(ModelConfig::gpt_1024(), "gpt_1024 (8L, 1024dim)");
+}
+
+fn bench_config(cfg: ModelConfig, name: &str) {
+    println!("\n=== Rustane Training Step Benchmark ===");
+    println!("Model: {} (NL={}, DIM={}, HIDDEN={}, SEQ={}, VOCAB={})",
+             name, cfg.nlayers, cfg.dim, cfg.hidden, cfg.seq, cfg.vocab);
+
+    println!("\nCompiling 10 ANE kernels...");
+    let t0 = Instant::now();
+    let kernels = CompiledKernels::compile(&cfg);
+    println!("Compiled in {:.2}s", t0.elapsed().as_secs_f32());
+
+    let mut weights = ModelWeights::random(&cfg);
+    let mut grads = ModelGrads::zeros(&cfg);
+    let mut opt = ModelOptState::zeros(&cfg);
+    let tc = TrainConfig::default();
+
+    let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
+    let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
+    let metal_adam = MetalAdam::new().expect("Metal GPU required");
+    let mut fwd_ws = ModelForwardWorkspace::new(&cfg);
+    let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
+
+    // Warmup
+    println!("\nWarmup step...");
+    {
+        grads.zero_out();
+        let _loss = full_model::forward_ws(&cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
+        full_model::backward_ws(&cfg, &kernels, &weights, &fwd_ws, &tokens, tc.softcap, tc.loss_scale, &mut grads, &mut bwd_ws);
+        let gsc = 1.0 / tc.loss_scale;
+        let raw_norm = full_model::grad_norm(&grads);
+        let combined_scale = if raw_norm * gsc > tc.grad_clip { tc.grad_clip / raw_norm } else { gsc };
+        let lr = full_model::learning_rate(0, &tc);
+        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, 1, lr, &tc, &metal_adam, combined_scale);
+    }
+
+    println!("\n{:<6} {:>10} {:>10} {:>10} {:>10} {:>10}   {}", "step", "total", "fwd", "bwd", "norm", "upd", "loss");
+    println!("{}", "-".repeat(80));
+
+    for step in 0..5u32 {
+        grads.zero_out();
+        let t0 = Instant::now();
+        let t_fwd_start = Instant::now();
+        let loss = full_model::forward_ws(&cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
+        let t_fwd = t_fwd_start.elapsed();
+        let t_bwd_start = Instant::now();
+        full_model::backward_ws(&cfg, &kernels, &weights, &fwd_ws, &tokens, tc.softcap, tc.loss_scale, &mut grads, &mut bwd_ws);
+        let t_bwd = t_bwd_start.elapsed();
+        let t_norm_start = Instant::now();
+        let gsc = 1.0 / tc.loss_scale;
+        let raw_norm = full_model::grad_norm(&grads);
+        let combined_scale = if raw_norm * gsc > tc.grad_clip { tc.grad_clip / raw_norm } else { gsc };
+        let t_norm = t_norm_start.elapsed();
+        let t_upd_start = Instant::now();
+        let lr = full_model::learning_rate(step + 2, &tc);
+        full_model::update_weights(&cfg, &mut weights, &grads, &mut opt, step + 2, lr, &tc, &metal_adam, combined_scale);
+        let t_upd = t_upd_start.elapsed();
+        let total = t0.elapsed();
+        println!("{:<6} {:>9.1}ms {:>9.1}ms {:>9.1}ms {:>9.1}ms {:>9.1}ms   {:.4}",
+                 step, total.as_secs_f32()*1000.0, t_fwd.as_secs_f32()*1000.0,
+                 t_bwd.as_secs_f32()*1000.0, t_norm.as_secs_f32()*1000.0,
+                 t_upd.as_secs_f32()*1000.0, loss);
+    }
+    println!("\n=== Benchmark complete ===\n");
+}
+

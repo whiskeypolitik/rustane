@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 struct Args {
+    model: String,
     data_path: PathBuf,
     val_path: Option<PathBuf>,
     token_bytes_path: Option<PathBuf>,
@@ -27,6 +28,7 @@ struct Args {
 
 fn parse_args() -> Args {
     let args: Vec<String> = std::env::args().collect();
+    let mut model = "gpt_karpathy".to_string();
     let mut data_path = None;
     let mut val_path = None;
     let mut token_bytes_path = None;
@@ -39,6 +41,7 @@ fn parse_args() -> Args {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--model" => { model = args[i+1].clone(); i += 2; }
             "--data" => { data_path = Some(PathBuf::from(&args[i+1])); i += 2; }
             "--val" => { val_path = Some(PathBuf::from(&args[i+1])); i += 2; }
             "--token-bytes" => { token_bytes_path = Some(PathBuf::from(&args[i+1])); i += 2; }
@@ -52,6 +55,7 @@ fn parse_args() -> Args {
     }
 
     Args {
+        model,
         data_path: data_path.expect("--data required"),
         val_path,
         token_bytes_path,
@@ -146,13 +150,19 @@ fn write_f32_vec(buf: &mut Vec<u8>, v: &[f32]) {
 
 fn main() {
     let args = parse_args();
-    let cfg = ModelConfig::gpt_karpathy();
+    let cfg = match args.model.as_str() {
+        "gpt_karpathy" => ModelConfig::gpt_karpathy(),
+        "gpt_1024" => ModelConfig::gpt_1024(),
+        other => { eprintln!("Unknown model: {other} (use gpt_karpathy or gpt_1024)"); std::process::exit(1); }
+    };
+
+    let per_layer = cfg.dim * cfg.q_dim + cfg.dim * cfg.kv_dim * 2
+        + cfg.q_dim * cfg.dim + cfg.dim * cfg.hidden * 3 + cfg.dim * 2;
+    let total_params = cfg.vocab * cfg.dim + cfg.nlayers * per_layer + cfg.dim;
 
     println!("=== Rustane Trainer ===");
-    println!("model: gpt_karpathy (6L, 768D, 8192V, 512S)");
-    println!("params: {:.1}M", (cfg.vocab * cfg.dim + cfg.nlayers * (
-        cfg.dim * cfg.dim * 4 + cfg.dim * cfg.hidden * 3 + cfg.dim * 2
-    ) + cfg.dim) as f64 / 1e6);
+    println!("model: {} ({}L, {}D, {}V, {}S)", args.model, cfg.nlayers, cfg.dim, cfg.vocab, cfg.seq);
+    println!("params: {:.1}M", total_params as f64 / 1e6);
 
     // Load data
     println!("\nLoading training data...");
