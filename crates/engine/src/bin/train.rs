@@ -20,6 +20,8 @@ struct Args {
     val_path: Option<PathBuf>,
     token_bytes_path: Option<PathBuf>,
     total_steps: u32,
+    warmup_steps: u32,
+    max_lr: f32,
     val_interval: u32,
     val_steps: u32,
     checkpoint_interval: u32,
@@ -33,6 +35,8 @@ fn parse_args() -> Args {
     let mut val_path = None;
     let mut token_bytes_path = None;
     let mut total_steps = 72000u32;
+    let mut warmup_steps = 0u32; // 0 = auto (2% of total)
+    let mut max_lr = 0.0f32;     // 0 = auto
     let mut val_interval = 500u32;
     let mut val_steps = 20u32;
     let mut checkpoint_interval = 1000u32;
@@ -46,6 +50,8 @@ fn parse_args() -> Args {
             "--val" => { val_path = Some(PathBuf::from(&args[i+1])); i += 2; }
             "--token-bytes" => { token_bytes_path = Some(PathBuf::from(&args[i+1])); i += 2; }
             "--steps" => { total_steps = args[i+1].parse().unwrap(); i += 2; }
+            "--warmup" => { warmup_steps = args[i+1].parse().unwrap(); i += 2; }
+            "--lr" => { max_lr = args[i+1].parse().unwrap(); i += 2; }
             "--val-interval" => { val_interval = args[i+1].parse().unwrap(); i += 2; }
             "--val-steps" => { val_steps = args[i+1].parse().unwrap(); i += 2; }
             "--ckpt-interval" => { checkpoint_interval = args[i+1].parse().unwrap(); i += 2; }
@@ -54,12 +60,23 @@ fn parse_args() -> Args {
         }
     }
 
+    // Auto warmup: 2% of total steps, min 100
+    if warmup_steps == 0 {
+        warmup_steps = (total_steps / 50).max(100);
+    }
+    // Auto LR: 3e-4 for small models, scale down for larger
+    if max_lr == 0.0 {
+        max_lr = 3e-4;
+    }
+
     Args {
         model,
         data_path: data_path.expect("--data required"),
         val_path,
         token_bytes_path,
         total_steps,
+        warmup_steps,
+        max_lr,
         val_interval,
         val_steps,
         checkpoint_interval,
@@ -197,6 +214,8 @@ fn main() {
 
     let mut tc = TrainConfig::default();
     tc.total_steps = args.total_steps;
+    tc.warmup_steps = args.warmup_steps;
+    tc.max_lr = args.max_lr;
 
     println!("\nTraining config:");
     println!("  lr: {:.0e} (warmup {} → cosine)", tc.max_lr, tc.warmup_steps);
