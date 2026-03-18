@@ -471,7 +471,7 @@ pub fn forward(
     }
 
     // 3. Run sdpaFwd (ANE)
-    kernels.sdpa_fwd.run_cached(&[&kernels.bufs.sdpa_fwd_in], &[&kernels.bufs.sdpa_fwd_out]).expect("ANE eval failed");
+    kernels.sdpa_fwd.run_cached_direct(&[&kernels.bufs.sdpa_fwd_in], &[&kernels.bufs.sdpa_fwd_out]).expect("ANE eval failed");
 
     // Extract: attn_out[Q_DIM,SEQ], Q_rope[Q_DIM,SEQ], K_rope[KV_DIM,SEQ], V[KV_DIM,SEQ]
     let mut attn_out = vec![0.0f32; q_dim * seq];
@@ -496,7 +496,7 @@ pub fn forward(
     }
 
     // 5. Run woFwd (ANE)
-    kernels.wo_fwd.run_cached(&[&kernels.bufs.wo_fwd_in], &[&kernels.bufs.wo_fwd_out]).expect("ANE eval failed");
+    kernels.wo_fwd.run_cached_direct(&[&kernels.bufs.wo_fwd_in], &[&kernels.bufs.wo_fwd_out]).expect("ANE eval failed");
 
     // Read o_out directly from output IOSurface
     let mut o_out = vec![0.0f32; dim * seq];
@@ -527,7 +527,7 @@ pub fn forward(
     }
 
     // 8. Run ffnFused (ANE)
-    kernels.ffn_fused.run_cached(&[&kernels.bufs.ffn_fused_in], &[&kernels.bufs.ffn_fused_out]).expect("ANE eval failed");
+    kernels.ffn_fused.run_cached_direct(&[&kernels.bufs.ffn_fused_in], &[&kernels.bufs.ffn_fused_out]).expect("ANE eval failed");
 
     // Extract: x_next[DIM,SEQ], h1[HIDDEN,SEQ], h3[HIDDEN,SEQ], gate[HIDDEN,SEQ]
     let mut x_next = vec![0.0f32; dim * seq];
@@ -598,7 +598,7 @@ pub fn forward_into(
     let ffn_out_ch = ffn_fused::output_channels(cfg);
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
-            kernels.sdpa_fwd.run_cached(&[&kernels.bufs.sdpa_fwd_in], &[&kernels.bufs.sdpa_fwd_out]).expect("ANE eval failed");
+            kernels.sdpa_fwd.run_cached_direct(&[&kernels.bufs.sdpa_fwd_in], &[&kernels.bufs.sdpa_fwd_out]).expect("ANE eval failed");
         });
         // Stage woFwd weights
         {
@@ -638,7 +638,7 @@ pub fn forward_into(
     }
 
     // 5. Run woFwd (ANE) — ffnFused weights already staged in step 3 during sdpaFwd
-    kernels.wo_fwd.run_cached(&[&kernels.bufs.wo_fwd_in], &[&kernels.bufs.wo_fwd_out]).expect("ANE eval failed");
+    kernels.wo_fwd.run_cached_direct(&[&kernels.bufs.wo_fwd_in], &[&kernels.bufs.wo_fwd_out]).expect("ANE eval failed");
 
     // Read o_out
     {
@@ -662,7 +662,7 @@ pub fn forward_into(
     }
 
     // 8. Run ffnFused (ANE)
-    kernels.ffn_fused.run_cached(&[&kernels.bufs.ffn_fused_in], &[&kernels.bufs.ffn_fused_out]).expect("ANE eval failed");
+    kernels.ffn_fused.run_cached_direct(&[&kernels.bufs.ffn_fused_in], &[&kernels.bufs.ffn_fused_out]).expect("ANE eval failed");
 
     // Extract: x_next + cache intermediates
     {
@@ -724,7 +724,7 @@ pub fn forward_into_pipelined(
     let ffn_out_ch = ffn_fused::output_channels(cfg);
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
-            kernels.sdpa_fwd.run_cached(&[&kernels.bufs.sdpa_fwd_in], &[&kernels.bufs.sdpa_fwd_out]).expect("ANE eval failed");
+            kernels.sdpa_fwd.run_cached_direct(&[&kernels.bufs.sdpa_fwd_in], &[&kernels.bufs.sdpa_fwd_out]).expect("ANE eval failed");
         });
         // Stage woFwd weights
         {
@@ -773,7 +773,7 @@ pub fn forward_into_pipelined(
     }
 
     // 5. Run woFwd (ANE)
-    kernels.wo_fwd.run_cached(&[&kernels.bufs.wo_fwd_in], &[&kernels.bufs.wo_fwd_out]).expect("ANE eval failed");
+    kernels.wo_fwd.run_cached_direct(&[&kernels.bufs.wo_fwd_in], &[&kernels.bufs.wo_fwd_out]).expect("ANE eval failed");
 
     {
         let locked = kernels.bufs.wo_fwd_out.as_f32_slice();
@@ -796,7 +796,7 @@ pub fn forward_into_pipelined(
     }
 
     // 8. Run ffnFused (ANE)
-    kernels.ffn_fused.run_cached(&[&kernels.bufs.ffn_fused_in], &[&kernels.bufs.ffn_fused_out]).expect("ANE eval failed");
+    kernels.ffn_fused.run_cached_direct(&[&kernels.bufs.ffn_fused_in], &[&kernels.bufs.ffn_fused_out]).expect("ANE eval failed");
 
     // Extract x_next ONLY — h1/h3/gate deferred to next layer's step 3
     {
@@ -897,7 +897,7 @@ pub fn forward_timed(
     let ffn_out_ch = ffn_fused::output_channels(cfg);
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
-            kernels.sdpa_fwd.run_cached(&[&kernels.bufs.sdpa_fwd_in], &[&kernels.bufs.sdpa_fwd_out]).expect("ANE eval failed");
+            kernels.sdpa_fwd.run_cached_direct(&[&kernels.bufs.sdpa_fwd_in], &[&kernels.bufs.sdpa_fwd_out]).expect("ANE eval failed");
         });
         // Stage woFwd weights
         {
@@ -947,7 +947,7 @@ pub fn forward_timed(
 
     // 6. ANE woFwd — ffnFused weights already staged in step 3
     let t = Instant::now();
-    kernels.wo_fwd.run_cached(&[&kernels.bufs.wo_fwd_in], &[&kernels.bufs.wo_fwd_out]).expect("ANE eval failed");
+    kernels.wo_fwd.run_cached_direct(&[&kernels.bufs.wo_fwd_in], &[&kernels.bufs.wo_fwd_out]).expect("ANE eval failed");
     let ane_wo_ms = t.elapsed().as_secs_f32() * 1000.0;
 
     // 7. Read woFwd output
@@ -980,7 +980,7 @@ pub fn forward_timed(
 
     // 10. ANE ffnFused
     let t = Instant::now();
-    kernels.ffn_fused.run_cached(&[&kernels.bufs.ffn_fused_in], &[&kernels.bufs.ffn_fused_out]).expect("ANE eval failed");
+    kernels.ffn_fused.run_cached_direct(&[&kernels.bufs.ffn_fused_in], &[&kernels.bufs.ffn_fused_out]).expect("ANE eval failed");
     let ane_ffn_ms = t.elapsed().as_secs_f32() * 1000.0;
 
     // 11. Read ffnFused output
@@ -1094,7 +1094,7 @@ pub fn backward_timed(
         stage_spatial(buf, dim, w2t_sp, &ws.dffn, seq, 0);
         stage_spatial(buf, dim, w2t_sp, &weights.w2, hidden, seq);
     }
-    kernels.ffn_bwd_w2t.run_cached(&[&kernels.bufs.ffn_bwd_w2t_in], &[&kernels.bufs.ffn_bwd_w2t_out]).expect("ANE eval failed");
+    kernels.ffn_bwd_w2t.run_cached_direct(&[&kernels.bufs.ffn_bwd_w2t_in], &[&kernels.bufs.ffn_bwd_w2t_out]).expect("ANE eval failed");
     {
         let locked = kernels.bufs.ffn_bwd_w2t_out.as_f32_slice();
         ws.dsilu_raw.copy_from_slice(&locked[..hidden * seq]);
@@ -1139,7 +1139,7 @@ pub fn backward_timed(
     let t = Instant::now();
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
-            kernels.ffn_bwd_w13t.run_cached(
+            kernels.ffn_bwd_w13t.run_cached_direct(
                 &[&kernels.bufs.ffn_bwd_w13t_in],
                 &[&kernels.bufs.ffn_bwd_w13t_out],
             ).expect("ANE eval failed");
@@ -1178,7 +1178,7 @@ pub fn backward_timed(
     // ASYNC: ANE wotBwd || pre-stage 3 of 4 sdpaBwd1 inputs (from forward cache)
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
-            kernels.wot_bwd.run_cached(&[&kernels.bufs.wot_bwd_in], &[&kernels.bufs.wot_bwd_out]).expect("ANE eval failed");
+            kernels.wot_bwd.run_cached_direct(&[&kernels.bufs.wot_bwd_in], &[&kernels.bufs.wot_bwd_out]).expect("ANE eval failed");
         });
         {
             let mut locked = kernels.bufs.sdpa_bwd1_in.as_f32_slice_mut();
@@ -1208,7 +1208,7 @@ pub fn backward_timed(
     let t = Instant::now();
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
-            kernels.sdpa_bwd1.run_cached(
+            kernels.sdpa_bwd1.run_cached_direct(
                 &[&kernels.bufs.sdpa_bwd1_in],
                 &[&kernels.bufs.sdpa_bwd1_out],
             ).expect("ANE eval failed");
@@ -1241,7 +1241,7 @@ pub fn backward_timed(
         pack_channels(buf, bwd2_in_ch, seq, &cache.q_rope, q_dim, 2 * score_ch);
         pack_channels(buf, bwd2_in_ch, seq, &cache.k_rope, q_dim, 2 * score_ch + q_dim);
     }
-    kernels.sdpa_bwd2.run_cached(&[&kernels.bufs.sdpa_bwd2_in], &[&kernels.bufs.sdpa_bwd2_out]).expect("ANE eval failed");
+    kernels.sdpa_bwd2.run_cached_direct(&[&kernels.bufs.sdpa_bwd2_in], &[&kernels.bufs.sdpa_bwd2_out]).expect("ANE eval failed");
     {
         let locked = kernels.bufs.sdpa_bwd2_out.as_f32_slice();
         read_channels_into(&locked, bwd2_out_ch, seq, 0, q_dim, &mut ws.dq);
@@ -1292,11 +1292,11 @@ pub fn backward_timed(
     let t = Instant::now();
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
-            kernels.q_bwd.run_cached(
+            kernels.q_bwd.run_cached_direct(
                 &[&kernels.bufs.q_bwd_in],
                 &[&kernels.bufs.q_bwd_out],
             ).expect("ANE eval failed");
-            kernels.kv_bwd.run_cached(
+            kernels.kv_bwd.run_cached_direct(
                 &[&kernels.bufs.kv_bwd_in],
                 &[&kernels.bufs.kv_bwd_out],
             ).expect("ANE eval failed");
@@ -1381,7 +1381,7 @@ pub fn backward(
         stage_spatial(buf, dim, w2t_sp, &ws.dffn, seq, 0);
         stage_spatial(buf, dim, w2t_sp, &weights.w2, hidden, seq);
     }
-    kernels.ffn_bwd_w2t.run_cached(&[&kernels.bufs.ffn_bwd_w2t_in], &[&kernels.bufs.ffn_bwd_w2t_out]).expect("ANE eval failed");
+    kernels.ffn_bwd_w2t.run_cached_direct(&[&kernels.bufs.ffn_bwd_w2t_in], &[&kernels.bufs.ffn_bwd_w2t_out]).expect("ANE eval failed");
 
     {
         let locked = kernels.bufs.ffn_bwd_w2t_out.as_f32_slice();
@@ -1423,7 +1423,7 @@ pub fn backward(
     // dW2 moved to step 9 (sdpaBwd1 overlap), dW1 moved to step 10 (sdpaBwd2 overlap)
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
-            kernels.ffn_bwd_w13t.run_cached(
+            kernels.ffn_bwd_w13t.run_cached_direct(
                 &[&kernels.bufs.ffn_bwd_w13t_in],
                 &[&kernels.bufs.ffn_bwd_w13t_out],
             ).expect("ANE eval failed");
@@ -1460,7 +1460,7 @@ pub fn backward(
     // ASYNC: ANE wotBwd || pre-stage 3 of 4 sdpaBwd1 inputs (from forward cache)
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
-            kernels.wot_bwd.run_cached(&[&kernels.bufs.wot_bwd_in], &[&kernels.bufs.wot_bwd_out]).expect("ANE eval failed");
+            kernels.wot_bwd.run_cached_direct(&[&kernels.bufs.wot_bwd_in], &[&kernels.bufs.wot_bwd_out]).expect("ANE eval failed");
         });
         {
             let mut locked = kernels.bufs.sdpa_bwd1_in.as_f32_slice_mut();
@@ -1488,7 +1488,7 @@ pub fn backward(
     // dW2 moved from step 5 to rebalance CPU load across async blocks
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
-            kernels.sdpa_bwd1.run_cached(
+            kernels.sdpa_bwd1.run_cached_direct(
                 &[&kernels.bufs.sdpa_bwd1_in],
                 &[&kernels.bufs.sdpa_bwd1_out],
             ).expect("ANE eval failed");
@@ -1520,7 +1520,7 @@ pub fn backward(
     // ASYNC: ANE sdpaBwd2 || pre-compute wqt+wkt+wvt + dW1 (moved from step 5 to rebalance)
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
-            kernels.sdpa_bwd2.run_cached(&[&kernels.bufs.sdpa_bwd2_in], &[&kernels.bufs.sdpa_bwd2_out]).expect("ANE eval failed");
+            kernels.sdpa_bwd2.run_cached_direct(&[&kernels.bufs.sdpa_bwd2_in], &[&kernels.bufs.sdpa_bwd2_out]).expect("ANE eval failed");
         });
         vdsp::mtrans(&weights.wq, q_dim, &mut ws.wqt, dim, dim, q_dim);
         vdsp::mtrans(&weights.wk, kv_dim, &mut ws.wkt, dim, dim, kv_dim);
@@ -1566,11 +1566,11 @@ pub fn backward(
     // while the main thread computes weight gradients.
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
-            kernels.q_bwd.run_cached(
+            kernels.q_bwd.run_cached_direct(
                 &[&kernels.bufs.q_bwd_in],
                 &[&kernels.bufs.q_bwd_out],
             ).expect("ANE eval failed");
-            kernels.kv_bwd.run_cached(
+            kernels.kv_bwd.run_cached_direct(
                 &[&kernels.bufs.kv_bwd_in],
                 &[&kernels.bufs.kv_bwd_out],
             ).expect("ANE eval failed");
@@ -1638,7 +1638,7 @@ pub fn backward_into(
     // Moving it here hides ~0.6ms/layer behind ANE dispatch time.
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
-            kernels.ffn_bwd_w2t.run_cached(&[&kernels.bufs.ffn_bwd_w2t_in], &[&kernels.bufs.ffn_bwd_w2t_out]).expect("ANE eval failed");
+            kernels.ffn_bwd_w2t.run_cached_direct(&[&kernels.bufs.ffn_bwd_w2t_in], &[&kernels.bufs.ffn_bwd_w2t_out]).expect("ANE eval failed");
         });
         vdsp::mtrans(&weights.w1, hidden, &mut ws.w1t, dim, dim, hidden);
         vdsp::mtrans(&weights.w3, hidden, &mut ws.w3t, dim, dim, hidden);
@@ -1684,7 +1684,7 @@ pub fn backward_into(
     // dW2 moved to step 9 (sdpaBwd1 overlap), dW1 moved to step 10 (sdpaBwd2 overlap)
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
-            kernels.ffn_bwd_w13t.run_cached(
+            kernels.ffn_bwd_w13t.run_cached_direct(
                 &[&kernels.bufs.ffn_bwd_w13t_in],
                 &[&kernels.bufs.ffn_bwd_w13t_out],
             ).expect("ANE eval failed");
@@ -1717,7 +1717,7 @@ pub fn backward_into(
     // ASYNC: ANE wotBwd || pre-stage 3 of 4 sdpaBwd1 inputs (from forward cache)
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
-            kernels.wot_bwd.run_cached(&[&kernels.bufs.wot_bwd_in], &[&kernels.bufs.wot_bwd_out]).expect("ANE eval failed");
+            kernels.wot_bwd.run_cached_direct(&[&kernels.bufs.wot_bwd_in], &[&kernels.bufs.wot_bwd_out]).expect("ANE eval failed");
         });
         {
             let mut locked = kernels.bufs.sdpa_bwd1_in.as_f32_slice_mut();
@@ -1745,7 +1745,7 @@ pub fn backward_into(
     // dW2 = dffn @ gate^T — both available since step 1 (dffn) and forward cache (gate).
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
-            kernels.sdpa_bwd1.run_cached(
+            kernels.sdpa_bwd1.run_cached_direct(
                 &[&kernels.bufs.sdpa_bwd1_in],
                 &[&kernels.bufs.sdpa_bwd1_out],
             ).expect("ANE eval failed");
@@ -1779,7 +1779,7 @@ pub fn backward_into(
     // reduces step 5 CPU to ~0.91ms. sdpaBwd2 ANE time absorbs the extra dW1 sgemm.
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
-            kernels.sdpa_bwd2.run_cached(&[&kernels.bufs.sdpa_bwd2_in], &[&kernels.bufs.sdpa_bwd2_out]).expect("ANE eval failed");
+            kernels.sdpa_bwd2.run_cached_direct(&[&kernels.bufs.sdpa_bwd2_in], &[&kernels.bufs.sdpa_bwd2_out]).expect("ANE eval failed");
         });
         vdsp::mtrans(&weights.wq, q_dim, &mut ws.wqt, dim, dim, q_dim);
         vdsp::mtrans(&weights.wk, kv_dim, &mut ws.wkt, dim, dim, kv_dim);
@@ -1826,11 +1826,11 @@ pub fn backward_into(
     // (~0.5ms) with CPU dW time instead of running kvBwd fully sequentially.
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
-            kernels.q_bwd.run_cached(
+            kernels.q_bwd.run_cached_direct(
                 &[&kernels.bufs.q_bwd_in],
                 &[&kernels.bufs.q_bwd_out],
             ).expect("ANE eval failed");
-            kernels.kv_bwd.run_cached(
+            kernels.kv_bwd.run_cached_direct(
                 &[&kernels.bufs.kv_bwd_in],
                 &[&kernels.bufs.kv_bwd_out],
             ).expect("ANE eval failed");
