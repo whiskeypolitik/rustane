@@ -11,7 +11,7 @@ use std::time::Instant;
 
 #[test]
 #[ignore] // Run manually: cargo test -p engine --test bench_step_time --release -- --ignored --nocapture
-fn bench_training_step() {
+fn bench_768() {
     let cfg = ModelConfig::gpt_karpathy();
 
     println!("\n=== Rustane Training Step Benchmark ===");

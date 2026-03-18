@@ -22,6 +22,15 @@ struct Args {
     total_steps: u32,
     warmup_steps: u32,
     max_lr: f32,
+    accum_steps: u32,
+    loss_scale: f32,
+    grad_clip: f32,
+    beta2: f32,
+    eps: f32,
+    weight_decay: f32,
+    embed_lr_scale: f32,
+    min_lr_frac: f32,
+    matrix_lr_scale: f32,
     val_interval: u32,
     val_steps: u32,
     checkpoint_interval: u32,
@@ -37,6 +46,15 @@ fn parse_args() -> Args {
     let mut total_steps = 72000u32;
     let mut warmup_steps = 0u32; // 0 = auto (2% of total)
     let mut max_lr = 0.0f32;     // 0 = auto
+    let mut accum_steps = 0u32;  // 0 = default (10)
+    let mut loss_scale = 0.0f32; // 0 = default (256)
+    let mut grad_clip = 0.0f32;  // 0 = default (1.0)
+    let mut beta2 = 0.0f32;     // 0 = default
+    let mut eps = 0.0f32;       // 0 = default
+    let mut weight_decay = -1.0f32; // -1 = default (allows 0.0 as explicit value)
+    let mut embed_lr_scale = -1.0f32; // -1 = default
+    let mut min_lr_frac = -1.0f32;    // -1 = default
+    let mut matrix_lr_scale = -1.0f32; // -1 = default
     let mut val_interval = 500u32;
     let mut val_steps = 20u32;
     let mut checkpoint_interval = 1000u32;
@@ -52,6 +70,15 @@ fn parse_args() -> Args {
             "--steps" => { total_steps = args[i+1].parse().unwrap(); i += 2; }
             "--warmup" => { warmup_steps = args[i+1].parse().unwrap(); i += 2; }
             "--lr" => { max_lr = args[i+1].parse().unwrap(); i += 2; }
+            "--accum" => { accum_steps = args[i+1].parse().unwrap(); i += 2; }
+            "--loss-scale" => { loss_scale = args[i+1].parse().unwrap(); i += 2; }
+            "--grad-clip" => { grad_clip = args[i+1].parse().unwrap(); i += 2; }
+            "--beta2" => { beta2 = args[i+1].parse().unwrap(); i += 2; }
+            "--eps" => { eps = args[i+1].parse().unwrap(); i += 2; }
+            "--wd" => { weight_decay = args[i+1].parse().unwrap(); i += 2; }
+            "--embed-lr" => { embed_lr_scale = args[i+1].parse().unwrap(); i += 2; }
+            "--min-lr-frac" => { min_lr_frac = args[i+1].parse().unwrap(); i += 2; }
+            "--matrix-lr" => { matrix_lr_scale = args[i+1].parse().unwrap(); i += 2; }
             "--val-interval" => { val_interval = args[i+1].parse().unwrap(); i += 2; }
             "--val-steps" => { val_steps = args[i+1].parse().unwrap(); i += 2; }
             "--ckpt-interval" => { checkpoint_interval = args[i+1].parse().unwrap(); i += 2; }
@@ -77,6 +104,15 @@ fn parse_args() -> Args {
         total_steps,
         warmup_steps,
         max_lr,
+        accum_steps,
+        loss_scale,
+        grad_clip,
+        beta2,
+        eps,
+        weight_decay,
+        embed_lr_scale,
+        min_lr_frac,
+        matrix_lr_scale,
         val_interval,
         val_steps,
         checkpoint_interval,
@@ -167,10 +203,22 @@ fn write_f32_vec(buf: &mut Vec<u8>, v: &[f32]) {
 
 fn main() {
     let args = parse_args();
-    let cfg = match args.model.as_str() {
-        "gpt_karpathy" => ModelConfig::gpt_karpathy(),
-        "gpt_1024" => ModelConfig::gpt_1024(),
-        other => { eprintln!("Unknown model: {other} (use gpt_karpathy or gpt_1024)"); std::process::exit(1); }
+    let cfg = if args.model.starts_with("custom:") {
+        // custom:dim,hidden,nlayers,seq  e.g. custom:1024,2816,12,256
+        let parts: Vec<usize> = args.model[7..].split(',').map(|s| s.parse().unwrap()).collect();
+        let (dim, hidden, nl, seq) = (parts[0], parts[1], parts[2], parts[3]);
+        let heads = dim / 128;
+        ModelConfig {
+            dim, hidden, heads, kv_heads: heads, hd: 128, seq, nlayers: nl,
+            vocab: 8192, q_dim: dim, kv_dim: dim, gqa_ratio: 1,
+        }
+    } else {
+        match args.model.as_str() {
+            "gpt_karpathy" => ModelConfig::gpt_karpathy(),
+            "gpt_1024" => ModelConfig::gpt_1024(),
+            "mha_28l" => ModelConfig::mha_28l(),
+            other => { eprintln!("Unknown model: {other}"); std::process::exit(1); }
+        }
     };
 
     let per_layer = cfg.dim * cfg.q_dim + cfg.dim * cfg.kv_dim * 2
@@ -216,11 +264,23 @@ fn main() {
     tc.total_steps = args.total_steps;
     tc.warmup_steps = args.warmup_steps;
     tc.max_lr = args.max_lr;
+    if args.accum_steps > 0 { tc.accum_steps = args.accum_steps; }
+    if args.loss_scale > 0.0 { tc.loss_scale = args.loss_scale; }
+    if args.grad_clip > 0.0 { tc.grad_clip = args.grad_clip; }
+    if args.beta2 > 0.0 { tc.beta2 = args.beta2; }
+    if args.eps > 0.0 { tc.eps = args.eps; }
+    if args.weight_decay >= 0.0 { tc.weight_decay = args.weight_decay; }
+    if args.embed_lr_scale >= 0.0 { tc.embed_lr_scale = args.embed_lr_scale; }
+    if args.min_lr_frac >= 0.0 { tc.min_lr_frac = args.min_lr_frac; }
+    if args.matrix_lr_scale >= 0.0 { tc.matrix_lr_scale = args.matrix_lr_scale; }
 
     println!("\nTraining config:");
-    println!("  lr: {:.0e} (warmup {} → cosine)", tc.max_lr, tc.warmup_steps);
+    println!("  lr: {:.0e} (warmup {} → cosine, min_lr_frac: {})", tc.max_lr, tc.warmup_steps, tc.min_lr_frac);
     println!("  accum: {} microbatches, loss_scale: {}", tc.accum_steps, tc.loss_scale);
-    println!("  softcap: {}, grad_clip: {}", tc.softcap, tc.grad_clip);
+    println!("  beta1: {}, beta2: {}, eps: {:.0e}", tc.beta1, tc.beta2, tc.eps);
+    println!("  weight_decay: {}, grad_clip: {}", tc.weight_decay, tc.grad_clip);
+    println!("  embed_lr_scale: {}, matrix_lr_scale: {}", tc.embed_lr_scale, tc.matrix_lr_scale);
+    println!("  softcap: {}", tc.softcap);
     println!("  total steps: {}", tc.total_steps);
     println!();
 

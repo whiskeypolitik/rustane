@@ -223,7 +223,10 @@ pub fn forward_ws(
     rmsnorm::forward_channel_first(&ws.x_prenorm, &weights.gamma_final, &mut ws.x_final, &mut ws.rms_inv_final, dim, seq);
 
     // 5. Logits: x_final^T @ embed^T → [SEQ, VOCAB]
+    //    sgemm_at uses beta=1.0 (C += A@B^T), so zero logits first to prevent
+    //    accumulation across microbatch calls.
     vdsp::mtrans(&ws.x_final, seq, &mut ws.x_final_row, dim, dim, seq);
+    ws.logits.fill(0.0);
     vdsp::sgemm_at(&ws.x_final_row, seq, dim, &weights.embed, vocab, &mut ws.logits);
 
     // 6. Softcap: logits = softcap * tanh(logits / softcap)

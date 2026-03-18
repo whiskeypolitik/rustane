@@ -50,4 +50,23 @@ impl ModelConfig {
             gqa_ratio: 1,
         }
     }
+
+    /// MHA-28L: Qwen3-0.6B skeleton with MHA — ~390M params
+    /// Mirrors Qwen3-0.6B (28L/1024/3072/s256) but MHA instead of GQA.
+    /// IOSurface alignment verified: SDPA=3328(÷16), FFN=9728(÷16), WO=1280(÷16).
+    pub fn mha_28l() -> Self {
+        Self {
+            dim: 1024,
+            hidden: 3072,
+            heads: 8,
+            kv_heads: 8,
+            hd: 128,
+            seq: 256,
+            nlayers: 28,
+            vocab: 8192,
+            q_dim: 1024,
+            kv_dim: 1024,
+            gqa_ratio: 1,
+        }
+    }
 }
