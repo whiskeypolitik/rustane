@@ -113,6 +113,30 @@ fn bench_training_step_1024() {
     bench_config(ModelConfig::gpt_1024(), "gpt_1024 (8L, 1024dim)");
 }
 
+#[test]
+#[ignore]
+fn bench_600m() {
+    let cfg = ModelConfig::target_600m();
+    println!("~{:.0}M params", cfg.param_count() as f64 / 1e6);
+    bench_config(cfg, "target_600m (20L, 1536dim)");
+}
+
+#[test]
+#[ignore]
+fn bench_800m() {
+    let cfg = ModelConfig::target_800m();
+    println!("~{:.0}M params", cfg.param_count() as f64 / 1e6);
+    bench_config(cfg, "target_800m (24L, 1792dim)");
+}
+
+#[test]
+#[ignore]
+fn bench_1b() {
+    let cfg = ModelConfig::target_1b();
+    println!("~{:.0}M params", cfg.param_count() as f64 / 1e6);
+    bench_config(cfg, "target_1b (28L, 2048dim)");
+}
+
 fn bench_config(cfg: ModelConfig, name: &str) {
     println!("\n=== Rustane Training Step Benchmark ===");
     println!("Model: {} (NL={}, DIM={}, HIDDEN={}, SEQ={}, VOCAB={})",

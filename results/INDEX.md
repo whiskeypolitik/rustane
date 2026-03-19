@@ -24,3 +24,4 @@
 | 2026-03-11 | — | Rust vs Obj-C optimization | 7 optimization opportunities, ~15-25% speedup. IOSurface reuse is #1. Honest: ANE dominates 70-80%. | [rust_vs_objc_optimization.md](rust_vs_objc_optimization.md) |
 | 2026-03-11 | 4.5 | Optimization round 1 | IOSurface reuse + pre-alloc scratch + vectorized Adam + LTO. 525→397ms/step (**24% faster**). 47/47 tests pass. | crates/engine/tests/bench_step_time.rs |
 | 2026-03-11 | — | Deep Rust vs Obj-C comparison | Rust 3.7x slower per microbatch (326ms vs 89ms). Root cause: synchronous ANE dispatch. Path to parity via async pipeline. | [rust_vs_objc_deep_comparison.md](rust_vs_objc_deep_comparison.md) |
+| 2026-03-18 | — | Parameter sweep (600M/1B/1.5B) | Wide+shallow wins: 11-17% faster tok/s. 15 configs, all train without NaN. C variant (fewer layers, bigger matmuls) best at every scale. | [2026-03-18_1830_param-sweep.md](2026-03-18_1830_param-sweep.md) |
