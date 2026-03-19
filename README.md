@@ -93,13 +93,19 @@ cargo run -p engine --release --bin train -- \
 
 ## Hardware Requirements
 
+Any Apple Silicon Mac with 18GB+ RAM. The ANE is the same 16-core design across M1-M4. Only RAM differs.
+
+Tested on M4 Max 128GB. Other configs are estimates based on RAM scaling.
+
 | Hardware | Memory | Training Ceiling | Forward Ceiling |
 |----------|--------|-----------------|-----------------|
-| M4 Max 128GB | 128 GB | **~5B** (85GB) | **~30B** (130GB) |
-| M4 Max 64GB | 64 GB | ~3B | ~15B |
-| M4 Pro 48GB | 48 GB | ~1.5B | ~10B |
-| M4 Pro 24GB | 24 GB | ~600M | ~5B |
-| M3/M4 Ultra 512GB | 512 GB | ~20B | ~100B+ |
+| M1/M2/M3 Pro 18GB | 18 GB | ~300M | ~3B |
+| M1/M2/M3 Pro 36GB | 36 GB | ~1B | ~7B |
+| M1/M2/M3/M4 Max 64GB | 64 GB | ~3B | ~15B |
+| M3/M4 Max 96GB | 96 GB | ~5B | ~20B |
+| **M3/M4 Max 128GB** | **128 GB** | **~5B** (tested) | **~30B** (tested) |
+| M3 Ultra 192GB | 192 GB | ~10B | ~40B+ |
+| M3 Ultra 512GB | 512 GB | ~20B | ~100B+ |
 
 ## ANE Gotchas
 
