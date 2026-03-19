@@ -1,119 +1,128 @@
 # rustane
 
-Rust-native training + inference engine for Apple Neural Engine and Metal GPU.
+Rust training + inference engine for Apple Neural Engine (ANE) + Metal GPU.
 
-Train on ANE (private APIs) → export weights → run hybrid ANE prefill + Metal decode → port to Jetson via candle-rs + CUDA.
+Training pipeline validated from 48M to 5B parameters. Forward pass confirmed to 30B. All on M4 Max 128GB using reverse-engineered private ANE APIs.
 
 ## What This Does
 
-Rustane is the first training-capable, memory-safe Rust stack for the Apple Neural Engine. It uses reverse-engineered private APIs (`_ANEClient`, `_ANEInMemoryModel`) to compile and evaluate MIL kernels directly on ANE hardware — no CoreML, no black-box scheduler.
+Rustane is the first training-capable, memory-safe Rust engine for the Apple Neural Engine. It uses reverse-engineered private APIs (`_ANEClient`, `_ANEInMemoryModel`) to compile and evaluate MIL kernels directly on ANE hardware — no CoreML, no black-box scheduler.
 
-The engine trains transformer models (up to ~1.5B parameters on 128GB M4 Max) at 3-5W power draw, leaving the GPU completely free for other work. Trained weights export via SafeTensors for inference anywhere.
+The engine trains transformer models at 3-5W power draw, leaving the GPU completely free. Trained weights export via SafeTensors for inference anywhere.
 
-## Status
+## Scale Results (M4 Max 128GB)
 
-Research complete (10 documents, 16 parallel research agents). Pre-coding validation in progress.
+### Training Pipeline Validation
+
+25 architecture configs tested across 5 scales. Each validates: compile + forward + backward + Adam + loss decrease.
+
+| Scale | Params | ms/step | tok/s | RAM | Status |
+|-------|--------|---------|-------|-----|--------|
+| 600M | 579M | 865 | 592 | ~12GB | Pass |
+| 1B | 1.3B | 2,012 | 254 | ~25GB | Pass |
+| 1.5B | 1.9B | 2,775 | 184 | ~30GB | Pass |
+| 3B | 3.2B | 4,639 | 110 | ~55GB | Pass |
+| **5B** | **5.0B** | **7,940** | **64** | **~85GB** | **Pass** |
+
+### Forward-Only (no backward/optimizer)
+
+| Scale | Forward Time | RAM |
+|-------|-------------|-----|
+| 7B | 3.1s | 31GB |
+| 10B | 4.7s | 46GB |
+| 15B | 27s | 70GB |
+| 20B | 41s | 93GB |
+| **30B** | **75s** | **130GB** |
+
+No ANE compilation ceiling found. The limit is RAM, not the chip.
+
+### Key Findings
+
+- **Architecture crossover at 3B**: wide+shallow wins below (fewer ANE dispatches), deep+narrow wins above (smaller matmuls more efficient)
+- **Efficiency cliff at dim=5120**: forward time jumps 4.7x per layer. Keep dim at or below 4096 for ANE.
+- **Practical training ceiling**: ~5B on 128GB. An M3/M4 Ultra with 512GB could reach ~20B.
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                      cli crate                       │
-│              (train / infer / export)                 │
-└─────────────┬───────────────────────┬───────────────┘
-              │                       │
-┌─────────────▼───────────────────────▼───────────────┐
-│                    engine crate                       │
-│  Training loop │ Inference │ Optimizer │ CPU ops      │
-│  Checkpoint I/O │ Config │ KV cache │ f32↔f16        │
+│                      engine crate                    │
+│  Training loop | Forward/Backward | Adam optimizer   │
+│  ANE kernels (10) | CPU ops (vDSP) | Metal Adam     │
 └───┬─────────────────────────────────────────┬───────┘
     │                                         │
 ┌───▼──────────────┐           ┌──────────────▼───────┐
 │   ane-bridge     │           │   metal-decode       │
-│   (Apple only)   │           │   (Apple only)       │
-│                  │           │                      │
-│ Pure Rust objc2  │           │ Metal compute shaders│
-│ dlopen + FFI     │           │ q8_gemv, rmsnorm,    │
-│ IOSurface I/O    │           │ rope, sdpa_causal    │
-│ MIL generation   │           │ Single cmd buffer    │
-│ Dynamic weights  │           │ Zero allocations     │
+│   ANE private    │           │   Metal compute      │
+│   API FFI        │           │   shaders (planned)  │
+│   IOSurface I/O  │           │   Single-token       │
+│   MIL generation │           │   decode path        │
 └──────────────────┘           └──────────────────────┘
-
-Future backend:
-┌──────────────────┐
-│ candle + CUDA    │
-│ (Jetson / edge)  │
-└──────────────────┘
 ```
 
 ### Crates
 
-- **ane-bridge** — Safe Rust FFI to ANE private APIs via dlopen. MIL kernel generation, IOSurface weight packing, dynamic weight pipeline (compile once, update via memcpy).
-- **metal-decode** — Custom Metal shaders for single-token decode. One command buffer per token, zero allocations. Kernels: q8_gemv, q4_gemv, rmsnorm, rope, sdpa_causal.
-- **engine** — Hybrid orchestrator. Training: ANE forward/backward + CPU optimizer + async dW overlap. Inference: ANE prefill (fused FFN mega-kernels) + Metal GPU decode.
+- **ane-bridge** — Safe Rust FFI to ANE private APIs via objc2/dlopen. MIL kernel generation, IOSurface weight packing, dynamic weight pipeline.
+- **metal-decode** — Metal shaders for single-token decode (planned).
+- **engine** — Training orchestrator: ANE forward (10 fused kernels), CPU backward (Accelerate sgemm), Metal/CPU Adam optimizer.
 
-## Hardware
-
-Optimized for 128GB Apple Silicon. The install script (coming soon) will detect your hardware and tell you what's possible.
-
-| Hardware | Memory | Max Model | Notes |
-|----------|--------|-----------|-------|
-| M4 Max 128GB | 128 GB | **~1.5B** | Sweet spot: DIM=1536, HIDDEN=5120, NL=48 |
-| M4 Max 64GB | 64 GB | ~0.8B | Comfortable for 0.6B Qwen3-style |
-| M4 Pro 48GB | 48 GB | ~0.6B | Full training feasible |
-| M4 Pro 24GB | 24 GB | ~0.3B | Tight but works |
-| M-series 16GB | 16 GB | ~0.1B | Research/prototype only |
-
-The bottleneck is ANE compiler limits (16,384 spatial dim, ~32K channels, ~32MB SRAM), not memory. See `dev/research/10-remaining-gaps-and-decisions.md` for the full scaling analysis.
-
-Future: NVIDIA Jetson deployment via candle-rs + CUDA backend.
-
-## Setup
+## Quick Start
 
 ```bash
-# Requires Rust 1.94.0+ and macOS 15+
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-rustup default stable
-
+# Requires Rust 1.94.0+ and macOS 15+ on Apple Silicon
 cargo build
-cargo test
+cargo test -p engine --release
+
+# Run training validation at 600M
+cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_600m_a
+
+# Run the full parameter sweep (600M to 5B, ~60 min)
+cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_full
+
+# Forward-only scale ladder (5B to 30B, ~8 min)
+cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_scale_ladder
+
+# Train on real data (needs climbmix-400B tokenized data)
+cargo run -p engine --release --bin train -- \
+  --model custom:1536,4096,20,512 --data /path/to/train.bin \
+  --lr 3e-4 --accum 1 --warmup 3% \
+  --embed-lr 1.0 --beta2 0.99 \
+  --loss-scale 1 --grad-clip 1 \
+  --steps 72000
 ```
 
-## Training
+## Hardware Requirements
 
-```bash
-# Phase 1: ~48.8M param GPT (gpt_karpathy config)
-cargo run -p engine -- train --config gpt_karpathy
+| Hardware | Memory | Training Ceiling | Forward Ceiling |
+|----------|--------|-----------------|-----------------|
+| M4 Max 128GB | 128 GB | **~5B** (85GB) | **~30B** (130GB) |
+| M4 Max 64GB | 64 GB | ~3B | ~15B |
+| M4 Pro 48GB | 48 GB | ~1.5B | ~10B |
+| M4 Pro 24GB | 24 GB | ~600M | ~5B |
+| M3/M4 Ultra 512GB | 512 GB | ~20B | ~100B+ |
 
-# Phase 2: ~600M param Qwen3-style
-cargo run -p engine -- train --config qwen3_06b
+## ANE Gotchas
 
-# Phase 3: ~1.5B param (128GB M4 Max sweet spot)
-cargo run -p engine -- train --config qwen3_15b
-```
-
-*(Commands not yet functional — implementation in progress.)*
-
-## Key Numbers
-
-| Metric | ANE Training | MLX (GPU) Baseline |
-|--------|-------------|-------------------|
-| Peak TFLOPS | ~19 FP16 | ~36.86 FP16 |
-| Sustained TFLOPS | 15-19 (mega-kernels) | ~10.6 (~29% MFU) |
-| Power | 3-5W | 30-60W |
-| GPU availability | **Free** | Occupied |
-| Hardware used | ANE (16 cores) | GPU (40 cores) |
-
-ANE training leaves the GPU free for inference serving, display rendering, or simultaneous MLX experiments.
+- IOSurface spatial width must be multiple of 16 (silent data corruption otherwise)
+- ANE compiler fails on rsqrt/sqrt after reduce ops — use pow(-0.5)
+- Per-ANE-dispatch overhead: ~0.095ms (XPC + IOKit round-trip)
+- IOSurface stores fp32, ANE casts to fp16 internally
+- dim must be divisible by 128 (heads = dim/128, hd=128)
+- hidden must be divisible by 16
 
 ## Sister Projects
 
 - [autoresearch-ANE](https://github.com/ncdrone/autoresearch-ANE) — ANE training in native Obj-C (private APIs). The research foundation.
-- [autoresearch-mlx](https://github.com/ncdrone/autoresearch-mlx) — MLX training in Python. Architecture exploration (241 experiments, val_bpb 1.664→1.266).
+- [autoresearch-mlx](https://github.com/ncdrone/autoresearch-mlx) — MLX training in Python. Architecture exploration (241 experiments).
 
 ## Credits
 
-See [CREDITS.md](CREDITS.md) for the projects and people this builds on.
+See [CREDITS.md](CREDITS.md) for the full list. Key acknowledgments:
+
+- **maderix** — ANE private API reverse engineering, the foundational work everything builds on
+- **ane crate** (computer-graphics-tools) — Rust FFI to ANE, our ane-bridge base
+- **thebasedcapital/ane-infer** — First Rust + ANE + Metal prototype
+- **karpathy/llm.c** — Training architecture reference, climbmix-400B dataset
 
 ## License
 
