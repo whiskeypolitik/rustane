@@ -249,8 +249,13 @@ fn main() {
     // Compile kernels
     println!("\nCompiling 10 ANE kernels...");
     let t0 = Instant::now();
-    let kernels = CompiledKernels::compile(&cfg);
+    let mut kernels = CompiledKernels::compile(&cfg);
     println!("  compiled in {:.1}s", t0.elapsed().as_secs_f32());
+
+    // On M3/M4 Ultra (dual-die), ANE eval calls accumulate internal firmware
+    // state that degrades throughput after ~100K dispatches. Periodic recompile
+    // resets this state. Cost: ~1s every N steps. Set to 0 to disable.
+    let ane_refresh_interval: u32 = 150;
 
     // Init model + Metal Adam optimizer
     let metal_adam = MetalAdam::new().expect("Metal GPU required for training");
@@ -356,6 +361,15 @@ fn main() {
             if (step + 1) % args.checkpoint_interval == 0 || step + 1 == tc.total_steps {
                 save_checkpoint(&cfg, &weights, &opt, step + 1, dir);
             }
+        }
+
+        // Periodic ANE refresh: drop compiled kernels and recompile to reset
+        // firmware state. Prevents eval dispatch degradation on long runs.
+        if ane_refresh_interval > 0 && (step + 1) % ane_refresh_interval == 0 && step + 1 < tc.total_steps {
+            let rt0 = Instant::now();
+            drop(kernels);
+            kernels = CompiledKernels::compile(&cfg);
+            println!("  [ANE refresh in {:.2}s]", rt0.elapsed().as_secs_f32());
         }
     }
 
