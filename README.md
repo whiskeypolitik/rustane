@@ -36,11 +36,26 @@ The engine trains transformer models at 3-5W power draw, leaving the GPU complet
 
 No ANE compilation ceiling found. The limit is RAM, not the chip.
 
+### M5 Max Forward-Only Results
+
+Community results from [Anemll](https://github.com/Anemll) testing on M5 Max 128GB:
+
+| Scale | M4 Max | M5 Max | Speedup |
+|-------|--------|--------|---------|
+| 5B | 2,064ms | 1,910ms | 8% |
+| 7B | 3,132ms | 2,878ms | 8% |
+| 10B | 4,696ms | 4,329ms | 8% |
+| 13B | 21,962ms | 20,270ms | 8% |
+| 15B | 26,740ms | 24,303ms | 9% |
+| 20B | 40,933ms | 32,380ms | **21%** |
+
+Steady 8% faster at 5B-15B, 21% at 20B. The dim=5120 efficiency cliff is present on both chips.
+
 ### Key Findings
 
 - **Architecture crossover at 3B**: wide+shallow wins below (fewer ANE dispatches), deep+narrow wins above (smaller matmuls more efficient)
 - **Efficiency cliff at dim=5120**: forward time jumps 4.7x per layer. Keep dim at or below 4096 for ANE.
-- **Practical training ceiling**: ~5B on 128GB. An M3/M4 Ultra with 512GB could reach ~20B.
+- **Practical training ceiling**: ~5B on 128GB. An M3 Ultra with 512GB could reach ~20B.
 
 ## Architecture
 
