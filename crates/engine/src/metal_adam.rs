@@ -58,6 +58,9 @@ struct Readback {
 }
 
 /// A batch of Adam updates encoded into a single command buffer.
+/// Shared scalar buffers (beta1, beta2, eps, bc1, bc2, grad_scale) are created once
+/// per batch in `begin_batch()` and reused for every `add()` call.
+/// Per-call buffers (lr, weight_decay) are still created per-tensor since they vary.
 pub struct AdamBatch<'a> {
     adam: &'a MetalAdam,
     cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
@@ -65,6 +68,13 @@ pub struct AdamBatch<'a> {
     readbacks: Vec<Readback>,
     // Hold zero-copy buffers alive until commit+wait completes
     _held: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    // Shared scalar buffers: same for every tensor in this batch
+    b1_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    b2_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    eps_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    bc1_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    bc2_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    gs_buf: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
 impl MetalAdam {
@@ -83,15 +93,25 @@ impl MetalAdam {
     }
 
     /// Start a batch of Adam updates. Encode all dispatches, then call `execute()`.
-    pub fn begin_batch(&self) -> AdamBatch<'_> {
+    /// Pass hyperparams that are constant across all tensors in the batch.
+    /// Creates 6 shared scalar buffers once; `add()` only creates lr+wd per call.
+    pub fn begin_batch(&self, t: u32, beta1: f32, beta2: f32, eps: f32, grad_scale: f32) -> AdamBatch<'_> {
         let cmd = self.queue.commandBuffer().expect("command buffer");
         let enc = cmd.computeCommandEncoder().expect("compute encoder");
+        let bc1 = 1.0f32 / (1.0 - beta1.powi(t as i32));
+        let bc2 = 1.0f32 / (1.0 - beta2.powi(t as i32));
         AdamBatch {
             adam: self,
             cmd,
             enc,
             readbacks: Vec::new(),
             _held: Vec::new(),
+            b1_buf: self.scalar_buffer(beta1),
+            b2_buf: self.scalar_buffer(beta2),
+            eps_buf: self.scalar_buffer(eps),
+            bc1_buf: self.scalar_buffer(bc1),
+            bc2_buf: self.scalar_buffer(bc2),
+            gs_buf: self.scalar_buffer(grad_scale),
         }
     }
 
@@ -109,8 +129,8 @@ impl MetalAdam {
         eps: f32,
         weight_decay: f32,
     ) {
-        let mut batch = self.begin_batch();
-        batch.add(param, grad, m, v, t, lr, beta1, beta2, eps, weight_decay, 1.0);
+        let mut batch = self.begin_batch(t, beta1, beta2, eps, 1.0);
+        batch.add(param, grad, m, v, lr, weight_decay);
         batch.execute();
     }
 
@@ -162,20 +182,16 @@ impl MetalAdam {
 
 impl<'a> AdamBatch<'a> {
     /// Encode one Adam dispatch into this batch.
-    /// `grad_scale` is applied to gradients inline (fused descale+clip — avoids separate CPU pass).
+    /// Shared scalars (beta1, beta2, eps, bc1, bc2, grad_scale) come from `begin_batch()`.
+    /// Only `lr` and `weight_decay` are per-tensor (differ across embedding/matrix/norm groups).
     pub fn add(
         &mut self,
         param: &mut [f32],
         grad: &[f32],
         m: &mut [f32],
         v: &mut [f32],
-        t: u32,
         lr: f32,
-        beta1: f32,
-        beta2: f32,
-        eps: f32,
         weight_decay: f32,
-        grad_scale: f32,
     ) {
         let n = param.len();
         assert_eq!(grad.len(), n);
@@ -183,23 +199,15 @@ impl<'a> AdamBatch<'a> {
         assert_eq!(v.len(), n);
         let byte_len = n * 4;
 
-        let bc1 = 1.0f32 / (1.0 - beta1.powi(t as i32));
-        let bc2 = 1.0f32 / (1.0 - beta2.powi(t as i32));
-
         // Create buffers — zero-copy for large page-aligned data, copy for small
         let (param_buf, param_needs_rb) = self.smart_buffer_mut(param.as_mut_ptr(), byte_len);
         let grad_buf = self.smart_buffer_ro(grad.as_ptr(), byte_len);
         let (m_buf, m_needs_rb) = self.smart_buffer_mut(m.as_mut_ptr(), byte_len);
         let (v_buf, v_needs_rb) = self.smart_buffer_mut(v.as_mut_ptr(), byte_len);
 
+        // Per-tensor scalars (lr and wd vary across embed/matrix/norm groups)
         let lr_buf = self.adam.scalar_buffer(lr);
-        let b1_buf = self.adam.scalar_buffer(beta1);
-        let b2_buf = self.adam.scalar_buffer(beta2);
-        let eps_buf = self.adam.scalar_buffer(eps);
         let wd_buf = self.adam.scalar_buffer(weight_decay);
-        let bc1_buf = self.adam.scalar_buffer(bc1);
-        let bc2_buf = self.adam.scalar_buffer(bc2);
-        let gs_buf = self.adam.scalar_buffer(grad_scale);
 
         unsafe {
             self.enc.setComputePipelineState(&self.adam.pipeline);
@@ -208,13 +216,13 @@ impl<'a> AdamBatch<'a> {
             self.enc.setBuffer_offset_atIndex(Some(&m_buf), 0, 2);
             self.enc.setBuffer_offset_atIndex(Some(&v_buf), 0, 3);
             self.enc.setBuffer_offset_atIndex(Some(&lr_buf), 0, 4);
-            self.enc.setBuffer_offset_atIndex(Some(&b1_buf), 0, 5);
-            self.enc.setBuffer_offset_atIndex(Some(&b2_buf), 0, 6);
-            self.enc.setBuffer_offset_atIndex(Some(&eps_buf), 0, 7);
+            self.enc.setBuffer_offset_atIndex(Some(&self.b1_buf), 0, 5);
+            self.enc.setBuffer_offset_atIndex(Some(&self.b2_buf), 0, 6);
+            self.enc.setBuffer_offset_atIndex(Some(&self.eps_buf), 0, 7);
             self.enc.setBuffer_offset_atIndex(Some(&wd_buf), 0, 8);
-            self.enc.setBuffer_offset_atIndex(Some(&bc1_buf), 0, 9);
-            self.enc.setBuffer_offset_atIndex(Some(&bc2_buf), 0, 10);
-            self.enc.setBuffer_offset_atIndex(Some(&gs_buf), 0, 11);
+            self.enc.setBuffer_offset_atIndex(Some(&self.bc1_buf), 0, 9);
+            self.enc.setBuffer_offset_atIndex(Some(&self.bc2_buf), 0, 10);
+            self.enc.setBuffer_offset_atIndex(Some(&self.gs_buf), 0, 11);
 
             let tg = self.adam.pipeline.maxTotalThreadsPerThreadgroup().min(256);
             let grid = MTLSize { width: n, height: 1, depth: 1 };

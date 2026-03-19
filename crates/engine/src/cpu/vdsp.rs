@@ -234,6 +234,12 @@ pub fn recf(a: &[f32], out: &mut [f32]) {
     unsafe { vvrecf(out.as_mut_ptr(), a.as_ptr(), &n) }
 }
 
+/// In-place reciprocal: v[i] = 1/v[i]
+pub fn recf_inplace(v: &mut [f32]) {
+    let n = v.len() as c_int;
+    unsafe { vvrecf(v.as_mut_ptr(), v.as_ptr(), &n) }
+}
+
 /// Matrix transpose: C[n,m] = A[m,n]^T
 /// A is m rows × n cols, C is n rows × m cols.
 pub fn mtrans(a: &[f32], a_cols: usize, c: &mut [f32], c_cols: usize, m: usize, n: usize) {

@@ -85,6 +85,68 @@ pub fn build_dual(ic: usize, oc: usize, seq: usize) -> Graph {
     g
 }
 
+/// Build a single DynMatmul graph using conv1x1: y = conv1x1(acts, weights)
+/// Input: [1, ic, 1, seq + oc]
+/// Output: [1, oc, 1, seq]
+///
+/// Uses 4 ops (slice, slice, reshape, conv1x1) instead of 7 ops (matmul path).
+/// ANE is a convolution engine — conv1x1 should be 3x faster per maderix benchmarks.
+pub fn build_conv(ic: usize, oc: usize, seq: usize) -> Graph {
+    let sp = seq + oc;
+    let mut g = Graph::new();
+
+    let input = g.placeholder(Shape { batch: 1, channels: ic, height: 1, width: sp });
+
+    // Slice activations: [1, IC, 1, SEQ]
+    let acts = g.slice(input, [0, 0, 0, 0], [1, ic, 1, seq]);
+
+    // Slice weights: [1, IC, 1, OC]
+    let wts = g.slice(input, [0, 0, 0, seq], [1, ic, 1, oc]);
+
+    // Transpose weights: [1, IC, 1, OC] → [1, OC, 1, IC] (swap channels↔width)
+    // This puts weights in [OC, IC] row-major order needed by conv
+    let wts_t = g.transpose(wts, [0, 3, 2, 1]);
+
+    // Reshape to conv weight format: [1, OC, 1, IC] → [OC, IC, 1, 1]
+    let wts_conv = g.reshape(wts_t, Shape { batch: oc, channels: ic, height: 1, width: 1 });
+
+    // Conv1x1: [1, IC, 1, SEQ] * [OC, IC, 1, 1] → [1, OC, 1, SEQ]
+    let _out = g.convolution_2d_1x1_dynamic(acts, wts_conv);
+
+    g
+}
+
+/// Build a DualDynMatmul graph using conv1x1: two parallel conv1x1 ops summed.
+/// Input: [1, IC, 1, 2*SEQ + 2*OC]
+/// Output: [1, OC, 1, SEQ] (sum of both conv1x1 results)
+pub fn build_dual_conv(ic: usize, oc: usize, seq: usize) -> Graph {
+    let mut g = Graph::new();
+    let sp = 2 * seq + 2 * oc;
+
+    let input = g.placeholder(Shape { batch: 1, channels: ic, height: 1, width: sp });
+
+    // First conv1x1: acts1 * wts1
+    let acts1 = g.slice(input, [0, 0, 0, 0], [1, ic, 1, seq]);
+    let wts1 = g.slice(input, [0, 0, 0, seq], [1, ic, 1, oc]);
+    let wts1_t = g.transpose(wts1, [0, 3, 2, 1]);
+    let wts1_conv = g.reshape(wts1_t, Shape { batch: oc, channels: ic, height: 1, width: 1 });
+    let out1 = g.convolution_2d_1x1_dynamic(acts1, wts1_conv);
+
+    // Second conv1x1: acts2 * wts2
+    let off2_acts = seq + oc;
+    let off2_wts = 2 * seq + oc;
+    let acts2 = g.slice(input, [0, 0, 0, off2_acts], [1, ic, 1, seq]);
+    let wts2 = g.slice(input, [0, 0, 0, off2_wts], [1, ic, 1, oc]);
+    let wts2_t = g.transpose(wts2, [0, 3, 2, 1]);
+    let wts2_conv = g.reshape(wts2_t, Shape { batch: oc, channels: ic, height: 1, width: 1 });
+    let out2 = g.convolution_2d_1x1_dynamic(acts2, wts2_conv);
+
+    // Sum both paths
+    let _sum = g.addition(out1, out2);
+
+    g
+}
+
 /// IOSurface spatial width for a single DynMatmul kernel.
 pub fn spatial_width(seq: usize, oc: usize) -> usize {
     seq + oc

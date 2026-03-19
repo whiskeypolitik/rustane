@@ -10,3 +10,4 @@ models/
 *.log
 .env
 .DS_Store
+data/

@@ -84,6 +84,53 @@ pub fn step(
     }
 }
 
+/// Fused single-pass AdamW step — zero allocation, one memory traversal.
+///
+/// Same math as `step()` + Metal shader, but processes each element exactly once
+/// instead of 7+ separate vDSP passes. This reduces memory traffic from ~76 bytes/elem
+/// to ~28 bytes/elem (read grad/m/v/param once, write m/v/param once).
+///
+/// `grad_scale` is applied inline (matches Metal shader's `gscale` parameter).
+/// For no scaling, pass 1.0.
+pub fn step_fused(
+    param: &mut [f32],
+    grad: &[f32],
+    m: &mut [f32],
+    v: &mut [f32],
+    t: u32,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    weight_decay: f32,
+    grad_scale: f32,
+) {
+    let n = param.len();
+    debug_assert_eq!(grad.len(), n);
+    debug_assert_eq!(m.len(), n);
+    debug_assert_eq!(v.len(), n);
+    debug_assert!(t > 0);
+
+    let bc1 = 1.0f32 / (1.0 - beta1.powi(t as i32));
+    let bc2 = 1.0f32 / (1.0 - beta2.powi(t as i32));
+    let one_minus_beta1 = 1.0 - beta1;
+    let one_minus_beta2 = 1.0 - beta2;
+
+    // Single pass: read each array once, write param/m/v once.
+    // LLVM auto-vectorizes this loop with NEON instructions.
+    for i in 0..n {
+        let g = grad[i] * grad_scale;
+        let mi = beta1 * m[i] + one_minus_beta1 * g;
+        let vi = beta2 * v[i] + one_minus_beta2 * g * g;
+        m[i] = mi;
+        v[i] = vi;
+        let m_hat = mi * bc1;
+        let v_hat = vi * bc2;
+        let update = m_hat / (v_hat.sqrt() + eps);
+        param[i] -= lr * (update + weight_decay * param[i]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

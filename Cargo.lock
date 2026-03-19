@@ -40,6 +40,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 [[package]]
 name = "ane"
 version = "0.1.0"
+source = "git+https://github.com/ncdrone/ane?branch=main#016b754a7d6182d41144aee80eb83b572624bcff"
 dependencies = [
  "half",
  "hf-hub",
@@ -470,6 +471,7 @@ name = "engine"
 version = "0.1.0"
 dependencies = [
  "ane-bridge",
+ "libc",
  "memmap2",
  "metal-decode",
  "objc2",
