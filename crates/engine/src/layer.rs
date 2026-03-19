@@ -954,14 +954,17 @@ pub fn backward_timed(
     }
     let stage_run_ffn_bwd_w2t_ms = t.elapsed().as_secs_f32() * 1000.0;
 
-    // 3. SiLU derivative (vvexpf for batch exp, fused scalar loop for cache locality)
+    // 3. SiLU derivative (vvexpf + vvrecf precompute sig, then division-free scalar loop)
     let t = Instant::now();
     let n = hidden * seq;
     {
         vdsp::vsmul(&cache.h1, -1.0, &mut ws.neg_h1);
         vdsp::expf(&ws.neg_h1, &mut ws.exp_neg);
+        // Precompute sigmoid via vectorized reciprocal — eliminates scalar fdiv from hot loop
+        vdsp::vsadd(&ws.exp_neg, 1.0, &mut ws.neg_h1);  // neg_h1 = 1 + exp(-h1)
+        vdsp::recf_inplace(&mut ws.neg_h1);              // neg_h1 = sig = 1/(1+exp(-h1))
         for i in 0..n {
-            let sig = 1.0 / (1.0 + ws.exp_neg[i]);
+            let sig = ws.neg_h1[i];
             let silu_val = cache.h1[i] * sig;
             let silu_deriv = sig * (1.0 + cache.h1[i] * (1.0 - sig));
             ws.dh3[i] = ws.dsilu_raw[i] * silu_val;
@@ -1227,13 +1230,16 @@ pub fn backward(
         ws.dsilu_raw.copy_from_slice(&locked[..hidden * seq]);
     }
 
-    // ── 3. SiLU derivative (vvexpf + fused scalar loop) ──
+    // ── 3. SiLU derivative (vvexpf + vvrecf precompute sig, then division-free scalar loop) ──
     let n = hidden * seq;
     {
         vdsp::vsmul(&cache.h1, -1.0, &mut ws.neg_h1);
         vdsp::expf(&ws.neg_h1, &mut ws.exp_neg);
+        // Precompute sigmoid via vectorized reciprocal — eliminates scalar fdiv from hot loop
+        vdsp::vsadd(&ws.exp_neg, 1.0, &mut ws.neg_h1);  // neg_h1 = 1 + exp(-h1)
+        vdsp::recf_inplace(&mut ws.neg_h1);              // neg_h1 = sig = 1/(1+exp(-h1))
         for i in 0..n {
-            let sig = 1.0 / (1.0 + ws.exp_neg[i]);
+            let sig = ws.neg_h1[i];
             let silu_val = cache.h1[i] * sig;
             let silu_deriv = sig * (1.0 + cache.h1[i] * (1.0 - sig));
             ws.dh3[i] = ws.dsilu_raw[i] * silu_val;
@@ -1470,13 +1476,16 @@ pub fn backward_into(
         ws.dsilu_raw.copy_from_slice(&locked[..hidden * seq]);
     }
 
-    // 3. SiLU derivative
+    // 3. SiLU derivative (vvexpf + vvrecf precompute sig, then division-free scalar loop)
     let n = hidden * seq;
     {
         vdsp::vsmul(&cache.h1, -1.0, &mut ws.neg_h1);
         vdsp::expf(&ws.neg_h1, &mut ws.exp_neg);
+        // Precompute sigmoid via vectorized reciprocal — eliminates scalar fdiv from hot loop
+        vdsp::vsadd(&ws.exp_neg, 1.0, &mut ws.neg_h1);  // neg_h1 = 1 + exp(-h1)
+        vdsp::recf_inplace(&mut ws.neg_h1);              // neg_h1 = sig = 1/(1+exp(-h1))
         for i in 0..n {
-            let sig = 1.0 / (1.0 + ws.exp_neg[i]);
+            let sig = ws.neg_h1[i];
             let silu_val = cache.h1[i] * sig;
             let silu_deriv = sig * (1.0 + cache.h1[i] * (1.0 - sig));
             ws.dh3[i] = ws.dsilu_raw[i] * silu_val;
