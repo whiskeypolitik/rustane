@@ -92,12 +92,21 @@ pub fn compute_fingerprint(result: &BenchResult) -> String {
     hash.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Write a bench result to `target/bench-result.json`.
+/// Write a bench result to `target/bench-result.json` at the workspace root.
 pub fn write_result(result: &BenchResult) {
-    let path = "target/bench-result.json";
     let json = serde_json::to_string_pretty(result).unwrap();
-    std::fs::write(path, &json).unwrap();
-    println!("\n  📊 Result saved to {path}");
+    // Find workspace root via CARGO_MANIFEST_DIR at build time, or fall back to git
+    let ws_root = run_cmd("git", &["rev-parse", "--show-toplevel"]);
+    let path = if ws_root.is_empty() {
+        std::path::PathBuf::from("target/bench-result.json")
+    } else {
+        std::path::PathBuf::from(&ws_root).join("target/bench-result.json")
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&path, &json).expect("failed to write bench-result.json");
+    println!("\n  📊 Result saved to {}", path.display());
     println!("  Submit to leaderboard: make submit");
 }
 
