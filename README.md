@@ -10,35 +10,106 @@ Rustane is the first training-capable, memory-safe Rust engine for the Apple Neu
 
 The engine trains transformer models at 3-5W power draw, leaving the GPU completely free. Trained weights export via SafeTensors for inference anywhere.
 
-## Scale Results (M4 Max 128GB)
+## Benchmarking
 
-### Training Pipeline Validation
+Run `make help` to see all available commands.
 
-25 architecture configs tested across 5 scales. Each validates: compile + forward + backward + Adam + loss decrease.
+### Three Types of Tests
 
-| Scale | Params | ms/step | tok/s | RAM | Status |
-|-------|--------|---------|-------|-----|--------|
-| 600M | 579M | 865 | 592 | ~12GB | Pass |
-| 1B | 1.3B | 2,012 | 254 | ~25GB | Pass |
-| 1.5B | 1.9B | 2,775 | 184 | ~30GB | Pass |
-| 3B | 3.2B | 4,639 | 110 | ~55GB | Pass |
-| **5B** | **5.0B** | **7,940** | **64** | **~85GB** | **Pass** |
+| Test | What It Measures | Command | Time |
+|------|-----------------|---------|------|
+| **Training validation** | Full pipeline: compile + forward + backward + Adam + loss decrease | `make sweep-600m` | ~17s |
+| **Architecture sweep** | 5 variants per scale, finds optimal depth/width | `make sweep-full` | ~60 min |
+| **Forward-only probe** | Forward pass only (no backward/optimizer), tests scale ceiling | `make forward-ladder` | ~8 min |
 
-### Forward-Only (no backward/optimizer)
+### Quick Start Benchmarking
+
+```bash
+# Build and run unit tests first
+make build
+make test
+
+# Validate training pipeline at 600M (any Mac with 18GB+)
+make sweep-600m
+
+# Validate at each scale individually
+make sweep-1b        # needs ~25GB
+make sweep-3b        # needs ~55GB
+make sweep-5b        # needs ~85GB
+
+# Full sweep: 25 configs across 600M-5B (needs 85GB, ~60 min)
+make sweep-full
+
+# Forward-only: how far can your hardware go?
+make forward-7b      # needs ~31GB
+make forward-10b     # needs ~46GB
+make forward-ladder  # 5B to 20B, needs ~93GB
+make forward-ceiling # 25B to 30B, needs ~130GB
+```
+
+### What Results Look Like
+
+Training validation output:
+```
+============================================================
+  600m-A — 1536d/4096h/20L/seq512 — ~579M params — h/d=2.67x
+============================================================
+  [1/4] Compiling ANE kernels... 0.5s
+  [2/4] Forward pass... loss=9.0108
+  [3/4] Training 10 steps... 9.0108 → 8.9857 (delta=-0.0251)
+  [4/4] Timing 5 steps... 958ms/step (fwd=241 bwd=645 upd=55) = 535 tok/s
+```
+
+Forward-only output:
+```
+======================================================================
+  7B — 4096d/11008h/32L/seq512 — 6.51B params — est. 31.1GB
+======================================================================
+  [1/3] Compiling ANE kernels... 1.5s
+  [2/3] Allocating 31.1GB... 5.3s
+  [3/3] Forward pass (1 warmup + 3 timed)... 3132ms (loss=9.3228)
+```
+
+### Sharing Your Results
+
+Run a test, copy the output, open an issue with your hardware info. We collect results across chips — every data point matters.
+
+Include: chip model, RAM, macOS version, full test output.
+
+## Results
+
+### Training Pipeline Validation (M4 Max 128GB)
+
+Best config at each scale from 25 architecture variants (5 per scale). Each config validates: ANE kernel compilation, forward pass, backward pass, Adam weight update, loss decrease.
+
+| Scale | Params | Best Config | ms/step | tok/s | RAM |
+|-------|--------|-------------|---------|-------|-----|
+| 600M | 579M | wide+shallow (14L) | 865 | 592 | ~12GB |
+| 1B | 1.3B | wide+shallow (20L) | 2,012 | 254 | ~25GB |
+| 1.5B | 1.9B | wide+shallow (24L) | 2,775 | 184 | ~30GB |
+| 3B | 3.2B | baseline (40L) | 4,639 | 110 | ~55GB |
+| **5B** | **5.0B** | **deep+narrow (60L)** | **6,893** | **74** | **~85GB** |
+| 7B | 6.5B | baseline (32L) | 94,000 | 5 | ~112GB (swap) |
+
+### Forward-Only Scale Probes (M4 Max 128GB)
+
+No backward pass or optimizer — tests ANE kernel compilation and forward pass at extreme scale.
 
 | Scale | Forward Time | RAM |
 |-------|-------------|-----|
+| 5B | 2.1s | 25GB |
 | 7B | 3.1s | 31GB |
 | 10B | 4.7s | 46GB |
+| 13B | 22s | 59GB |
 | 15B | 27s | 70GB |
 | 20B | 41s | 93GB |
 | **30B** | **75s** | **130GB** |
 
 No ANE compilation ceiling found. The limit is RAM, not the chip.
 
-### M5 Max Forward-Only Results
+### Forward-Only: M5 Max (community)
 
-Community results from [Anemll](https://github.com/Anemll) testing on M5 Max 128GB:
+Results from [Anemll](https://github.com/Anemll) testing on M5 Max 128GB (forward-only):
 
 | Scale | M4 Max | M5 Max | Speedup |
 |-------|--------|--------|---------|
@@ -81,34 +152,9 @@ Steady 8% faster at 5B-15B, 21% at 20B. The dim=5120 efficiency cliff is present
 - **metal-decode** — Metal shaders for single-token decode (planned).
 - **engine** — Training orchestrator: ANE forward (10 fused kernels), CPU backward (Accelerate sgemm), Metal/CPU Adam optimizer.
 
-## Quick Start
-
-```bash
-# Requires Rust 1.94.0+ and macOS 15+ on Apple Silicon
-cargo build
-cargo test -p engine --release
-
-# Run training validation at 600M
-cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_600m_a
-
-# Run the full parameter sweep (600M to 5B, ~60 min)
-cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_full
-
-# Forward-only scale ladder (5B to 30B, ~8 min)
-cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_scale_ladder
-
-# Train on real data (needs climbmix-400B tokenized data)
-cargo run -p engine --release --bin train -- \
-  --model custom:1536,4096,20,512 --data /path/to/train.bin \
-  --lr 3e-4 --accum 1 --warmup 3% \
-  --embed-lr 1.0 --beta2 0.99 \
-  --loss-scale 1 --grad-clip 1 \
-  --steps 72000
-```
-
 ## Hardware Requirements
 
-Any Apple Silicon Mac with 18GB+ RAM. The ANE is the same 16-core design across M1-M4. Only RAM differs.
+Any Apple Silicon Mac with 18GB+ RAM. The ANE is the same 16-core design across M1-M5. Only RAM differs.
 
 Tested on M4 Max 128GB. Other configs are estimates based on RAM scaling.
 
@@ -116,9 +162,9 @@ Tested on M4 Max 128GB. Other configs are estimates based on RAM scaling.
 |----------|--------|-----------------|-----------------|
 | M1/M2/M3 Pro 18GB | 18 GB | ~300M | ~3B |
 | M1/M2/M3 Pro 36GB | 36 GB | ~1B | ~7B |
-| M1/M2/M3/M4 Max 64GB | 64 GB | ~3B | ~15B |
-| M3/M4 Max 96GB | 96 GB | ~5B | ~20B |
-| **M3/M4 Max 128GB** | **128 GB** | **~5B** (tested) | **~30B** (tested) |
+| M1/M2/M3/M4/M5 Max 64GB | 64 GB | ~3B | ~15B |
+| M3/M4/M5 Max 96GB | 96 GB | ~5B | ~20B |
+| **M3/M4/M5 Max 128GB** | **128 GB** | **~5B** (tested) | **~30B** (tested) |
 | M3 Ultra 192GB | 192 GB | ~10B | ~40B+ |
 | M3 Ultra 512GB | 512 GB | ~20B | ~100B+ |
 

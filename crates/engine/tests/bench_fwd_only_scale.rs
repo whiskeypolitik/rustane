@@ -9,6 +9,7 @@
 use engine::full_model::{self, ModelWeights, ModelForwardWorkspace, TrainConfig};
 use engine::layer::CompiledKernels;
 use engine::model::ModelConfig;
+use engine::bench_result;
 use std::time::Instant;
 
 /// Build a custom ModelConfig (all MHA, hd=128, vocab=8192).
@@ -86,6 +87,40 @@ fn run_fwd_probe(cfg: &ModelConfig, name: &str) -> FwdResult {
 
     println!("{fwd_ms:.0}ms (loss={loss:.4})");
     assert!(loss.is_finite(), "forward pass produced NaN/Inf at {name}");
+
+    // Write leaderboard-ready JSON
+    let mut bench = bench_result::BenchResult {
+        schema_version: 1,
+        rustane_version: env!("CARGO_PKG_VERSION").to_string(),
+        git_sha: bench_result::git_sha(),
+        benchmark: format!("fwd_{}", name.to_lowercase()),
+        config: bench_result::ModelInfo {
+            name: name.to_string(),
+            dim: cfg.dim,
+            hidden: cfg.hidden,
+            heads: cfg.heads,
+            nlayers: cfg.nlayers,
+            seq: cfg.seq,
+            params_m: params_b * 1000.0,
+        },
+        results: bench_result::TimingResults {
+            ms_per_step: fwd_ms,
+            ms_fwd: fwd_ms,
+            ms_bwd: 0.0,
+            ms_upd: 0.0,
+            tok_per_s: cfg.seq as f32 * 1000.0 / fwd_ms,
+            loss_start: loss,
+            loss_end: loss,
+            loss_delta: 0.0,
+        },
+        loss_trace: vec![loss],
+        hardware: bench_result::collect_hardware_info(),
+        submitter: bench_result::Submitter::default(),
+        timestamp_utc: bench_result::utc_timestamp(),
+        fingerprint: String::new(),
+    };
+    bench.fingerprint = bench_result::compute_fingerprint(&bench);
+    bench_result::write_result(&bench);
 
     FwdResult { name: name.to_string(), params_b, dim: cfg.dim, hidden: cfg.hidden,
                 nlayers: cfg.nlayers, compile_s, alloc_s, fwd_ms, loss, mem_est_gb }

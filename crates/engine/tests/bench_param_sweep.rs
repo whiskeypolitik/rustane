@@ -11,6 +11,7 @@ use engine::full_model::{self, ModelWeights, ModelGrads, ModelOptState, ModelFor
 use engine::layer::CompiledKernels;
 use engine::model::ModelConfig;
 use engine::metal_adam::MetalAdam;
+use engine::bench_result;
 use std::time::Instant;
 
 /// Build a custom ModelConfig (all MHA, hd=128, vocab=8192).
@@ -153,6 +154,40 @@ fn run_sweep(cfg: &ModelConfig, name: &str) -> SweepResult {
     println!("{ms_per_step:.0}ms/step (fwd={ms_fwd:.0} bwd={ms_bwd:.0} upd={ms_upd:.0}) = {tok_per_s:.0} tok/s");
 
     if !all_finite { println!("  WARNING: NaN/Inf detected!"); }
+
+    // Write leaderboard-ready JSON
+    let mut bench = bench_result::BenchResult {
+        schema_version: 1,
+        rustane_version: env!("CARGO_PKG_VERSION").to_string(),
+        git_sha: bench_result::git_sha(),
+        benchmark: format!("sweep_{}", name.to_lowercase().replace("-", "_")),
+        config: bench_result::ModelInfo {
+            name: name.to_string(),
+            dim: cfg.dim,
+            hidden: cfg.hidden,
+            heads: cfg.heads,
+            nlayers: cfg.nlayers,
+            seq: cfg.seq,
+            params_m,
+        },
+        results: bench_result::TimingResults {
+            ms_per_step,
+            ms_fwd,
+            ms_bwd,
+            ms_upd,
+            tok_per_s,
+            loss_start: loss0,
+            loss_end: final_loss,
+            loss_delta,
+        },
+        loss_trace: losses.clone(),
+        hardware: bench_result::collect_hardware_info(),
+        submitter: bench_result::Submitter::default(),
+        timestamp_utc: bench_result::utc_timestamp(),
+        fingerprint: String::new(),
+    };
+    bench.fingerprint = bench_result::compute_fingerprint(&bench);
+    bench_result::write_result(&bench);
 
     SweepResult {
         name: name.to_string(),
