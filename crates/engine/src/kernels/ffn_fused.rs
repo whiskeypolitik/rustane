@@ -82,6 +82,17 @@ pub fn build(cfg: &ModelConfig) -> Graph {
     g
 }
 
+/// ANE hard limit on input IOSurface spatial width.
+/// At 1B (hidden=5632, seq=512): sp = 2*512 + 3*5632 = 17,920 > 16,384.
+/// hidden=5120 (sp=16,384) is the exact boundary.
+pub const ANE_MAX_SPATIAL_WIDTH: usize = 16_384;
+
+/// Returns true when the fused FFN kernel exceeds the ANE spatial width limit
+/// and must be decomposed into separate dyn_matmul dispatches + CPU ops.
+pub fn needs_decomposition(cfg: &ModelConfig) -> bool {
+    input_spatial_width(cfg) > ANE_MAX_SPATIAL_WIDTH
+}
+
 /// Input spatial width for ffnFused.
 pub fn input_spatial_width(cfg: &ModelConfig) -> usize {
     2 * cfg.seq + 3 * cfg.hidden
