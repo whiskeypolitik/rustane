@@ -19,6 +19,7 @@ struct Args {
     data_path: PathBuf,
     val_path: Option<PathBuf>,
     token_bytes_path: Option<PathBuf>,
+    resume_path: Option<PathBuf>,
     total_steps: u32,
     warmup_steps: u32,
     max_lr: f32,
@@ -43,6 +44,7 @@ fn parse_args() -> Args {
     let mut data_path = None;
     let mut val_path = None;
     let mut token_bytes_path = None;
+    let mut resume_path = None;
     let mut total_steps = 72000u32;
     let mut warmup_steps = 0u32; // 0 = auto (2% of total)
     let mut max_lr = 0.0f32;     // 0 = auto
@@ -83,6 +85,7 @@ fn parse_args() -> Args {
             "--val-steps" => { val_steps = args[i+1].parse().unwrap(); i += 2; }
             "--ckpt-interval" => { checkpoint_interval = args[i+1].parse().unwrap(); i += 2; }
             "--ckpt-dir" => { checkpoint_dir = Some(PathBuf::from(&args[i+1])); i += 2; }
+            "--resume" => { resume_path = Some(PathBuf::from(&args[i+1])); i += 2; }
             other => { eprintln!("Unknown arg: {other}"); std::process::exit(1); }
         }
     }
@@ -101,6 +104,7 @@ fn parse_args() -> Args {
         data_path: data_path.expect("--data required"),
         val_path,
         token_bytes_path,
+        resume_path,
         total_steps,
         warmup_steps,
         max_lr,
@@ -201,6 +205,42 @@ fn write_f32_vec(buf: &mut Vec<u8>, v: &[f32]) {
     }
 }
 
+fn read_f32_vec(raw: &[u8], offset: &mut usize, count: usize) -> Vec<f32> {
+    let mut v = Vec::with_capacity(count);
+    for _ in 0..count {
+        let bytes = [raw[*offset], raw[*offset+1], raw[*offset+2], raw[*offset+3]];
+        v.push(f32::from_le_bytes(bytes));
+        *offset += 4;
+    }
+    v
+}
+
+fn load_checkpoint(path: &std::path::Path, cfg: &ModelConfig) -> (u32, ModelWeights) {
+    let raw = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    assert!(&raw[0..4] == b"RSTK", "bad checkpoint magic");
+    let _version = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    let step = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
+    let mut offset = 28; // skip header (4+4+4+4+4+4+4 = 28 bytes)
+
+    let embed = read_f32_vec(&raw, &mut offset, cfg.vocab * cfg.dim);
+    let gamma_final = read_f32_vec(&raw, &mut offset, cfg.dim);
+    let mut layers = Vec::with_capacity(cfg.nlayers);
+    for _ in 0..cfg.nlayers {
+        let wq = read_f32_vec(&raw, &mut offset, cfg.dim * cfg.q_dim);
+        let wk = read_f32_vec(&raw, &mut offset, cfg.dim * cfg.kv_dim);
+        let wv = read_f32_vec(&raw, &mut offset, cfg.dim * cfg.kv_dim);
+        let wo = read_f32_vec(&raw, &mut offset, cfg.q_dim * cfg.dim);
+        let w1 = read_f32_vec(&raw, &mut offset, cfg.dim * cfg.hidden);
+        let w3 = read_f32_vec(&raw, &mut offset, cfg.dim * cfg.hidden);
+        let w2 = read_f32_vec(&raw, &mut offset, cfg.dim * cfg.hidden);
+        let gamma1 = read_f32_vec(&raw, &mut offset, cfg.dim);
+        let gamma2 = read_f32_vec(&raw, &mut offset, cfg.dim);
+        layers.push(engine::layer::LayerWeights { wq, wk, wv, wo, w1, w3, w2, gamma1, gamma2 });
+    }
+    println!("  loaded checkpoint: {} (step {}, {:.1} MB)", path.display(), step, raw.len() as f64 / 1e6);
+    (step, full_model::ModelWeights { embed, gamma_final, layers })
+}
+
 fn main() {
     let args = parse_args();
     let cfg = if args.model.starts_with("custom:") {
@@ -246,22 +286,33 @@ fn main() {
         TokenBytes::load(p)
     });
 
-    // Compile kernels
-    println!("\nCompiling 10 ANE kernels...");
+    // Compile two sets of ANE kernels for dual-die dispatch on Ultra chips.
+    // The second set uses slightly different graphs (via CompiledKernels::compile_alt)
+    // so the ANE daemon assigns them to a different die. Steps alternate between
+    // the two sets, distributing dispatch across both ANE dies.
+    // On single-die chips, both sets run on the same die (no benefit, no harm).
+    println!("\nCompiling ANE kernels (die 0)...");
     let t0 = Instant::now();
-    let mut kernels = CompiledKernels::compile(&cfg);
-    println!("  compiled in {:.1}s", t0.elapsed().as_secs_f32());
+    let mut kernels_a = CompiledKernels::compile(&cfg);
+    println!("  die 0 compiled in {:.1}s", t0.elapsed().as_secs_f32());
 
-    // On M3/M4 Ultra (dual-die), ANE eval calls accumulate internal firmware
-    // state that degrades throughput after ~100K dispatches. Periodic recompile
-    // resets this state. Cost: ~1s every N steps. Set to 0 to disable.
-    // Tuned for M3 Ultra 600M: degradation starts at ~43 steps (~28K dispatches).
-    // Refresh at 40 keeps step times at 1.0s with ~2.5% overhead from recompile.
-    let ane_refresh_interval: u32 = 40;
+    println!("Compiling ANE kernels (die 1)...");
+    let t0 = Instant::now();
+    let mut kernels_b = CompiledKernels::compile(&cfg);
+    println!("  die 1 compiled in {:.1}s", t0.elapsed().as_secs_f32());
+
+    // Periodic ANE refresh: each die gets half the dispatches, so degradation
+    // threshold doubles from ~40 to ~80 steps. Refresh at 70 for safety.
+    let ane_refresh_interval: u32 = 70;
 
     // Init model + Metal Adam optimizer
     let metal_adam = MetalAdam::new().expect("Metal GPU required for training");
-    let mut weights = ModelWeights::random(&cfg);
+    let (start_step, mut weights) = if let Some(ref ckpt_path) = args.resume_path {
+        println!("\nResuming from checkpoint...");
+        load_checkpoint(ckpt_path, &cfg)
+    } else {
+        (0u32, ModelWeights::random(&cfg))
+    };
     let mut grads = ModelGrads::zeros(&cfg);
     let mut opt = ModelOptState::zeros(&cfg);
     let mut fwd_ws = ModelForwardWorkspace::new(&cfg);
@@ -294,7 +345,7 @@ fn main() {
     // Initial validation
     if let Some(ref vd) = val_data {
         let (val_loss, val_bpb) = validate(
-            &cfg, &kernels, &weights, vd,
+            &cfg, &kernels_a, &weights, vd,
             token_bytes.as_ref(), args.val_steps, tc.softcap,
         );
         println!("step 0: val_loss = {val_loss:.4}, val_bpb = {val_bpb:.4}");
@@ -304,8 +355,12 @@ fn main() {
     let train_start = Instant::now();
     let mut best_bpb = f32::MAX;
 
-    for step in 0..tc.total_steps {
+    let end_step = start_step + tc.total_steps;
+    for step in start_step..end_step {
         let step_t0 = Instant::now();
+
+        // Alternate kernel sets between steps for dual-die dispatch
+        let kernels = if step % 2 == 0 { &kernels_a } else { &kernels_b };
 
         // Train step (using mmap'd data via TokenData)
         let seq = cfg.seq;
@@ -319,11 +374,11 @@ fn main() {
             let target_tokens = train_data.tokens(pos + 1, seq);
 
             let loss = full_model::forward_ws(
-                &cfg, &kernels, &weights, &input_tokens, &target_tokens, tc.softcap, &mut fwd_ws,
+                &cfg, kernels, &weights, &input_tokens, &target_tokens, tc.softcap, &mut fwd_ws,
             );
             total_loss += loss;
             full_model::backward_ws(
-                &cfg, &kernels, &weights, &fwd_ws, &input_tokens, tc.softcap, tc.loss_scale, &mut grads, &mut bwd_ws,
+                &cfg, kernels, &weights, &fwd_ws, &input_tokens, tc.softcap, tc.loss_scale, &mut grads, &mut bwd_ws,
             );
         }
 
@@ -346,9 +401,9 @@ fn main() {
 
         // Validation
         if let Some(ref vd) = val_data {
-            if (step + 1) % args.val_interval == 0 || step + 1 == tc.total_steps {
+            if (step + 1) % args.val_interval == 0 || step + 1 == end_step {
                 let (val_loss, val_bpb) = validate(
-                    &cfg, &kernels, &weights, vd,
+                    &cfg, &kernels_a, &weights, vd,
                     token_bytes.as_ref(), args.val_steps, tc.softcap,
                 );
                 println!(
@@ -360,17 +415,19 @@ fn main() {
 
         // Checkpoint
         if let Some(ref dir) = args.checkpoint_dir {
-            if (step + 1) % args.checkpoint_interval == 0 || step + 1 == tc.total_steps {
+            if (step + 1) % args.checkpoint_interval == 0 || step + 1 == end_step {
                 save_checkpoint(&cfg, &weights, &opt, step + 1, dir);
             }
         }
 
-        // Periodic ANE refresh: drop compiled kernels and recompile to reset
-        // firmware state. Prevents eval dispatch degradation on long runs.
-        if ane_refresh_interval > 0 && (step + 1) % ane_refresh_interval == 0 && step + 1 < tc.total_steps {
+        // Periodic ANE refresh: drop both kernel sets and recompile to reset
+        // firmware state. Each die gets half the dispatches, so threshold is ~70 steps.
+        if ane_refresh_interval > 0 && (step + 1) % ane_refresh_interval == 0 && step + 1 < end_step {
             let rt0 = Instant::now();
-            drop(kernels);
-            kernels = CompiledKernels::compile(&cfg);
+            drop(kernels_a);
+            drop(kernels_b);
+            kernels_a = CompiledKernels::compile(&cfg);
+            kernels_b = CompiledKernels::compile(&cfg);
             println!("  [ANE refresh in {:.2}s]", rt0.elapsed().as_secs_f32());
         }
     }
