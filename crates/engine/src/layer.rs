@@ -143,13 +143,18 @@ impl KernelBuffers {
 
         // Forward: ffn_fused (or decomposed)
         let decomposed = ffn_fused::needs_decomposition(cfg);
+        let use_dual_w13 = decomposed && ffn_fused::can_use_dual_w13(cfg);
         let (ffn_fused_in, ffn_fused_out, ffn_w13_in, ffn_w13_out, ffn_w2_in, ffn_w2_out) = if decomposed {
-            let w13_sp = dyn_matmul::spatial_width(seq, hidden); // seq + hidden
-            let w2_sp = dyn_matmul::spatial_width(seq, dim);     // seq + dim
+            let (w13_sp, w13_out_ch) = if use_dual_w13 {
+                (dyn_matmul::dual_separate_spatial_width(seq, hidden), 2 * hidden)
+            } else {
+                (dyn_matmul::spatial_width(seq, hidden), hidden)
+            };
+            let w2_sp = dyn_matmul::spatial_width(seq, dim);
             (
                 None, None,
                 Some(TensorData::new(Shape { batch: 1, channels: dim, height: 1, width: w13_sp })),
-                Some(TensorData::new(Shape { batch: 1, channels: hidden, height: 1, width: seq })),
+                Some(TensorData::new(Shape { batch: 1, channels: w13_out_ch, height: 1, width: seq })),
                 Some(TensorData::new(Shape { batch: 1, channels: hidden, height: 1, width: w2_sp })),
                 Some(TensorData::new(Shape { batch: 1, channels: dim, height: 1, width: seq })),
             )
@@ -246,9 +251,10 @@ pub struct CompiledKernels {
     pub wo_fwd: Executable,
     pub ffn_fused: Option<Executable>,        // Some when fused, None when decomposed
     // Decomposed FFN forward (only populated when needs_decomposition)
-    ffn_w13_fwd: Option<Executable>,          // dyn_matmul(dim, hidden, seq)
+    ffn_w13_fwd: Option<Executable>,          // dual_separate or single dyn_matmul
     ffn_w2_fwd: Option<Executable>,           // dyn_matmul(hidden, dim, seq)
     pub use_decomposed_ffn: bool,
+    pub use_dual_w13: bool,                   // true when W1+W3 fused into single dispatch
     pub ffn_bwd_w2t: Executable,
     pub ffn_bwd_w13t: Executable,
     pub wot_bwd: Executable,
@@ -276,8 +282,13 @@ impl CompiledKernels {
         let ffn_fused_exe = if decomposed { None } else {
             Some(ffn_fused::build(cfg).compile(qos).expect("ffnFused compile"))
         };
+        let use_dual_w13 = decomposed && ffn_fused::can_use_dual_w13(cfg);
         let ffn_w13_fwd = if decomposed {
-            Some(dyn_matmul::build(cfg.dim, cfg.hidden, cfg.seq).compile(qos).expect("ffnW13Fwd compile"))
+            if use_dual_w13 {
+                Some(dyn_matmul::build_dual_separate(cfg.dim, cfg.hidden, cfg.seq).compile(qos).expect("ffnW13DualFwd compile"))
+            } else {
+                Some(dyn_matmul::build(cfg.dim, cfg.hidden, cfg.seq).compile(qos).expect("ffnW13Fwd compile"))
+            }
         } else { None };
         let ffn_w2_fwd = if decomposed {
             Some(dyn_matmul::build(cfg.hidden, cfg.dim, cfg.seq).compile(qos).expect("ffnW2Fwd compile"))
@@ -306,7 +317,7 @@ impl CompiledKernels {
         Self {
             sdpa_fwd, wo_fwd,
             ffn_fused: ffn_fused_exe, ffn_w13_fwd, ffn_w2_fwd,
-            use_decomposed_ffn: decomposed,
+            use_decomposed_ffn: decomposed, use_dual_w13,
             ffn_bwd_w2t, ffn_bwd_w13t, wot_bwd,
             sdpa_bwd1, sdpa_bwd2, q_bwd, kv_bwd,
             bufs, rope,
@@ -561,8 +572,8 @@ pub fn forward(
     let mut w2t_scratch = vec![0.0f32; hidden * dim];
 
     if kernels.use_decomposed_ffn {
-        // Decomposed path: 3 separate dyn_matmul dispatches + CPU SiLU + CPU residual
-        let w13_sp = dyn_matmul::spatial_width(seq, hidden);
+        // Decomposed path: dual W1+W3 dispatch + CPU SiLU + W2 dispatch + CPU residual
+        let w13_sp = if kernels.use_dual_w13 { dyn_matmul::dual_separate_spatial_width(seq, hidden) } else { dyn_matmul::spatial_width(seq, hidden) };
         let w2_sp = dyn_matmul::spatial_width(seq, dim);
         let w13_exe = kernels.ffn_w13_fwd.as_ref().unwrap();
         let w2_exe = kernels.ffn_w2_fwd.as_ref().unwrap();
@@ -571,30 +582,38 @@ pub fn forward(
         let w2_in = kernels.bufs.ffn_w2_in.as_ref().unwrap();
         let w2_out = kernels.bufs.ffn_w2_out.as_ref().unwrap();
 
-        // W1 fwd: h1 = x2norm @ W1
-        {
-            let mut locked = w13_in.as_f32_slice_mut();
-            let buf = &mut *locked;
-            stage_spatial(buf, dim, w13_sp, &x2norm, seq, 0);
-            stage_spatial(buf, dim, w13_sp, &weights.w1, hidden, seq);
-        }
-        w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE ffnW13Fwd(W1) failed");
-        {
-            let locked = w13_out.as_f32_slice();
-            h1.copy_from_slice(&locked[..hidden * seq]);
-        }
-
-        // W3 fwd: h3 = x2norm @ W3 (xnorm already staged at sp[0:seq])
-        {
-            let mut locked = w13_in.as_f32_slice_mut();
-            let buf = &mut *locked;
-            // xnorm is already at offset 0 from W1 dispatch, just update weights
-            stage_spatial(buf, dim, w13_sp, &weights.w3, hidden, seq);
-        }
-        w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE ffnW13Fwd(W3) failed");
-        {
-            let locked = w13_out.as_f32_slice();
-            h3.copy_from_slice(&locked[..hidden * seq]);
+        // W1+W3 projection: dual dispatch if fits, else separate
+        if kernels.use_dual_w13 {
+            {
+                let mut locked = w13_in.as_f32_slice_mut();
+                let buf = &mut *locked;
+                stage_spatial(buf, dim, w13_sp, &x2norm, seq, 0);
+                stage_spatial(buf, dim, w13_sp, &weights.w1, hidden, seq);
+                stage_spatial(buf, dim, w13_sp, &weights.w3, hidden, seq + hidden);
+            }
+            w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE w13 dual failed");
+            {
+                let locked = w13_out.as_f32_slice();
+                read_channels_into(&locked, 2 * hidden, seq, 0, hidden, &mut h1);
+                read_channels_into(&locked, 2 * hidden, seq, hidden, hidden, &mut h3);
+            }
+        } else {
+            // Separate W1, W3 dispatches
+            {
+                let mut locked = w13_in.as_f32_slice_mut();
+                let buf = &mut *locked;
+                stage_spatial(buf, dim, w13_sp, &x2norm, seq, 0);
+                stage_spatial(buf, dim, w13_sp, &weights.w1, hidden, seq);
+            }
+            w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE w13 W1 failed");
+            { let locked = w13_out.as_f32_slice(); h1.copy_from_slice(&locked[..hidden * seq]); }
+            {
+                let mut locked = w13_in.as_f32_slice_mut();
+                let buf = &mut *locked;
+                stage_spatial(buf, dim, w13_sp, &weights.w3, hidden, seq);
+            }
+            w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE w13 W3 failed");
+            { let locked = w13_out.as_f32_slice(); h3.copy_from_slice(&locked[..hidden * seq]); }
         }
 
         // CPU SiLU gate: gate = silu(h1) * h3
@@ -702,13 +721,16 @@ pub fn forward_into(
             let buf = &mut *locked;
             stage_spatial(buf, q_dim, wo_sp, &weights.wo, dim, seq);
         }
-        // Pre-stage FFN weights (fused or decomposed W1 only)
+        // Pre-stage FFN weights (fused or decomposed W1 + optional W3)
         if kernels.use_decomposed_ffn {
-            let w13_sp = dyn_matmul::spatial_width(seq, hidden);
+            let w13_sp = if kernels.use_dual_w13 { dyn_matmul::dual_separate_spatial_width(seq, hidden) } else { dyn_matmul::spatial_width(seq, hidden) };
             let w13_in = kernels.bufs.ffn_w13_in.as_ref().unwrap();
             let mut locked = w13_in.as_f32_slice_mut();
             let buf = &mut *locked;
             stage_spatial(buf, dim, w13_sp, &weights.w1, hidden, seq);
+            if kernels.use_dual_w13 {
+                stage_spatial(buf, dim, w13_sp, &weights.w3, hidden, seq + hidden);
+            }
         } else {
             let ffn_sp = ffn_fused::input_spatial_width(cfg);
             let ffn_in = kernels.bufs.ffn_fused_in.as_ref().unwrap();
@@ -756,7 +778,7 @@ pub fn forward_into(
 
     // 7-8. FFN: fused or decomposed
     if kernels.use_decomposed_ffn {
-        let w13_sp = dyn_matmul::spatial_width(seq, hidden);
+        let w13_sp = if kernels.use_dual_w13 { dyn_matmul::dual_separate_spatial_width(seq, hidden) } else { dyn_matmul::spatial_width(seq, hidden) };
         let w2_sp = dyn_matmul::spatial_width(seq, dim);
         let w13_exe = kernels.ffn_w13_fwd.as_ref().unwrap();
         let w2_exe = kernels.ffn_w2_fwd.as_ref().unwrap();
@@ -765,28 +787,23 @@ pub fn forward_into(
         let w2_in = kernels.bufs.ffn_w2_in.as_ref().unwrap();
         let w2_out = kernels.bufs.ffn_w2_out.as_ref().unwrap();
 
-        // W1 fwd: h1 = x2norm @ W1 (W1 weights pre-staged in step 3)
+        // W1+W3 projection (weights pre-staged in step 3)
         {
             let mut locked = w13_in.as_f32_slice_mut();
             let buf = &mut *locked;
             stage_spatial(buf, dim, w13_sp, &cache.x2norm, seq, 0);
         }
-        w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE ffnW13Fwd(W1) failed");
-        {
+        if kernels.use_dual_w13 {
+            w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE w13 dual failed");
             let locked = w13_out.as_f32_slice();
-            cache.h1.copy_from_slice(&locked[..hidden * seq]);
-        }
-
-        // W3 fwd: h3 = x2norm @ W3
-        {
-            let mut locked = w13_in.as_f32_slice_mut();
-            let buf = &mut *locked;
-            stage_spatial(buf, dim, w13_sp, &weights.w3, hidden, seq);
-        }
-        w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE ffnW13Fwd(W3) failed");
-        {
-            let locked = w13_out.as_f32_slice();
-            cache.h3.copy_from_slice(&locked[..hidden * seq]);
+            read_channels_into(&locked, 2 * hidden, seq, 0, hidden, &mut cache.h1);
+            read_channels_into(&locked, 2 * hidden, seq, hidden, hidden, &mut cache.h3);
+        } else {
+            w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE w13 W1 failed");
+            { let locked = w13_out.as_f32_slice(); cache.h1.copy_from_slice(&locked[..hidden * seq]); }
+            { let mut locked = w13_in.as_f32_slice_mut(); stage_spatial(&mut locked, dim, w13_sp, &weights.w3, hidden, seq); }
+            w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE w13 W3 failed");
+            { let locked = w13_out.as_f32_slice(); cache.h3.copy_from_slice(&locked[..hidden * seq]); }
         }
 
         // CPU SiLU gate
@@ -895,13 +912,16 @@ pub fn forward_into_pipelined(
         }
         // Pre-stage FFN weights + deferred prev-layer readback
         if kernels.use_decomposed_ffn {
-            // Pre-stage W1 weights into decomposed buffer; also pre-compute W2 transpose
-            let w13_sp = dyn_matmul::spatial_width(seq, hidden);
+            // Pre-stage W1 (+ W3 if dual) weights
+            let w13_sp = if kernels.use_dual_w13 { dyn_matmul::dual_separate_spatial_width(seq, hidden) } else { dyn_matmul::spatial_width(seq, hidden) };
             let w13_in = kernels.bufs.ffn_w13_in.as_ref().unwrap();
             {
                 let mut locked = w13_in.as_f32_slice_mut();
                 let buf = &mut *locked;
                 stage_spatial(buf, dim, w13_sp, &weights.w1, hidden, seq);
+                if kernels.use_dual_w13 {
+                    stage_spatial(buf, dim, w13_sp, &weights.w3, hidden, seq + hidden);
+                }
             }
             // When decomposed, prev_cache h1/h3/gate were already written during prev layer's
             // decomposed FFN sequence — no deferred readback needed.
@@ -962,7 +982,7 @@ pub fn forward_into_pipelined(
 
     // 7-8. FFN: fused or decomposed
     if kernels.use_decomposed_ffn {
-        let w13_sp = dyn_matmul::spatial_width(seq, hidden);
+        let w13_sp = if kernels.use_dual_w13 { dyn_matmul::dual_separate_spatial_width(seq, hidden) } else { dyn_matmul::spatial_width(seq, hidden) };
         let w2_sp = dyn_matmul::spatial_width(seq, dim);
         let w13_exe = kernels.ffn_w13_fwd.as_ref().unwrap();
         let w2_exe = kernels.ffn_w2_fwd.as_ref().unwrap();
@@ -971,28 +991,23 @@ pub fn forward_into_pipelined(
         let w2_in = kernels.bufs.ffn_w2_in.as_ref().unwrap();
         let w2_out = kernels.bufs.ffn_w2_out.as_ref().unwrap();
 
-        // W1 fwd (W1 weights pre-staged in step 3)
+        // W1+W3 projection (weights pre-staged in step 3)
         {
             let mut locked = w13_in.as_f32_slice_mut();
             let buf = &mut *locked;
             stage_spatial(buf, dim, w13_sp, &cache.x2norm, seq, 0);
         }
-        w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE ffnW13Fwd(W1) failed");
-        {
+        if kernels.use_dual_w13 {
+            w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE w13 dual failed");
             let locked = w13_out.as_f32_slice();
-            cache.h1.copy_from_slice(&locked[..hidden * seq]);
-        }
-
-        // W3 fwd
-        {
-            let mut locked = w13_in.as_f32_slice_mut();
-            let buf = &mut *locked;
-            stage_spatial(buf, dim, w13_sp, &weights.w3, hidden, seq);
-        }
-        w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE ffnW13Fwd(W3) failed");
-        {
-            let locked = w13_out.as_f32_slice();
-            cache.h3.copy_from_slice(&locked[..hidden * seq]);
+            read_channels_into(&locked, 2 * hidden, seq, 0, hidden, &mut cache.h1);
+            read_channels_into(&locked, 2 * hidden, seq, hidden, hidden, &mut cache.h3);
+        } else {
+            w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE w13 W1 failed");
+            { let locked = w13_out.as_f32_slice(); cache.h1.copy_from_slice(&locked[..hidden * seq]); }
+            { let mut locked = w13_in.as_f32_slice_mut(); stage_spatial(&mut locked, dim, w13_sp, &weights.w3, hidden, seq); }
+            w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE w13 W3 failed");
+            { let locked = w13_out.as_f32_slice(); cache.h3.copy_from_slice(&locked[..hidden * seq]); }
         }
 
         // CPU SiLU gate
@@ -1146,11 +1161,14 @@ pub fn forward_timed(
         }
         // Pre-stage FFN weights
         if kernels.use_decomposed_ffn {
-            let w13_sp = dyn_matmul::spatial_width(seq, hidden);
+            let w13_sp = if kernels.use_dual_w13 { dyn_matmul::dual_separate_spatial_width(seq, hidden) } else { dyn_matmul::spatial_width(seq, hidden) };
             let w13_in = kernels.bufs.ffn_w13_in.as_ref().unwrap();
             let mut locked = w13_in.as_f32_slice_mut();
             let buf = &mut *locked;
             stage_spatial(buf, dim, w13_sp, &weights.w1, hidden, seq);
+            if kernels.use_dual_w13 {
+                stage_spatial(buf, dim, w13_sp, &weights.w3, hidden, seq + hidden);
+            }
         } else {
             let ffn_sp = ffn_fused::input_spatial_width(cfg);
             let ffn_in = kernels.bufs.ffn_fused_in.as_ref().unwrap();
@@ -1224,7 +1242,7 @@ pub fn forward_timed(
 
     let (stage_ffn_ms, ane_ffn_ms, read_ffn_ms);
     if kernels.use_decomposed_ffn {
-        let w13_sp = dyn_matmul::spatial_width(seq, hidden);
+        let w13_sp = if kernels.use_dual_w13 { dyn_matmul::dual_separate_spatial_width(seq, hidden) } else { dyn_matmul::spatial_width(seq, hidden) };
         let w2_sp = dyn_matmul::spatial_width(seq, dim);
         let w13_exe = kernels.ffn_w13_fwd.as_ref().unwrap();
         let w2_exe = kernels.ffn_w2_fwd.as_ref().unwrap();
@@ -1233,7 +1251,7 @@ pub fn forward_timed(
         let w2_in = kernels.bufs.ffn_w2_in.as_ref().unwrap();
         let w2_out = kernels.bufs.ffn_w2_out.as_ref().unwrap();
 
-        // Stage: x2norm for W1 (W1 weights already pre-staged)
+        // Stage: x2norm (W1+W3 weights already pre-staged)
         let t = Instant::now();
         {
             let mut locked = w13_in.as_f32_slice_mut();
@@ -1242,22 +1260,19 @@ pub fn forward_timed(
         }
         stage_ffn_ms = t.elapsed().as_secs_f32() * 1000.0;
 
-        // ANE: W1 + W3 + W2 dispatches + CPU SiLU
+        // ANE: W1+W3 dispatch (dual or separate) + CPU SiLU + W2 dispatch
         let t = Instant::now();
-        w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE ffnW13Fwd(W1) failed");
-        {
+        if kernels.use_dual_w13 {
+            w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE w13 dual failed");
             let locked = w13_out.as_f32_slice();
-            h1.copy_from_slice(&locked[..hidden * seq]);
-        }
-        {
-            let mut locked = w13_in.as_f32_slice_mut();
-            let buf = &mut *locked;
-            stage_spatial(buf, dim, w13_sp, &weights.w3, hidden, seq);
-        }
-        w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE ffnW13Fwd(W3) failed");
-        {
-            let locked = w13_out.as_f32_slice();
-            h3.copy_from_slice(&locked[..hidden * seq]);
+            read_channels_into(&locked, 2 * hidden, seq, 0, hidden, &mut h1);
+            read_channels_into(&locked, 2 * hidden, seq, hidden, hidden, &mut h3);
+        } else {
+            w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE w13 W1 failed");
+            { let locked = w13_out.as_f32_slice(); h1.copy_from_slice(&locked[..hidden * seq]); }
+            { let mut locked = w13_in.as_f32_slice_mut(); stage_spatial(&mut locked, dim, w13_sp, &weights.w3, hidden, seq); }
+            w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE w13 W3 failed");
+            { let locked = w13_out.as_f32_slice(); h3.copy_from_slice(&locked[..hidden * seq]); }
         }
         silu::silu_gate(&h1, &h3, &mut gate);
         vdsp::mtrans(&weights.w2, hidden, &mut w2t_scratch, dim, dim, hidden);

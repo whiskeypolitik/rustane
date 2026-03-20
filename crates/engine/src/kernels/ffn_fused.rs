@@ -93,6 +93,13 @@ pub fn needs_decomposition(cfg: &ModelConfig) -> bool {
     input_spatial_width(cfg) > ANE_MAX_SPATIAL_WIDTH
 }
 
+/// Returns true when the dual W1+W3 kernel fits within ANE spatial width.
+/// Dual kernel: sp = seq + 2*hidden. Boundary: hidden <= (16384 - seq) / 2.
+/// Falls back to separate W1/W3 dispatches if too large.
+pub fn can_use_dual_w13(cfg: &ModelConfig) -> bool {
+    cfg.seq + 2 * cfg.hidden <= ANE_MAX_SPATIAL_WIDTH
+}
+
 /// Input spatial width for ffnFused.
 pub fn input_spatial_width(cfg: &ModelConfig) -> usize {
     2 * cfg.seq + 3 * cfg.hidden
