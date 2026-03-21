@@ -1962,6 +1962,7 @@ pub fn backward_into(
     // ASYNC: ANE ffnBwdW2t || pre-compute w1t, w3t + sigmoid(h1) for steps 3+4
     // Sigmoid chain (vsmul+expf+vsadd+recf) is the expensive part of SiLU backward.
     // Moving it here hides ~0.6ms/layer behind ANE dispatch time.
+    let w13t_sp = dyn_matmul::dual_spatial_width(seq, dim);
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
             kernels.ffn_bwd_w2t.run_cached_direct(&[&kernels.bufs.ffn_bwd_w2t_in], &[&kernels.bufs.ffn_bwd_w2t_out]).expect("ANE eval failed");
@@ -1993,7 +1994,6 @@ pub fn backward_into(
     }
 
     // 4. Stage ffnBwdW13t — fused single-pass (w1t, w3t from step 2 overlap)
-    let w13t_sp = dyn_matmul::dual_spatial_width(seq, dim);
     {
         let mut locked = kernels.bufs.ffn_bwd_w13t_in.as_f32_slice_mut();
         let buf = &mut *locked;
