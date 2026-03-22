@@ -12,3 +12,4 @@ pub mod training;
 pub mod full_model;
 pub mod metal_adam;
 pub mod data;
+pub mod bench_result;

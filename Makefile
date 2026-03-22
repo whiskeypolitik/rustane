@@ -3,7 +3,7 @@
 # Run `make help` to see all available targets.
 
 .PHONY: help build test sweep-600m sweep-1b sweep-3b sweep-5b sweep-full \
-	forward-ladder forward-ceiling forward-7b forward-10b train-600m
+	forward-ladder forward-ceiling forward-7b forward-10b train-600m submit
 
 help: ## Show this help
 	@echo "  Rustane — available commands:"
@@ -26,6 +26,9 @@ help: ## Show this help
 	@echo ""
 	@echo "  Training on real data:"
 	@echo "  make train-600m DATA=/path/to/train.bin"
+	@echo ""
+	@echo "  Leaderboard:"
+	@echo "  make submit               Submit last benchmark to bench.rustane.org"
 
 build: ## Build all crates
 	cargo build
@@ -73,3 +76,47 @@ train-600m: ## Train 600M on real data (needs climbmix-400B data file)
 		--embed-lr 1.0 --beta2 0.99 \
 		--loss-scale 1 --grad-clip 1 \
 		--steps 72000
+
+# ── Leaderboard ──────────────────────────────────────────────────────
+
+LEADERBOARD_API ?= https://api.bench.rustane.org
+
+submit: ## Submit benchmark result to leaderboard
+	@if [ ! -f target/bench-result.json ]; then \
+		echo "No benchmark results found. Run a benchmark first:"; \
+		echo "  make sweep-600m"; \
+		echo "  make forward-7b"; \
+		exit 1; \
+	fi
+	@echo ""
+	@echo "Submit to rustane leaderboard (bench.rustane.org)"
+	@echo ""
+	@read -p "Your name: " NAME; \
+	read -p "X handle (optional, e.g. @danpacary): " XHANDLE; \
+	TMPFILE=$$(mktemp); \
+	jq --arg name "$$NAME" --arg x "$$XHANDLE" \
+		'.submitter = {name: $$name, x_handle: $$x}' \
+		target/bench-result.json > "$$TMPFILE"; \
+	echo ""; \
+	echo "Submitting..."; \
+	RESPONSE=$$(curl -s -X POST $(LEADERBOARD_API)/api/submit \
+		-H "Content-Type: application/json" \
+		-d @"$$TMPFILE"); \
+	echo "$$RESPONSE" | jq .; \
+	RESULT_ID=$$(echo "$$RESPONSE" | jq -r '.id // empty'); \
+	if [ -n "$$RESULT_ID" ]; then \
+		echo ""; \
+		echo "View: https://bench.rustane.org/?id=$$RESULT_ID"; \
+		echo ""; \
+		read -p "Share on X? (y/n): " SHARE; \
+		if [ "$$SHARE" = "y" ]; then \
+			TOKS=$$(jq -r '.results.tok_per_s' target/bench-result.json); \
+			MS=$$(jq -r '.results.ms_per_step' target/bench-result.json); \
+			BENCH=$$(jq -r '.benchmark' target/bench-result.json); \
+			CHIP=$$(jq -r '.hardware.chip' target/bench-result.json); \
+			RAM=$$(jq -r '.hardware.ram_gb' target/bench-result.json); \
+			TEXT="Just ran rustane $$BENCH on $$CHIP $${RAM}GB%0A%0A$${TOKS} tok/s | $${MS}ms/step%0A%0Ahttps://bench.rustane.org/?id=$$RESULT_ID"; \
+			open "https://twitter.com/intent/tweet?text=$$TEXT"; \
+		fi; \
+	fi; \
+	rm -f "$$TMPFILE"

@@ -136,6 +136,19 @@ If you're touching ANE kernel code:
 - Commit messages: what changed and why, not just what
 - No docs/comments on code you didn't change
 
+## Leaderboard
+
+After running any benchmark, submit your results to the community leaderboard:
+
+```bash
+make sweep-600m    # or any benchmark
+make submit        # prompts for name + X handle, posts to bench.rustane.org
+```
+
+Requires `jq` for JSON processing (`brew install jq` if you don't have it).
+
+View the leaderboard: [bench.rustane.org](https://bench.rustane.org)
+
 ## License
 
 By contributing, you agree that your contributions will be licensed under MIT.
