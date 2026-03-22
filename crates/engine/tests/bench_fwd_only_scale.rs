@@ -295,7 +295,32 @@ fn fwd_100b() {
     assert!(r.loss.is_finite());
 }
 
-/// Push from 25B to 100B. Find the ceiling on 512GB M3 Ultra.
+#[test]
+#[ignore]
+fn fwd_110b() {
+    // dim=5120, hidden=13824, 40 heads, 352 layers → ~111.7B (~447GB weights)
+    let r = run_fwd_probe(&custom_config(5120, 13824, 40, 352, 512), "110B");
+    assert!(r.loss.is_finite());
+}
+
+#[test]
+#[ignore]
+fn fwd_115b() {
+    // dim=5120, hidden=13824, 40 heads, 368 layers → ~116.7B (~467GB weights)
+    let r = run_fwd_probe(&custom_config(5120, 13824, 40, 368, 512), "115B");
+    assert!(r.loss.is_finite());
+}
+
+#[test]
+#[ignore]
+fn fwd_122b() {
+    // dim=5120, hidden=13824, 40 heads, 390 layers → ~123.7B (~496GB)
+    // CEILING on 512GB M3 Ultra — 124B (503GB) OOM kills
+    let r = run_fwd_probe(&custom_config(5120, 13824, 40, 390, 512), "122B");
+    assert!(r.loss.is_finite());
+}
+
+/// Push from 25B to 125B. Find the ceiling on 512GB M3 Ultra.
 /// All configs use dim=5120 to stay within ANE spatial width limit (16384).
 #[test]
 #[ignore]
@@ -309,6 +334,10 @@ fn fwd_find_ceiling() {
         (custom_config(5120, 13824, 40, 224, 512), "70B"),
         (custom_config(5120, 13824, 40, 256, 512), "80B"),
         (custom_config(5120, 13824, 40, 320, 512), "100B"),
+        (custom_config(5120, 13824, 40, 352, 512), "110B"),
+        (custom_config(5120, 13824, 40, 368, 512), "115B"),
+        (custom_config(5120, 13824, 40, 384, 512), "120B"),
+        (custom_config(5120, 13824, 40, 390, 512), "122B"),
     ];
 
     let mut results = Vec::new();
