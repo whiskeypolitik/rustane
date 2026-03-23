@@ -69,9 +69,9 @@ Observed host-side signals:
 
 Observed `rustane` shape:
 
-- [lib.rs](/Users/andrewgordon/RustRover%20Projects/rustane/crates/ane-bridge/src/lib.rs) describes `ane-bridge` as a thin wrapper around dynamic weight pipeline behavior
-- [layer.rs](/Users/andrewgordon/RustRover%20Projects/rustane/crates/engine/src/layer.rs) shows the engine repeatedly compiling/using many kernel executables as isolated programs
-- README positions the project around direct MIL compilation rather than a persistent model service in [README.md](/Users/andrewgordon/RustRover%20Projects/rustane/README.md)
+- 'lib.rs' describes `ane-bridge` as a thin wrapper around dynamic weight pipeline behavior
+- 'layer.rs' shows the engine repeatedly compiling/using many kernel executables as isolated programs
+- README positions the project around direct MIL compilation rather than a persistent model service in 'README.md'
 
 ### What this implies
 
@@ -150,7 +150,7 @@ Observed host-side signals:
 
 Observed `rustane` shape:
 
-- [layer.rs](/Users/andrewgordon/RustRover%20Projects/rustane/crates/engine/src/layer.rs) submits kernels through `run_cached_direct(&[...], &[...])`
+- 'layer.rs' submits kernels through `run_cached_direct(&[...], &[...])`
 - The current engine code stages buffers manually and assumes explicit packed or
   per-buffer positional ordering
 
@@ -243,7 +243,7 @@ If `rustane` eventually uses a richer chained execution model, it might reduce:
 - some of the CPU-side glue now needed between ANE kernels.
 
 That is especially interesting because the README already highlights dispatch
-overhead as an ANE gotcha in [README.md](/Users/andrewgordon/RustRover%20Projects/rustane/README.md).
+overhead as an ANE gotcha in 'README.md'.
 
 ### Why it is not top priority yet
 
