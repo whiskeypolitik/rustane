@@ -168,3 +168,7 @@ ANE compiler pass rejects it.
 - `hopper_validation_pass39_matrixmult_unit_layer.md`
 - `hopper_validation_pass40_create_matmul_layer_failures.md`
 - `hopper_validation_pass41_cache_manager_lookup.md`
+- `hopper_validation_pass42_request_dispatch_paths.md`
+- `hopper_validation_pass43_espresso_request_construction.md`
+- `hopper_validation_pass44_eval_and_mapping.md`
+- `hopper_validation_pass45_request_reuse.md`
