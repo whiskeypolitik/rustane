@@ -5,9 +5,6 @@
 .PHONY: help build test sweep-600m sweep-1b sweep-3b sweep-5b sweep-full \
 	forward-ladder forward-ceiling forward-7b forward-10b train-600m submit
 
-STREAMS ?= 1
-USE_LEAN_WORKSPACE ?= 1
-
 help: ## Show this help
 	@echo "  Rustane — available commands:"
 	@echo ""
@@ -26,8 +23,6 @@ help: ## Show this help
 	@echo "  make forward-10b          Forward pass at 10B (~45s, needs 46GB)"
 	@echo "  make forward-ladder       Forward pass 5B to 20B (~8 min, needs 93GB)"
 	@echo "  make forward-ceiling      Forward pass 25B/30B (~10 min, needs 130GB)"
-	@echo "  add STREAMS=<N>           Use multistream forward benchmark mode"
-	@echo "  example: make forward-ladder STREAMS=4"
 	@echo ""
 	@echo "  Training on real data:"
 	@echo "  make train-600m DATA=/path/to/train.bin"
@@ -61,32 +56,16 @@ sweep-full: ## Full parameter sweep, 25 configs, 600M-5B (~60 min, needs 85GB)
 # ── Forward-only scale probes ────────────────────────────────────────
 
 forward-ladder: ## Forward pass 5B to 20B (~8 min, needs 93GB)
-	@if [ "$(STREAMS)" = "1" ]; then \
-		USE_LEAN_WORKSPACE=$(USE_LEAN_WORKSPACE) cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_scale_ladder; \
-	else \
-		STREAMS=$(STREAMS) cargo test -p engine --test bench_forward_multistream --release -- --ignored --nocapture forward_ladder_multistream; \
-	fi
+	cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_scale_ladder
 
 forward-ceiling: ## Push forward pass to 25B/30B (~10 min, needs 130GB)
-	@if [ "$(STREAMS)" = "1" ]; then \
-		USE_LEAN_WORKSPACE=$(USE_LEAN_WORKSPACE) cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_find_ceiling; \
-	else \
-		STREAMS=$(STREAMS) cargo test -p engine --test bench_forward_multistream --release -- --ignored --nocapture forward_ceiling_multistream; \
-	fi
+	cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_find_ceiling
 
 forward-7b: ## Single forward pass at 7B (~30s, needs 31GB)
-	@if [ "$(STREAMS)" = "1" ]; then \
-		USE_LEAN_WORKSPACE=$(USE_LEAN_WORKSPACE) cargo test -p engine --test theory_runner_supervisor --release -- --ignored --nocapture theory_forward_7b_isolated; \
-	else \
-		STREAMS=$(STREAMS) cargo test -p engine --test bench_forward_multistream --release -- --ignored --nocapture forward_7b_multistream; \
-	fi
+	cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_7b
 
 forward-10b: ## Single forward pass at 10B (~45s, needs 46GB)
-	@if [ "$(STREAMS)" = "1" ]; then \
-		USE_LEAN_WORKSPACE=$(USE_LEAN_WORKSPACE) cargo test -p engine --test theory_runner_supervisor --release -- --ignored --nocapture theory_forward_10b_isolated; \
-	else \
-		STREAMS=$(STREAMS) cargo test -p engine --test bench_forward_multistream --release -- --ignored --nocapture forward_10b_multistream; \
-	fi
+	cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_10b
 
 # ── Real data training ───────────────────────────────────────────────
 

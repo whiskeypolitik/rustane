@@ -7,7 +7,7 @@
 
 use ane_bridge::ane::{Executable, Shape, TensorData};
 use objc2_foundation::NSQualityOfService;
-use crate::cpu::{rmsnorm, silu, vdsp};
+use crate::cpu::{rmsnorm, vdsp};
 use crate::kernels::{dyn_matmul, sdpa_fwd, sdpa_bwd, ffn_fused};
 use crate::model::ModelConfig;
 use std::time::Instant;
@@ -23,7 +23,6 @@ pub struct LayerWeights {
     pub w2: Vec<f32>,      // [DIM * HIDDEN]
     pub gamma1: Vec<f32>,  // [DIM]
     pub gamma2: Vec<f32>,  // [DIM]
-    pub w2_generation: u64,
 }
 
 /// Weight gradients (same layout as weights).
@@ -55,8 +54,6 @@ pub struct ForwardCache {
     pub h1: Vec<f32>,          // gate projection [HIDDEN * SEQ]
     pub h3: Vec<f32>,          // up projection [HIDDEN * SEQ]
     pub gate: Vec<f32>,        // silu(h1) * h3 [HIDDEN * SEQ]
-    pub w2t_scratch: Vec<f32>, // [HIDDEN * DIM] for W2 transpose (decomposed FFN only)
-    pub w2t_generation: u64,   // generation of weights.w2 currently packed into w2t_scratch
 }
 
 impl ForwardCache {
@@ -83,8 +80,6 @@ impl ForwardCache {
             h1: vec![0.0; hidden * seq],
             h3: vec![0.0; hidden * seq],
             gate: vec![0.0; hidden * seq],
-            w2t_scratch: vec![0.0; hidden * dim],
-            w2t_generation: u64::MAX,
         }
     }
 }
@@ -96,23 +91,12 @@ impl ForwardCache {
 /// so no interior mutability wrapper is needed.
 pub struct KernelBuffers {
     // Forward: sdpa_fwd, wo_fwd, ffn_fused
-    sdpa_fwd_xnorm_in: TensorData,
-    sdpa_fwd_wq_in: TensorData,
-    sdpa_fwd_wk_in: TensorData,
-    sdpa_fwd_wv_in: TensorData,
-    sdpa_fwd_attn_out: TensorData,
-    sdpa_fwd_q_rope_out: TensorData,
-    sdpa_fwd_k_rope_out: TensorData,
-    sdpa_fwd_v_out: TensorData,
+    sdpa_fwd_in: TensorData,
+    sdpa_fwd_out: TensorData,
     wo_fwd_in: TensorData,
     wo_fwd_out: TensorData,
-    ffn_fused_in: Option<TensorData>,
-    ffn_fused_out: Option<TensorData>,
-    // Decomposed FFN forward (only populated when needs_decomposition)
-    ffn_w13_in: Option<TensorData>,   // [1, dim, 1, seq+hidden]
-    ffn_w13_out: Option<TensorData>,  // [1, hidden, 1, seq]
-    ffn_w2_in: Option<TensorData>,    // [1, hidden, 1, seq+dim]
-    ffn_w2_out: Option<TensorData>,   // [1, dim, 1, seq]
+    ffn_fused_in: TensorData,
+    ffn_fused_out: TensorData,
     // Backward: ffn_bwd_w2t, ffn_bwd_w13t, wot_bwd, sdpa_bwd1, sdpa_bwd2, q_bwd, kv_bwd
     ffn_bwd_w2t_in: TensorData,
     ffn_bwd_w2t_out: TensorData,
@@ -140,46 +124,21 @@ impl KernelBuffers {
         let hidden = cfg.hidden;
 
         // Forward: sdpa_fwd
-        let sdpa_fwd_xnorm_in = TensorData::new(sdpa_fwd::xnorm_shape(cfg));
-        let sdpa_fwd_wq_in = TensorData::new(sdpa_fwd::wq_shape(cfg));
-        let sdpa_fwd_wk_in = TensorData::new(sdpa_fwd::wk_shape(cfg));
-        let sdpa_fwd_wv_in = TensorData::new(sdpa_fwd::wv_shape(cfg));
-        let sdpa_fwd_attn_out = TensorData::new(sdpa_fwd::attn_out_shape(cfg));
-        let sdpa_fwd_q_rope_out = TensorData::new(sdpa_fwd::q_rope_shape(cfg));
-        let sdpa_fwd_k_rope_out = TensorData::new(sdpa_fwd::k_rope_shape(cfg));
-        let sdpa_fwd_v_out = TensorData::new(sdpa_fwd::v_shape(cfg));
+        let sdpa_sp = sdpa_fwd::input_spatial_width(cfg);
+        let sdpa_out_ch = sdpa_fwd::output_channels(cfg);
+        let sdpa_fwd_in = TensorData::new(Shape { batch: 1, channels: dim, height: 1, width: sdpa_sp });
+        let sdpa_fwd_out = TensorData::new(Shape { batch: 1, channels: sdpa_out_ch, height: 1, width: seq });
 
         // Forward: wo_fwd
         let wo_sp = dyn_matmul::spatial_width(seq, dim);
         let wo_fwd_in = TensorData::new(Shape { batch: 1, channels: q_dim, height: 1, width: wo_sp });
         let wo_fwd_out = TensorData::new(Shape { batch: 1, channels: dim, height: 1, width: seq });
 
-        // Forward: ffn_fused (or decomposed)
-        let decomposed = ffn_fused::needs_decomposition(cfg);
-        let use_dual_w13 = decomposed && ffn_fused::can_use_dual_w13(cfg);
-        let (ffn_fused_in, ffn_fused_out, ffn_w13_in, ffn_w13_out, ffn_w2_in, ffn_w2_out) = if decomposed {
-            let (w13_sp, w13_out_ch) = if use_dual_w13 {
-                (dyn_matmul::dual_separate_spatial_width(seq, hidden), 2 * hidden)
-            } else {
-                (dyn_matmul::spatial_width(seq, hidden), hidden)
-            };
-            let w2_sp = dyn_matmul::spatial_width(seq, dim);
-            (
-                None, None,
-                Some(TensorData::new(Shape { batch: 1, channels: dim, height: 1, width: w13_sp })),
-                Some(TensorData::new(Shape { batch: 1, channels: w13_out_ch, height: 1, width: seq })),
-                Some(TensorData::new(Shape { batch: 1, channels: hidden, height: 1, width: w2_sp })),
-                Some(TensorData::new(Shape { batch: 1, channels: dim, height: 1, width: seq })),
-            )
-        } else {
-            let ffn_sp = ffn_fused::input_spatial_width(cfg);
-            let ffn_out_ch = ffn_fused::output_channels(cfg);
-            (
-                Some(TensorData::new(Shape { batch: 1, channels: dim, height: 1, width: ffn_sp })),
-                Some(TensorData::new(Shape { batch: 1, channels: ffn_out_ch, height: 1, width: seq })),
-                None, None, None, None,
-            )
-        };
+        // Forward: ffn_fused
+        let ffn_sp = ffn_fused::input_spatial_width(cfg);
+        let ffn_out_ch = ffn_fused::output_channels(cfg);
+        let ffn_fused_in = TensorData::new(Shape { batch: 1, channels: dim, height: 1, width: ffn_sp });
+        let ffn_fused_out = TensorData::new(Shape { batch: 1, channels: ffn_out_ch, height: 1, width: seq });
 
         // Backward: ffn_bwd_w2t
         let w2t_sp = dyn_matmul::spatial_width(seq, hidden);
@@ -219,17 +178,9 @@ impl KernelBuffers {
         let kv_bwd_out = TensorData::new(Shape { batch: 1, channels: dim, height: 1, width: seq });
 
         Self {
-            sdpa_fwd_xnorm_in,
-            sdpa_fwd_wq_in,
-            sdpa_fwd_wk_in,
-            sdpa_fwd_wv_in,
-            sdpa_fwd_attn_out,
-            sdpa_fwd_q_rope_out,
-            sdpa_fwd_k_rope_out,
-            sdpa_fwd_v_out,
+            sdpa_fwd_in, sdpa_fwd_out,
             wo_fwd_in, wo_fwd_out,
             ffn_fused_in, ffn_fused_out,
-            ffn_w13_in, ffn_w13_out, ffn_w2_in, ffn_w2_out,
             ffn_bwd_w2t_in, ffn_bwd_w2t_out,
             ffn_bwd_w13t_in, ffn_bwd_w13t_out,
             wot_bwd_in, wot_bwd_out,
@@ -237,85 +188,6 @@ impl KernelBuffers {
             sdpa_bwd2_in, sdpa_bwd2_out,
             q_bwd_in, q_bwd_out,
             kv_bwd_in, kv_bwd_out,
-        }
-    }
-
-    /// Pre-allocate only the forward IOSurface buffers.
-    /// Backward buffers are reduced to tiny placeholders because forward-only
-    /// benchmarks never touch them.
-    fn allocate_forward_only(cfg: &ModelConfig) -> Self {
-        let dim = cfg.dim;
-        let seq = cfg.seq;
-        let q_dim = cfg.q_dim;
-        let hidden = cfg.hidden;
-
-        let sdpa_fwd_xnorm_in = TensorData::new(sdpa_fwd::xnorm_shape(cfg));
-        let sdpa_fwd_wq_in = TensorData::new(sdpa_fwd::wq_shape(cfg));
-        let sdpa_fwd_wk_in = TensorData::new(sdpa_fwd::wk_shape(cfg));
-        let sdpa_fwd_wv_in = TensorData::new(sdpa_fwd::wv_shape(cfg));
-        let sdpa_fwd_attn_out = TensorData::new(sdpa_fwd::attn_out_shape(cfg));
-        let sdpa_fwd_q_rope_out = TensorData::new(sdpa_fwd::q_rope_shape(cfg));
-        let sdpa_fwd_k_rope_out = TensorData::new(sdpa_fwd::k_rope_shape(cfg));
-        let sdpa_fwd_v_out = TensorData::new(sdpa_fwd::v_shape(cfg));
-
-        let wo_sp = dyn_matmul::spatial_width(seq, dim);
-        let wo_fwd_in = TensorData::new(Shape { batch: 1, channels: q_dim, height: 1, width: wo_sp });
-        let wo_fwd_out = TensorData::new(Shape { batch: 1, channels: dim, height: 1, width: seq });
-
-        let decomposed = ffn_fused::needs_decomposition(cfg);
-        let use_dual_w13 = decomposed && ffn_fused::can_use_dual_w13(cfg);
-        let (ffn_fused_in, ffn_fused_out, ffn_w13_in, ffn_w13_out, ffn_w2_in, ffn_w2_out) = if decomposed {
-            let (w13_sp, w13_out_ch) = if use_dual_w13 {
-                (dyn_matmul::dual_separate_spatial_width(seq, hidden), 2 * hidden)
-            } else {
-                (dyn_matmul::spatial_width(seq, hidden), hidden)
-            };
-            let w2_sp = dyn_matmul::spatial_width(seq, dim);
-            (
-                None, None,
-                Some(TensorData::new(Shape { batch: 1, channels: dim, height: 1, width: w13_sp })),
-                Some(TensorData::new(Shape { batch: 1, channels: w13_out_ch, height: 1, width: seq })),
-                Some(TensorData::new(Shape { batch: 1, channels: hidden, height: 1, width: w2_sp })),
-                Some(TensorData::new(Shape { batch: 1, channels: dim, height: 1, width: seq })),
-            )
-        } else {
-            let ffn_sp = ffn_fused::input_spatial_width(cfg);
-            let ffn_out_ch = ffn_fused::output_channels(cfg);
-            (
-                Some(TensorData::new(Shape { batch: 1, channels: dim, height: 1, width: ffn_sp })),
-                Some(TensorData::new(Shape { batch: 1, channels: ffn_out_ch, height: 1, width: seq })),
-                None, None, None, None,
-            )
-        };
-
-        let tiny = || TensorData::new(Shape { batch: 1, channels: 1, height: 1, width: 1 });
-
-        Self {
-            sdpa_fwd_xnorm_in,
-            sdpa_fwd_wq_in,
-            sdpa_fwd_wk_in,
-            sdpa_fwd_wv_in,
-            sdpa_fwd_attn_out,
-            sdpa_fwd_q_rope_out,
-            sdpa_fwd_k_rope_out,
-            sdpa_fwd_v_out,
-            wo_fwd_in, wo_fwd_out,
-            ffn_fused_in, ffn_fused_out,
-            ffn_w13_in, ffn_w13_out, ffn_w2_in, ffn_w2_out,
-            ffn_bwd_w2t_in: tiny(),
-            ffn_bwd_w2t_out: tiny(),
-            ffn_bwd_w13t_in: tiny(),
-            ffn_bwd_w13t_out: tiny(),
-            wot_bwd_in: tiny(),
-            wot_bwd_out: tiny(),
-            sdpa_bwd1_in: tiny(),
-            sdpa_bwd1_out: tiny(),
-            sdpa_bwd2_in: tiny(),
-            sdpa_bwd2_out: tiny(),
-            q_bwd_in: tiny(),
-            q_bwd_out: tiny(),
-            kv_bwd_in: tiny(),
-            kv_bwd_out: tiny(),
         }
     }
 }
@@ -348,12 +220,7 @@ impl RopeTable {
 pub struct CompiledKernels {
     pub sdpa_fwd: Executable,
     pub wo_fwd: Executable,
-    pub ffn_fused: Option<Executable>,        // Some when fused, None when decomposed
-    // Decomposed FFN forward (only populated when needs_decomposition)
-    ffn_w13_fwd: Option<Executable>,          // dual_separate or single dyn_matmul
-    ffn_w2_fwd: Option<Executable>,           // dyn_matmul(hidden, dim, seq)
-    pub use_decomposed_ffn: bool,
-    pub use_dual_w13: bool,                   // true when W1+W3 fused into single dispatch
+    pub ffn_fused: Executable,
     pub ffn_bwd_w2t: Executable,
     pub ffn_bwd_w13t: Executable,
     pub wot_bwd: Executable,
@@ -376,22 +243,7 @@ impl CompiledKernels {
         let sdpa_fwd = sdpa_fwd::build(cfg).compile(qos).expect("sdpaFwd compile");
         let wo_fwd = dyn_matmul::build(cfg.q_dim, cfg.dim, cfg.seq)
             .compile(qos).expect("woFwd compile");
-
-        let decomposed = ffn_fused::needs_decomposition(cfg);
-        let ffn_fused_exe = if decomposed { None } else {
-            Some(ffn_fused::build(cfg).compile(qos).expect("ffnFused compile"))
-        };
-        let use_dual_w13 = decomposed && ffn_fused::can_use_dual_w13(cfg);
-        let ffn_w13_fwd = if decomposed {
-            if use_dual_w13 {
-                Some(dyn_matmul::build_dual_separate(cfg.dim, cfg.hidden, cfg.seq).compile(qos).expect("ffnW13DualFwd compile"))
-            } else {
-                Some(dyn_matmul::build(cfg.dim, cfg.hidden, cfg.seq).compile(qos).expect("ffnW13Fwd compile"))
-            }
-        } else { None };
-        let ffn_w2_fwd = if decomposed {
-            Some(dyn_matmul::build(cfg.hidden, cfg.dim, cfg.seq).compile(qos).expect("ffnW2Fwd compile"))
-        } else { None };
+        let ffn_fused = ffn_fused::build(cfg).compile(qos).expect("ffnFused compile");
 
         // Backward kernels
         let ffn_bwd_w2t = dyn_matmul::build(cfg.dim, cfg.hidden, cfg.seq)
@@ -414,19 +266,11 @@ impl CompiledKernels {
         let rope = RopeTable::compute(cfg.hd, cfg.seq);
 
         Self {
-            sdpa_fwd, wo_fwd,
-            ffn_fused: ffn_fused_exe, ffn_w13_fwd, ffn_w2_fwd,
-            use_decomposed_ffn: decomposed, use_dual_w13,
+            sdpa_fwd, wo_fwd, ffn_fused,
             ffn_bwd_w2t, ffn_bwd_w13t, wot_bwd,
             sdpa_bwd1, sdpa_bwd2, q_bwd, kv_bwd,
             bufs, rope,
         }
-    }
-
-    /// Compile kernels for forward-only workloads.
-    /// Reuses the real forward executables but shrinks backward IOSurface state.
-    pub fn compile_forward_only(cfg: &ModelConfig) -> Self {
-        Self::compile(cfg)
     }
 }
 
@@ -524,7 +368,6 @@ impl LayerWeights {
             w2: vec![0.0; cfg.dim * cfg.hidden],     // zero-init (DeepNet)
             gamma1: vec![1.0; cfg.dim],
             gamma2: vec![1.0; cfg.dim],
-            w2_generation: 0,
         }
     }
 }
@@ -593,70 +436,6 @@ fn read_channels_into(src: &[f32], _total_ch: usize, seq: usize, ch_start: usize
     dst.copy_from_slice(&src[start..start + ch_count * seq]);
 }
 
-fn stage_sdpa_fwd_inputs(bufs: &KernelBuffers, xnorm: &[f32], wq: &[f32], wk: &[f32], wv: &[f32]) {
-    {
-        let mut locked = bufs.sdpa_fwd_xnorm_in.as_f32_slice_mut();
-        locked.copy_from_slice(xnorm);
-    }
-    {
-        let mut locked = bufs.sdpa_fwd_wq_in.as_f32_slice_mut();
-        locked.copy_from_slice(wq);
-    }
-    {
-        let mut locked = bufs.sdpa_fwd_wk_in.as_f32_slice_mut();
-        locked.copy_from_slice(wk);
-    }
-    {
-        let mut locked = bufs.sdpa_fwd_wv_in.as_f32_slice_mut();
-        locked.copy_from_slice(wv);
-    }
-}
-
-fn run_sdpa_fwd(kernels: &CompiledKernels) {
-    kernels
-        .sdpa_fwd
-        .run_cached_direct(
-            &[
-                &kernels.bufs.sdpa_fwd_xnorm_in,
-                &kernels.bufs.sdpa_fwd_wq_in,
-                &kernels.bufs.sdpa_fwd_wk_in,
-                &kernels.bufs.sdpa_fwd_wv_in,
-            ],
-            &[
-                &kernels.bufs.sdpa_fwd_attn_out,
-                &kernels.bufs.sdpa_fwd_q_rope_out,
-                &kernels.bufs.sdpa_fwd_k_rope_out,
-                &kernels.bufs.sdpa_fwd_v_out,
-            ],
-        )
-        .expect("ANE eval failed");
-}
-
-fn read_sdpa_fwd_outputs(
-    bufs: &KernelBuffers,
-    attn_out: &mut [f32],
-    q_rope: &mut [f32],
-    k_rope: &mut [f32],
-    v: &mut [f32],
-) {
-    {
-        let locked = bufs.sdpa_fwd_attn_out.as_f32_slice();
-        attn_out.copy_from_slice(&locked[..attn_out.len()]);
-    }
-    {
-        let locked = bufs.sdpa_fwd_q_rope_out.as_f32_slice();
-        q_rope.copy_from_slice(&locked[..q_rope.len()]);
-    }
-    {
-        let locked = bufs.sdpa_fwd_k_rope_out.as_f32_slice();
-        k_rope.copy_from_slice(&locked[..k_rope.len()]);
-    }
-    {
-        let locked = bufs.sdpa_fwd_v_out.as_f32_slice();
-        v.copy_from_slice(&locked[..v.len()]);
-    }
-}
-
 // ── Forward pass ──
 
 /// Run forward pass for one transformer layer.
@@ -679,18 +458,33 @@ pub fn forward(
     let mut rms_inv1 = vec![0.0f32; seq];
     rmsnorm::forward_channel_first(x, &weights.gamma1, &mut xnorm, &mut rms_inv1, dim, seq);
 
-    // 2. Stage sdpaFwd inputs directly into dedicated IOSurfaces
-    stage_sdpa_fwd_inputs(&kernels.bufs, &xnorm, &weights.wq, &weights.wk, &weights.wv);
+    // 2. Stage sdpaFwd directly into IOSurface (skip scratch buffer)
+    let sdpa_sp = sdpa_fwd::input_spatial_width(cfg);
+    let sdpa_out_ch = sdpa_fwd::output_channels(cfg);
+    {
+        let mut locked = kernels.bufs.sdpa_fwd_in.as_f32_slice_mut();
+        let buf = &mut *locked;
+        stage_spatial(buf, dim, sdpa_sp, &xnorm, seq, 0);
+        stage_spatial(buf, dim, sdpa_sp, &weights.wq, q_dim, seq);
+        stage_spatial(buf, dim, sdpa_sp, &weights.wk, kv_dim, seq + q_dim);
+        stage_spatial(buf, dim, sdpa_sp, &weights.wv, kv_dim, seq + q_dim + kv_dim);
+    }
 
     // 3. Run sdpaFwd (ANE)
-    run_sdpa_fwd(kernels);
+    kernels.sdpa_fwd.run_cached_direct(&[&kernels.bufs.sdpa_fwd_in], &[&kernels.bufs.sdpa_fwd_out]).expect("ANE eval failed");
 
     // Extract: attn_out[Q_DIM,SEQ], Q_rope[Q_DIM,SEQ], K_rope[KV_DIM,SEQ], V[KV_DIM,SEQ]
     let mut attn_out = vec![0.0f32; q_dim * seq];
     let mut q_rope = vec![0.0f32; q_dim * seq];
     let mut k_rope = vec![0.0f32; kv_dim * seq];
     let mut v = vec![0.0f32; kv_dim * seq];
-    read_sdpa_fwd_outputs(&kernels.bufs, &mut attn_out, &mut q_rope, &mut k_rope, &mut v);
+    {
+        let locked = kernels.bufs.sdpa_fwd_out.as_f32_slice();
+        read_channels_into(&locked, sdpa_out_ch, seq, 0, q_dim, &mut attn_out);
+        read_channels_into(&locked, sdpa_out_ch, seq, q_dim, q_dim, &mut q_rope);
+        read_channels_into(&locked, sdpa_out_ch, seq, 2 * q_dim, kv_dim, &mut k_rope);
+        read_channels_into(&locked, sdpa_out_ch, seq, 2 * q_dim + kv_dim, kv_dim, &mut v);
+    }
 
     // 4. Stage woFwd directly into IOSurface
     let wo_sp = dyn_matmul::spatial_width(seq, dim);
@@ -719,107 +513,38 @@ pub fn forward(
     let mut rms_inv2 = vec![0.0f32; seq];
     rmsnorm::forward_channel_first(&x2, &weights.gamma2, &mut x2norm, &mut rms_inv2, dim, seq);
 
-    // 7-8. FFN: fused or decomposed
+    // 7. Stage ffnFused directly into IOSurface
+    let ffn_sp = ffn_fused::input_spatial_width(cfg);
+    let ffn_out_ch = ffn_fused::output_channels(cfg);
+    {
+        let mut locked = kernels.bufs.ffn_fused_in.as_f32_slice_mut();
+        let buf = &mut *locked;
+        stage_spatial(buf, dim, ffn_sp, &x2norm, seq, 0);
+        stage_spatial(buf, dim, ffn_sp, &x2, seq, seq);
+        stage_spatial(buf, dim, ffn_sp, &weights.w1, hidden, 2 * seq);
+        stage_spatial(buf, dim, ffn_sp, &weights.w3, hidden, 2 * seq + hidden);
+        stage_spatial(buf, dim, ffn_sp, &weights.w2, hidden, 2 * seq + 2 * hidden);
+    }
+
+    // 8. Run ffnFused (ANE)
+    kernels.ffn_fused.run_cached_direct(&[&kernels.bufs.ffn_fused_in], &[&kernels.bufs.ffn_fused_out]).expect("ANE eval failed");
+
+    // Extract: x_next[DIM,SEQ], h1[HIDDEN,SEQ], h3[HIDDEN,SEQ], gate[HIDDEN,SEQ]
     let mut x_next = vec![0.0f32; dim * seq];
     let mut h1 = vec![0.0f32; hidden * seq];
     let mut h3 = vec![0.0f32; hidden * seq];
     let mut gate = vec![0.0f32; hidden * seq];
-    let mut w2t_scratch = vec![0.0f32; hidden * dim];
-
-    if kernels.use_decomposed_ffn {
-        // Decomposed path: dual W1+W3 dispatch + CPU SiLU + W2 dispatch + CPU residual
-        let w13_sp = if kernels.use_dual_w13 { dyn_matmul::dual_separate_spatial_width(seq, hidden) } else { dyn_matmul::spatial_width(seq, hidden) };
-        let w2_sp = dyn_matmul::spatial_width(seq, dim);
-        let w13_exe = kernels.ffn_w13_fwd.as_ref().unwrap();
-        let w2_exe = kernels.ffn_w2_fwd.as_ref().unwrap();
-        let w13_in = kernels.bufs.ffn_w13_in.as_ref().unwrap();
-        let w13_out = kernels.bufs.ffn_w13_out.as_ref().unwrap();
-        let w2_in = kernels.bufs.ffn_w2_in.as_ref().unwrap();
-        let w2_out = kernels.bufs.ffn_w2_out.as_ref().unwrap();
-
-        // W1+W3 projection: dual dispatch if fits, else separate
-        if kernels.use_dual_w13 {
-            {
-                let mut locked = w13_in.as_f32_slice_mut();
-                let buf = &mut *locked;
-                stage_spatial(buf, dim, w13_sp, &x2norm, seq, 0);
-                stage_spatial(buf, dim, w13_sp, &weights.w1, hidden, seq);
-                stage_spatial(buf, dim, w13_sp, &weights.w3, hidden, seq + hidden);
-            }
-            w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE w13 dual failed");
-            {
-                let locked = w13_out.as_f32_slice();
-                read_channels_into(&locked, 2 * hidden, seq, 0, hidden, &mut h1);
-                read_channels_into(&locked, 2 * hidden, seq, hidden, hidden, &mut h3);
-            }
-        } else {
-            // Separate W1, W3 dispatches
-            {
-                let mut locked = w13_in.as_f32_slice_mut();
-                let buf = &mut *locked;
-                stage_spatial(buf, dim, w13_sp, &x2norm, seq, 0);
-                stage_spatial(buf, dim, w13_sp, &weights.w1, hidden, seq);
-            }
-            w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE w13 W1 failed");
-            { let locked = w13_out.as_f32_slice(); h1.copy_from_slice(&locked[..hidden * seq]); }
-            {
-                let mut locked = w13_in.as_f32_slice_mut();
-                let buf = &mut *locked;
-                stage_spatial(buf, dim, w13_sp, &weights.w3, hidden, seq);
-            }
-            w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE w13 W3 failed");
-            { let locked = w13_out.as_f32_slice(); h3.copy_from_slice(&locked[..hidden * seq]); }
-        }
-
-        // CPU SiLU gate: gate = silu(h1) * h3
-        silu::silu_gate(&h1, &h3, &mut gate);
-
-        // Transpose W2 from [DIM, HIDDEN] → [HIDDEN, DIM]
-        vdsp::mtrans(&weights.w2, hidden, &mut w2t_scratch, dim, dim, hidden);
-
-        // W2 fwd: ffn_out = gate @ W2^T
-        {
-            let mut locked = w2_in.as_f32_slice_mut();
-            let buf = &mut *locked;
-            stage_spatial(buf, hidden, w2_sp, &gate, seq, 0);
-            stage_spatial(buf, hidden, w2_sp, &w2t_scratch, dim, seq);
-        }
-        w2_exe.run_cached_direct(&[w2_in], &[w2_out]).expect("ANE ffnW2Fwd failed");
-        // Read ffn_out and compute residual: x_next = x2 + alpha * ffn_out
-        {
-            let locked = w2_out.as_f32_slice();
-            // Use x_next as temporary for ffn_out, then compute residual in-place
-            x_next.copy_from_slice(&locked[..dim * seq]);
-        }
-        vdsp::vsma(&x_next.clone(), alpha, &x2, &mut x_next);
-    } else {
-        // Fused path (existing)
-        let ffn_sp = ffn_fused::input_spatial_width(cfg);
-        let ffn_out_ch = ffn_fused::output_channels(cfg);
-        let ffn_in = kernels.bufs.ffn_fused_in.as_ref().unwrap();
-        let ffn_out = kernels.bufs.ffn_fused_out.as_ref().unwrap();
-        {
-            let mut locked = ffn_in.as_f32_slice_mut();
-            let buf = &mut *locked;
-            stage_spatial(buf, dim, ffn_sp, &x2norm, seq, 0);
-            stage_spatial(buf, dim, ffn_sp, &x2, seq, seq);
-            stage_spatial(buf, dim, ffn_sp, &weights.w1, hidden, 2 * seq);
-            stage_spatial(buf, dim, ffn_sp, &weights.w3, hidden, 2 * seq + hidden);
-            stage_spatial(buf, dim, ffn_sp, &weights.w2, hidden, 2 * seq + 2 * hidden);
-        }
-        kernels.ffn_fused.as_ref().unwrap().run_cached_direct(&[ffn_in], &[ffn_out]).expect("ANE eval failed");
-        {
-            let locked = ffn_out.as_f32_slice();
-            read_channels_into(&locked, ffn_out_ch, seq, 0, dim, &mut x_next);
-            read_channels_into(&locked, ffn_out_ch, seq, dim, hidden, &mut h1);
-            read_channels_into(&locked, ffn_out_ch, seq, dim + hidden, hidden, &mut h3);
-            read_channels_into(&locked, ffn_out_ch, seq, dim + 2 * hidden, hidden, &mut gate);
-        }
+    {
+        let locked = kernels.bufs.ffn_fused_out.as_f32_slice();
+        read_channels_into(&locked, ffn_out_ch, seq, 0, dim, &mut x_next);
+        read_channels_into(&locked, ffn_out_ch, seq, dim, hidden, &mut h1);
+        read_channels_into(&locked, ffn_out_ch, seq, dim + hidden, hidden, &mut h3);
+        read_channels_into(&locked, ffn_out_ch, seq, dim + 2 * hidden, hidden, &mut gate);
     }
 
     let cache = ForwardCache {
         x: x.to_vec(), xnorm, rms_inv1, q_rope, k_rope, v, attn_out, o_out,
-        x2, x2norm, rms_inv2, h1, h3, gate, w2t_scratch, w2t_generation: weights.w2_generation,
+        x2, x2norm, rms_inv2, h1, h3, gate,
     };
 
     (x_next, cache)
@@ -848,14 +573,32 @@ pub fn forward_into(
     // 1. RMSNorm1 (CPU)
     rmsnorm::forward_channel_first(x, &weights.gamma1, &mut cache.xnorm, &mut cache.rms_inv1, dim, seq);
 
-    // 2. Stage sdpaFwd inputs
-    stage_sdpa_fwd_inputs(&kernels.bufs, &cache.xnorm, &weights.wq, &weights.wk, &weights.wv);
+    // 2. Stage sdpaFwd — fused single-pass
+    let sdpa_sp = sdpa_fwd::input_spatial_width(cfg);
+    let sdpa_out_ch = sdpa_fwd::output_channels(cfg);
+    {
+        let mut locked = kernels.bufs.sdpa_fwd_in.as_f32_slice_mut();
+        let buf = &mut *locked;
+        for c in 0..dim {
+            let row = c * sdpa_sp;
+            buf[row..row + seq].copy_from_slice(&cache.xnorm[c * seq..c * seq + seq]);
+            buf[row + seq..row + seq + q_dim].copy_from_slice(&weights.wq[c * q_dim..c * q_dim + q_dim]);
+            let kv_off = seq + q_dim;
+            buf[row + kv_off..row + kv_off + kv_dim].copy_from_slice(&weights.wk[c * kv_dim..c * kv_dim + kv_dim]);
+            buf[row + kv_off + kv_dim..row + kv_off + 2 * kv_dim].copy_from_slice(&weights.wv[c * kv_dim..c * kv_dim + kv_dim]);
+        }
+    }
 
-    // 3. Run sdpaFwd (ANE) || pre-stage woFwd weights + ffn weights
+    // 3. Run sdpaFwd (ANE) || pre-stage woFwd weights + ffnFused weights
+    // sdpaFwd ANE takes ~2ms, giving plenty of CPU headroom to stage both
+    // woFwd weights (~0.3ms) and ffnFused weights (~1.2ms) = ~1.5ms total CPU < 2ms ANE.
+    // This eliminates the CPU bottleneck that previously slowed step 5 (woFwd overlap).
     let wo_sp = dyn_matmul::spatial_width(seq, dim);
+    let ffn_sp = ffn_fused::input_spatial_width(cfg);
+    let ffn_out_ch = ffn_fused::output_channels(cfg);
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
-            run_sdpa_fwd(kernels);
+            kernels.sdpa_fwd.run_cached_direct(&[&kernels.bufs.sdpa_fwd_in], &[&kernels.bufs.sdpa_fwd_out]).expect("ANE eval failed");
         });
         // Stage woFwd weights
         {
@@ -863,20 +606,9 @@ pub fn forward_into(
             let buf = &mut *locked;
             stage_spatial(buf, q_dim, wo_sp, &weights.wo, dim, seq);
         }
-        // Pre-stage FFN weights (fused or decomposed W1 + optional W3)
-        if kernels.use_decomposed_ffn {
-            let w13_sp = if kernels.use_dual_w13 { dyn_matmul::dual_separate_spatial_width(seq, hidden) } else { dyn_matmul::spatial_width(seq, hidden) };
-            let w13_in = kernels.bufs.ffn_w13_in.as_ref().unwrap();
-            let mut locked = w13_in.as_f32_slice_mut();
-            let buf = &mut *locked;
-            stage_spatial(buf, dim, w13_sp, &weights.w1, hidden, seq);
-            if kernels.use_dual_w13 {
-                stage_spatial(buf, dim, w13_sp, &weights.w3, hidden, seq + hidden);
-            }
-        } else {
-            let ffn_sp = ffn_fused::input_spatial_width(cfg);
-            let ffn_in = kernels.bufs.ffn_fused_in.as_ref().unwrap();
-            let mut locked = ffn_in.as_f32_slice_mut();
+        // Stage ffnFused weights (moved from step 5 — hidden behind sdpaFwd ANE time)
+        {
+            let mut locked = kernels.bufs.ffn_fused_in.as_f32_slice_mut();
             let buf = &mut *locked;
             let w_off = 2 * seq;
             for c in 0..dim {
@@ -890,13 +622,13 @@ pub fn forward_into(
     });
 
     // Extract sdpaFwd output
-    read_sdpa_fwd_outputs(
-        &kernels.bufs,
-        &mut cache.attn_out,
-        &mut cache.q_rope,
-        &mut cache.k_rope,
-        &mut cache.v,
-    );
+    {
+        let locked = kernels.bufs.sdpa_fwd_out.as_f32_slice();
+        read_channels_into(&locked, sdpa_out_ch, seq, 0, q_dim, &mut cache.attn_out);
+        read_channels_into(&locked, sdpa_out_ch, seq, q_dim, q_dim, &mut cache.q_rope);
+        read_channels_into(&locked, sdpa_out_ch, seq, 2 * q_dim, kv_dim, &mut cache.k_rope);
+        read_channels_into(&locked, sdpa_out_ch, seq, 2 * q_dim + kv_dim, kv_dim, &mut cache.v);
+    }
 
     // 4. Stage woFwd activations only (weights already staged during sdpaFwd)
     {
@@ -905,7 +637,7 @@ pub fn forward_into(
         stage_spatial(buf, q_dim, wo_sp, &cache.attn_out, seq, 0);
     }
 
-    // 5. Run woFwd (ANE)
+    // 5. Run woFwd (ANE) — ffnFused weights already staged in step 3 during sdpaFwd
     kernels.wo_fwd.run_cached_direct(&[&kernels.bufs.wo_fwd_in], &[&kernels.bufs.wo_fwd_out]).expect("ANE eval failed");
 
     // Read o_out
@@ -918,84 +650,27 @@ pub fn forward_into(
     vdsp::vsma(&cache.o_out, alpha, x, &mut cache.x2);
     rmsnorm::forward_channel_first(&cache.x2, &weights.gamma2, &mut cache.x2norm, &mut cache.rms_inv2, dim, seq);
 
-    // 7-8. FFN: fused or decomposed
-    if kernels.use_decomposed_ffn {
-        let w13_sp = if kernels.use_dual_w13 { dyn_matmul::dual_separate_spatial_width(seq, hidden) } else { dyn_matmul::spatial_width(seq, hidden) };
-        let w2_sp = dyn_matmul::spatial_width(seq, dim);
-        let w13_exe = kernels.ffn_w13_fwd.as_ref().unwrap();
-        let w2_exe = kernels.ffn_w2_fwd.as_ref().unwrap();
-        let w13_in = kernels.bufs.ffn_w13_in.as_ref().unwrap();
-        let w13_out = kernels.bufs.ffn_w13_out.as_ref().unwrap();
-        let w2_in = kernels.bufs.ffn_w2_in.as_ref().unwrap();
-        let w2_out = kernels.bufs.ffn_w2_out.as_ref().unwrap();
+    // 7. Stage ffnFused activations only (weights already staged in step 3 during sdpaFwd)
+    {
+        let mut locked = kernels.bufs.ffn_fused_in.as_f32_slice_mut();
+        let buf = &mut *locked;
+        for c in 0..dim {
+            let row = c * ffn_sp;
+            buf[row..row + seq].copy_from_slice(&cache.x2norm[c * seq..c * seq + seq]);
+            buf[row + seq..row + 2 * seq].copy_from_slice(&cache.x2[c * seq..c * seq + seq]);
+        }
+    }
 
-        // W1+W3 projection (weights pre-staged in step 3)
-        {
-            let mut locked = w13_in.as_f32_slice_mut();
-            let buf = &mut *locked;
-            stage_spatial(buf, dim, w13_sp, &cache.x2norm, seq, 0);
-        }
-        if kernels.use_dual_w13 {
-            w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE w13 dual failed");
-            let locked = w13_out.as_f32_slice();
-            read_channels_into(&locked, 2 * hidden, seq, 0, hidden, &mut cache.h1);
-            read_channels_into(&locked, 2 * hidden, seq, hidden, hidden, &mut cache.h3);
-        } else {
-            w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE w13 W1 failed");
-            { let locked = w13_out.as_f32_slice(); cache.h1.copy_from_slice(&locked[..hidden * seq]); }
-            { let mut locked = w13_in.as_f32_slice_mut(); stage_spatial(&mut locked, dim, w13_sp, &weights.w3, hidden, seq); }
-            w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE w13 W3 failed");
-            { let locked = w13_out.as_f32_slice(); cache.h3.copy_from_slice(&locked[..hidden * seq]); }
-        }
+    // 8. Run ffnFused (ANE)
+    kernels.ffn_fused.run_cached_direct(&[&kernels.bufs.ffn_fused_in], &[&kernels.bufs.ffn_fused_out]).expect("ANE eval failed");
 
-        // CPU SiLU gate
-        silu::silu_gate(&cache.h1, &cache.h3, &mut cache.gate);
-
-        // Reuse the cached W2^T until training updates W2.
-        if cache.w2t_generation != weights.w2_generation {
-            vdsp::mtrans(&weights.w2, hidden, &mut cache.w2t_scratch, dim, dim, hidden);
-            cache.w2t_generation = weights.w2_generation;
-        }
-        {
-            let mut locked = w2_in.as_f32_slice_mut();
-            let buf = &mut *locked;
-            stage_spatial(buf, hidden, w2_sp, &cache.gate, seq, 0);
-            stage_spatial(buf, hidden, w2_sp, &cache.w2t_scratch, dim, seq);
-        }
-        w2_exe.run_cached_direct(&[w2_in], &[w2_out]).expect("ANE ffnW2Fwd failed");
-
-        // Read ffn_out into x_next, then residual
-        {
-            let locked = w2_out.as_f32_slice();
-            x_next.copy_from_slice(&locked[..dim * seq]);
-        }
-        // x_next = alpha * ffn_out + x2  (vsma: a*scalar + b → out)
-        let ffn_tmp: Vec<f32> = x_next.to_vec();
-        vdsp::vsma(&ffn_tmp, alpha, &cache.x2, x_next);
-    } else {
-        let ffn_sp = ffn_fused::input_spatial_width(cfg);
-        let ffn_out_ch = ffn_fused::output_channels(cfg);
-        let ffn_in = kernels.bufs.ffn_fused_in.as_ref().unwrap();
-        let ffn_out = kernels.bufs.ffn_fused_out.as_ref().unwrap();
-
-        // Stage activations only (weights already staged in step 3)
-        {
-            let mut locked = ffn_in.as_f32_slice_mut();
-            let buf = &mut *locked;
-            for c in 0..dim {
-                let row = c * ffn_sp;
-                buf[row..row + seq].copy_from_slice(&cache.x2norm[c * seq..c * seq + seq]);
-                buf[row + seq..row + 2 * seq].copy_from_slice(&cache.x2[c * seq..c * seq + seq]);
-            }
-        }
-        kernels.ffn_fused.as_ref().unwrap().run_cached_direct(&[ffn_in], &[ffn_out]).expect("ANE eval failed");
-        {
-            let locked = ffn_out.as_f32_slice();
-            read_channels_into(&locked, ffn_out_ch, seq, 0, dim, x_next);
-            read_channels_into(&locked, ffn_out_ch, seq, dim, hidden, &mut cache.h1);
-            read_channels_into(&locked, ffn_out_ch, seq, dim + hidden, hidden, &mut cache.h3);
-            read_channels_into(&locked, ffn_out_ch, seq, dim + 2 * hidden, hidden, &mut cache.gate);
-        }
+    // Extract: x_next + cache intermediates
+    {
+        let locked = kernels.bufs.ffn_fused_out.as_f32_slice();
+        read_channels_into(&locked, ffn_out_ch, seq, 0, dim, x_next);
+        read_channels_into(&locked, ffn_out_ch, seq, dim, hidden, &mut cache.h1);
+        read_channels_into(&locked, ffn_out_ch, seq, dim + hidden, hidden, &mut cache.h3);
+        read_channels_into(&locked, ffn_out_ch, seq, dim + 2 * hidden, hidden, &mut cache.gate);
     }
 }
 
@@ -1027,14 +702,29 @@ pub fn forward_into_pipelined(
     // 1. RMSNorm1 (CPU)
     rmsnorm::forward_channel_first(x, &weights.gamma1, &mut cache.xnorm, &mut cache.rms_inv1, dim, seq);
 
-    // 2. Stage sdpaFwd inputs
-    stage_sdpa_fwd_inputs(&kernels.bufs, &cache.xnorm, &weights.wq, &weights.wk, &weights.wv);
+    // 2. Stage sdpaFwd
+    let sdpa_sp = sdpa_fwd::input_spatial_width(cfg);
+    let sdpa_out_ch = sdpa_fwd::output_channels(cfg);
+    {
+        let mut locked = kernels.bufs.sdpa_fwd_in.as_f32_slice_mut();
+        let buf = &mut *locked;
+        for c in 0..dim {
+            let row = c * sdpa_sp;
+            buf[row..row + seq].copy_from_slice(&cache.xnorm[c * seq..c * seq + seq]);
+            buf[row + seq..row + seq + q_dim].copy_from_slice(&weights.wq[c * q_dim..c * q_dim + q_dim]);
+            let kv_off = seq + q_dim;
+            buf[row + kv_off..row + kv_off + kv_dim].copy_from_slice(&weights.wk[c * kv_dim..c * kv_dim + kv_dim]);
+            buf[row + kv_off + kv_dim..row + kv_off + 2 * kv_dim].copy_from_slice(&weights.wv[c * kv_dim..c * kv_dim + kv_dim]);
+        }
+    }
 
     // 3. Run sdpaFwd (ANE) || pre-stage weights + deferred prev-layer cache readback
     let wo_sp = dyn_matmul::spatial_width(seq, dim);
+    let ffn_sp = ffn_fused::input_spatial_width(cfg);
+    let ffn_out_ch = ffn_fused::output_channels(cfg);
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
-            run_sdpa_fwd(kernels);
+            kernels.sdpa_fwd.run_cached_direct(&[&kernels.bufs.sdpa_fwd_in], &[&kernels.bufs.sdpa_fwd_out]).expect("ANE eval failed");
         });
         // Stage woFwd weights
         {
@@ -1042,56 +732,38 @@ pub fn forward_into_pipelined(
             let buf = &mut *locked;
             stage_spatial(buf, q_dim, wo_sp, &weights.wo, dim, seq);
         }
-        // Pre-stage FFN weights + deferred prev-layer readback
-        if kernels.use_decomposed_ffn {
-            // Pre-stage W1 (+ W3 if dual) weights
-            let w13_sp = if kernels.use_dual_w13 { dyn_matmul::dual_separate_spatial_width(seq, hidden) } else { dyn_matmul::spatial_width(seq, hidden) };
-            let w13_in = kernels.bufs.ffn_w13_in.as_ref().unwrap();
-            {
-                let mut locked = w13_in.as_f32_slice_mut();
-                let buf = &mut *locked;
-                stage_spatial(buf, dim, w13_sp, &weights.w1, hidden, seq);
-                if kernels.use_dual_w13 {
-                    stage_spatial(buf, dim, w13_sp, &weights.w3, hidden, seq + hidden);
-                }
+        // Stage ffnFused weights
+        {
+            let mut locked = kernels.bufs.ffn_fused_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            let w_off = 2 * seq;
+            for c in 0..dim {
+                let row = c * ffn_sp;
+                buf[row + w_off..row + w_off + hidden].copy_from_slice(&weights.w1[c * hidden..c * hidden + hidden]);
+                buf[row + w_off + hidden..row + w_off + 2 * hidden].copy_from_slice(&weights.w3[c * hidden..c * hidden + hidden]);
+                buf[row + w_off + 2 * hidden..row + w_off + 3 * hidden].copy_from_slice(&weights.w2[c * hidden..c * hidden + hidden]);
             }
-            // When decomposed, prev_cache h1/h3/gate were already written during prev layer's
-            // decomposed FFN sequence — no deferred readback needed.
-        } else {
-            let ffn_sp = ffn_fused::input_spatial_width(cfg);
-            let ffn_out_ch = ffn_fused::output_channels(cfg);
-            let ffn_in = kernels.bufs.ffn_fused_in.as_ref().unwrap();
-            {
-                let mut locked = ffn_in.as_f32_slice_mut();
-                let buf = &mut *locked;
-                let w_off = 2 * seq;
-                for c in 0..dim {
-                    let row = c * ffn_sp;
-                    buf[row + w_off..row + w_off + hidden].copy_from_slice(&weights.w1[c * hidden..c * hidden + hidden]);
-                    buf[row + w_off + hidden..row + w_off + 2 * hidden].copy_from_slice(&weights.w3[c * hidden..c * hidden + hidden]);
-                    buf[row + w_off + 2 * hidden..row + w_off + 3 * hidden].copy_from_slice(&weights.w2[c * hidden..c * hidden + hidden]);
-                }
-            }
-            // Deferred readback: read PREVIOUS layer's h1/h3/gate from ffn_fused_out.
-            if let Some(prev) = prev_cache {
-                let ffn_out = kernels.bufs.ffn_fused_out.as_ref().unwrap();
-                let locked = ffn_out.as_f32_slice();
-                read_channels_into(&locked, ffn_out_ch, seq, dim, hidden, &mut prev.h1);
-                read_channels_into(&locked, ffn_out_ch, seq, dim + hidden, hidden, &mut prev.h3);
-                read_channels_into(&locked, ffn_out_ch, seq, dim + 2 * hidden, hidden, &mut prev.gate);
-            }
+        }
+        // Deferred readback: read PREVIOUS layer's h1/h3/gate from ffn_fused_out.
+        // This IOSurface still holds the previous layer's output (not yet overwritten).
+        // Safe: ffn_fused_out is not touched by sdpaFwd (which uses sdpa_fwd_in/out).
+        if let Some(prev) = prev_cache {
+            let locked = kernels.bufs.ffn_fused_out.as_f32_slice();
+            read_channels_into(&locked, ffn_out_ch, seq, dim, hidden, &mut prev.h1);
+            read_channels_into(&locked, ffn_out_ch, seq, dim + hidden, hidden, &mut prev.h3);
+            read_channels_into(&locked, ffn_out_ch, seq, dim + 2 * hidden, hidden, &mut prev.gate);
         }
         ane_handle.join().expect("ANE thread panicked");
     });
 
     // Extract sdpaFwd output
-    read_sdpa_fwd_outputs(
-        &kernels.bufs,
-        &mut cache.attn_out,
-        &mut cache.q_rope,
-        &mut cache.k_rope,
-        &mut cache.v,
-    );
+    {
+        let locked = kernels.bufs.sdpa_fwd_out.as_f32_slice();
+        read_channels_into(&locked, sdpa_out_ch, seq, 0, q_dim, &mut cache.attn_out);
+        read_channels_into(&locked, sdpa_out_ch, seq, q_dim, q_dim, &mut cache.q_rope);
+        read_channels_into(&locked, sdpa_out_ch, seq, 2 * q_dim, kv_dim, &mut cache.k_rope);
+        read_channels_into(&locked, sdpa_out_ch, seq, 2 * q_dim + kv_dim, kv_dim, &mut cache.v);
+    }
 
     // 4. Stage woFwd activations only
     {
@@ -1112,100 +784,36 @@ pub fn forward_into_pipelined(
     vdsp::vsma(&cache.o_out, alpha, x, &mut cache.x2);
     rmsnorm::forward_channel_first(&cache.x2, &weights.gamma2, &mut cache.x2norm, &mut cache.rms_inv2, dim, seq);
 
-    // 7-8. FFN: fused or decomposed
-    if kernels.use_decomposed_ffn {
-        let w13_sp = if kernels.use_dual_w13 { dyn_matmul::dual_separate_spatial_width(seq, hidden) } else { dyn_matmul::spatial_width(seq, hidden) };
-        let w2_sp = dyn_matmul::spatial_width(seq, dim);
-        let w13_exe = kernels.ffn_w13_fwd.as_ref().unwrap();
-        let w2_exe = kernels.ffn_w2_fwd.as_ref().unwrap();
-        let w13_in = kernels.bufs.ffn_w13_in.as_ref().unwrap();
-        let w13_out = kernels.bufs.ffn_w13_out.as_ref().unwrap();
-        let w2_in = kernels.bufs.ffn_w2_in.as_ref().unwrap();
-        let w2_out = kernels.bufs.ffn_w2_out.as_ref().unwrap();
+    // 7. Stage ffnFused activations only
+    {
+        let mut locked = kernels.bufs.ffn_fused_in.as_f32_slice_mut();
+        let buf = &mut *locked;
+        for c in 0..dim {
+            let row = c * ffn_sp;
+            buf[row..row + seq].copy_from_slice(&cache.x2norm[c * seq..c * seq + seq]);
+            buf[row + seq..row + 2 * seq].copy_from_slice(&cache.x2[c * seq..c * seq + seq]);
+        }
+    }
 
-        // W1+W3 projection (weights pre-staged in step 3)
-        {
-            let mut locked = w13_in.as_f32_slice_mut();
-            let buf = &mut *locked;
-            stage_spatial(buf, dim, w13_sp, &cache.x2norm, seq, 0);
-        }
-        if kernels.use_dual_w13 {
-            w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE w13 dual failed");
-            let locked = w13_out.as_f32_slice();
-            read_channels_into(&locked, 2 * hidden, seq, 0, hidden, &mut cache.h1);
-            read_channels_into(&locked, 2 * hidden, seq, hidden, hidden, &mut cache.h3);
-        } else {
-            w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE w13 W1 failed");
-            { let locked = w13_out.as_f32_slice(); cache.h1.copy_from_slice(&locked[..hidden * seq]); }
-            { let mut locked = w13_in.as_f32_slice_mut(); stage_spatial(&mut locked, dim, w13_sp, &weights.w3, hidden, seq); }
-            w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE w13 W3 failed");
-            { let locked = w13_out.as_f32_slice(); cache.h3.copy_from_slice(&locked[..hidden * seq]); }
-        }
+    // 8. Run ffnFused (ANE)
+    kernels.ffn_fused.run_cached_direct(&[&kernels.bufs.ffn_fused_in], &[&kernels.bufs.ffn_fused_out]).expect("ANE eval failed");
 
-        // CPU SiLU gate
-        silu::silu_gate(&cache.h1, &cache.h3, &mut cache.gate);
-
-        // Reuse the cached W2^T until training updates W2.
-        if cache.w2t_generation != weights.w2_generation {
-            vdsp::mtrans(&weights.w2, hidden, &mut cache.w2t_scratch, dim, dim, hidden);
-            cache.w2t_generation = weights.w2_generation;
-        }
-        {
-            let mut locked = w2_in.as_f32_slice_mut();
-            let buf = &mut *locked;
-            stage_spatial(buf, hidden, w2_sp, &cache.gate, seq, 0);
-            stage_spatial(buf, hidden, w2_sp, &cache.w2t_scratch, dim, seq);
-        }
-        w2_exe.run_cached_direct(&[w2_in], &[w2_out]).expect("ANE ffnW2Fwd failed");
-
-        // Read ffn_out into x_next, then residual
-        {
-            let locked = w2_out.as_f32_slice();
-            x_next.copy_from_slice(&locked[..dim * seq]);
-        }
-        let ffn_tmp: Vec<f32> = x_next.to_vec();
-        vdsp::vsma(&ffn_tmp, alpha, &cache.x2, x_next);
-        // h1/h3/gate already populated — no deferred readback needed
-    } else {
-        let ffn_sp = ffn_fused::input_spatial_width(cfg);
-        let ffn_out_ch = ffn_fused::output_channels(cfg);
-        let ffn_in = kernels.bufs.ffn_fused_in.as_ref().unwrap();
-        let ffn_out = kernels.bufs.ffn_fused_out.as_ref().unwrap();
-
-        // Stage activations only (weights already staged in step 3)
-        {
-            let mut locked = ffn_in.as_f32_slice_mut();
-            let buf = &mut *locked;
-            for c in 0..dim {
-                let row = c * ffn_sp;
-                buf[row..row + seq].copy_from_slice(&cache.x2norm[c * seq..c * seq + seq]);
-                buf[row + seq..row + 2 * seq].copy_from_slice(&cache.x2[c * seq..c * seq + seq]);
-            }
-        }
-        kernels.ffn_fused.as_ref().unwrap().run_cached_direct(&[ffn_in], &[ffn_out]).expect("ANE eval failed");
-
-        // Extract x_next ONLY — h1/h3/gate deferred to next layer's step 3
-        {
-            let locked = ffn_out.as_f32_slice();
-            read_channels_into(&locked, ffn_out_ch, seq, 0, dim, x_next);
-        }
+    // Extract x_next ONLY — h1/h3/gate deferred to next layer's step 3
+    {
+        let locked = kernels.bufs.ffn_fused_out.as_f32_slice();
+        read_channels_into(&locked, ffn_out_ch, seq, 0, dim, x_next);
     }
 }
 
 /// Read deferred h1/h3/gate from ffnFused IOSurface into cache.
 /// Used for the last layer (no next layer to overlap with).
-/// No-op when decomposed (cache already populated during forward).
 pub fn read_ffn_cache(cfg: &ModelConfig, kernels: &CompiledKernels, cache: &mut ForwardCache) {
-    if kernels.use_decomposed_ffn {
-        return; // h1/h3/gate already written during decomposed FFN sequence
-    }
     let dim = cfg.dim;
     let seq = cfg.seq;
     let hidden = cfg.hidden;
     let ffn_out_ch = ffn_fused::output_channels(cfg);
 
-    let ffn_out = kernels.bufs.ffn_fused_out.as_ref().unwrap();
-    let locked = ffn_out.as_f32_slice();
+    let locked = kernels.bufs.ffn_fused_out.as_f32_slice();
     read_channels_into(&locked, ffn_out_ch, seq, dim, hidden, &mut cache.h1);
     read_channels_into(&locked, ffn_out_ch, seq, dim + hidden, hidden, &mut cache.h3);
     read_channels_into(&locked, ffn_out_ch, seq, dim + 2 * hidden, hidden, &mut cache.gate);
@@ -1269,15 +877,27 @@ pub fn forward_timed(
 
     // 2. Stage sdpaFwd
     let t = Instant::now();
-    stage_sdpa_fwd_inputs(&kernels.bufs, &xnorm, &weights.wq, &weights.wk, &weights.wv);
+    let sdpa_sp = sdpa_fwd::input_spatial_width(cfg);
+    let sdpa_out_ch = sdpa_fwd::output_channels(cfg);
+    {
+        let mut locked = kernels.bufs.sdpa_fwd_in.as_f32_slice_mut();
+        let buf = &mut *locked;
+        stage_spatial(buf, dim, sdpa_sp, &xnorm, seq, 0);
+        stage_spatial(buf, dim, sdpa_sp, &weights.wq, q_dim, seq);
+        stage_spatial(buf, dim, sdpa_sp, &weights.wk, kv_dim, seq + q_dim);
+        stage_spatial(buf, dim, sdpa_sp, &weights.wv, kv_dim, seq + q_dim + kv_dim);
+    }
     let stage_sdpa_ms = t.elapsed().as_secs_f32() * 1000.0;
 
-    // 3. ANE sdpaFwd || pre-stage woFwd weights + FFN weights
+    // 3. ANE sdpaFwd || pre-stage woFwd weights + ffnFused weights
+    // sdpaFwd ANE takes ~2ms, hiding ~1.5ms of CPU staging work.
     let t = Instant::now();
     let wo_sp = dyn_matmul::spatial_width(seq, dim);
+    let ffn_sp = ffn_fused::input_spatial_width(cfg);
+    let ffn_out_ch = ffn_fused::output_channels(cfg);
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
-            run_sdpa_fwd(kernels);
+            kernels.sdpa_fwd.run_cached_direct(&[&kernels.bufs.sdpa_fwd_in], &[&kernels.bufs.sdpa_fwd_out]).expect("ANE eval failed");
         });
         // Stage woFwd weights
         {
@@ -1285,20 +905,9 @@ pub fn forward_timed(
             let buf = &mut *locked;
             stage_spatial(buf, q_dim, wo_sp, &weights.wo, dim, seq);
         }
-        // Pre-stage FFN weights
-        if kernels.use_decomposed_ffn {
-            let w13_sp = if kernels.use_dual_w13 { dyn_matmul::dual_separate_spatial_width(seq, hidden) } else { dyn_matmul::spatial_width(seq, hidden) };
-            let w13_in = kernels.bufs.ffn_w13_in.as_ref().unwrap();
-            let mut locked = w13_in.as_f32_slice_mut();
-            let buf = &mut *locked;
-            stage_spatial(buf, dim, w13_sp, &weights.w1, hidden, seq);
-            if kernels.use_dual_w13 {
-                stage_spatial(buf, dim, w13_sp, &weights.w3, hidden, seq + hidden);
-            }
-        } else {
-            let ffn_sp = ffn_fused::input_spatial_width(cfg);
-            let ffn_in = kernels.bufs.ffn_fused_in.as_ref().unwrap();
-            let mut locked = ffn_in.as_f32_slice_mut();
+        // Stage ffnFused weights (moved from woFwd overlap — hidden behind sdpaFwd ANE)
+        {
+            let mut locked = kernels.bufs.ffn_fused_in.as_f32_slice_mut();
             let buf = &mut *locked;
             let w_off = 2 * seq;
             for c in 0..dim {
@@ -1318,7 +927,13 @@ pub fn forward_timed(
     let mut q_rope = vec![0.0f32; q_dim * seq];
     let mut k_rope = vec![0.0f32; kv_dim * seq];
     let mut v = vec![0.0f32; kv_dim * seq];
-    read_sdpa_fwd_outputs(&kernels.bufs, &mut attn_out, &mut q_rope, &mut k_rope, &mut v);
+    {
+        let locked = kernels.bufs.sdpa_fwd_out.as_f32_slice();
+        read_channels_into(&locked, sdpa_out_ch, seq, 0, q_dim, &mut attn_out);
+        read_channels_into(&locked, sdpa_out_ch, seq, q_dim, q_dim, &mut q_rope);
+        read_channels_into(&locked, sdpa_out_ch, seq, 2 * q_dim, kv_dim, &mut k_rope);
+        read_channels_into(&locked, sdpa_out_ch, seq, 2 * q_dim + kv_dim, kv_dim, &mut v);
+    }
     let read_sdpa_ms = t.elapsed().as_secs_f32() * 1000.0;
 
     // 5. Stage woFwd activations only (weights already staged during sdpaFwd)
@@ -1353,102 +968,41 @@ pub fn forward_timed(
     rmsnorm::forward_channel_first(&x2, &weights.gamma2, &mut x2norm, &mut rms_inv2, dim, seq);
     let residual_rmsnorm2_ms = t.elapsed().as_secs_f32() * 1000.0;
 
-    // 9-11. FFN: fused or decomposed (stage + dispatch + read)
+    // 9. Stage ffnFused activations only (weights already staged in step 3 during sdpaFwd)
+    let t = Instant::now();
+    {
+        let mut locked = kernels.bufs.ffn_fused_in.as_f32_slice_mut();
+        let buf = &mut *locked;
+        stage_spatial(buf, dim, ffn_sp, &x2norm, seq, 0);
+        stage_spatial(buf, dim, ffn_sp, &x2, seq, seq);
+    }
+    let stage_ffn_ms = t.elapsed().as_secs_f32() * 1000.0;
+
+    // 10. ANE ffnFused
+    let t = Instant::now();
+    kernels.ffn_fused.run_cached_direct(&[&kernels.bufs.ffn_fused_in], &[&kernels.bufs.ffn_fused_out]).expect("ANE eval failed");
+    let ane_ffn_ms = t.elapsed().as_secs_f32() * 1000.0;
+
+    // 11. Read ffnFused output
+    let t = Instant::now();
     let mut x_next = vec![0.0f32; dim * seq];
     let mut h1 = vec![0.0f32; hidden * seq];
     let mut h3 = vec![0.0f32; hidden * seq];
     let mut gate = vec![0.0f32; hidden * seq];
-    let mut w2t_scratch = vec![0.0f32; hidden * dim];
-
-    let (stage_ffn_ms, ane_ffn_ms, read_ffn_ms);
-    if kernels.use_decomposed_ffn {
-        let w13_sp = if kernels.use_dual_w13 { dyn_matmul::dual_separate_spatial_width(seq, hidden) } else { dyn_matmul::spatial_width(seq, hidden) };
-        let w2_sp = dyn_matmul::spatial_width(seq, dim);
-        let w13_exe = kernels.ffn_w13_fwd.as_ref().unwrap();
-        let w2_exe = kernels.ffn_w2_fwd.as_ref().unwrap();
-        let w13_in = kernels.bufs.ffn_w13_in.as_ref().unwrap();
-        let w13_out = kernels.bufs.ffn_w13_out.as_ref().unwrap();
-        let w2_in = kernels.bufs.ffn_w2_in.as_ref().unwrap();
-        let w2_out = kernels.bufs.ffn_w2_out.as_ref().unwrap();
-
-        // Stage: x2norm (W1+W3 weights already pre-staged)
-        let t = Instant::now();
-        {
-            let mut locked = w13_in.as_f32_slice_mut();
-            let buf = &mut *locked;
-            stage_spatial(buf, dim, w13_sp, &x2norm, seq, 0);
-        }
-        stage_ffn_ms = t.elapsed().as_secs_f32() * 1000.0;
-
-        // ANE: W1+W3 dispatch (dual or separate) + CPU SiLU + W2 dispatch
-        let t = Instant::now();
-        if kernels.use_dual_w13 {
-            w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE w13 dual failed");
-            let locked = w13_out.as_f32_slice();
-            read_channels_into(&locked, 2 * hidden, seq, 0, hidden, &mut h1);
-            read_channels_into(&locked, 2 * hidden, seq, hidden, hidden, &mut h3);
-        } else {
-            w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE w13 W1 failed");
-            { let locked = w13_out.as_f32_slice(); h1.copy_from_slice(&locked[..hidden * seq]); }
-            { let mut locked = w13_in.as_f32_slice_mut(); stage_spatial(&mut locked, dim, w13_sp, &weights.w3, hidden, seq); }
-            w13_exe.run_cached_direct(&[w13_in], &[w13_out]).expect("ANE w13 W3 failed");
-            { let locked = w13_out.as_f32_slice(); h3.copy_from_slice(&locked[..hidden * seq]); }
-        }
-        silu::silu_gate(&h1, &h3, &mut gate);
-        vdsp::mtrans(&weights.w2, hidden, &mut w2t_scratch, dim, dim, hidden);
-        {
-            let mut locked = w2_in.as_f32_slice_mut();
-            let buf = &mut *locked;
-            stage_spatial(buf, hidden, w2_sp, &gate, seq, 0);
-            stage_spatial(buf, hidden, w2_sp, &w2t_scratch, dim, seq);
-        }
-        w2_exe.run_cached_direct(&[w2_in], &[w2_out]).expect("ANE ffnW2Fwd failed");
-        ane_ffn_ms = t.elapsed().as_secs_f32() * 1000.0;
-
-        // Read ffn_out + residual
-        let t = Instant::now();
-        {
-            let locked = w2_out.as_f32_slice();
-            x_next.copy_from_slice(&locked[..dim * seq]);
-        }
-        let ffn_tmp: Vec<f32> = x_next.clone();
-        vdsp::vsma(&ffn_tmp, alpha, &x2, &mut x_next);
-        read_ffn_ms = t.elapsed().as_secs_f32() * 1000.0;
-    } else {
-        let ffn_sp = ffn_fused::input_spatial_width(cfg);
-        let ffn_out_ch = ffn_fused::output_channels(cfg);
-        let ffn_in = kernels.bufs.ffn_fused_in.as_ref().unwrap();
-        let ffn_out = kernels.bufs.ffn_fused_out.as_ref().unwrap();
-
-        let t = Instant::now();
-        {
-            let mut locked = ffn_in.as_f32_slice_mut();
-            let buf = &mut *locked;
-            stage_spatial(buf, dim, ffn_sp, &x2norm, seq, 0);
-            stage_spatial(buf, dim, ffn_sp, &x2, seq, seq);
-        }
-        stage_ffn_ms = t.elapsed().as_secs_f32() * 1000.0;
-
-        let t = Instant::now();
-        kernels.ffn_fused.as_ref().unwrap().run_cached_direct(&[ffn_in], &[ffn_out]).expect("ANE eval failed");
-        ane_ffn_ms = t.elapsed().as_secs_f32() * 1000.0;
-
-        let t = Instant::now();
-        {
-            let locked = ffn_out.as_f32_slice();
-            read_channels_into(&locked, ffn_out_ch, seq, 0, dim, &mut x_next);
-            read_channels_into(&locked, ffn_out_ch, seq, dim, hidden, &mut h1);
-            read_channels_into(&locked, ffn_out_ch, seq, dim + hidden, hidden, &mut h3);
-            read_channels_into(&locked, ffn_out_ch, seq, dim + 2 * hidden, hidden, &mut gate);
-        }
-        read_ffn_ms = t.elapsed().as_secs_f32() * 1000.0;
+    {
+        let locked = kernels.bufs.ffn_fused_out.as_f32_slice();
+        read_channels_into(&locked, ffn_out_ch, seq, 0, dim, &mut x_next);
+        read_channels_into(&locked, ffn_out_ch, seq, dim, hidden, &mut h1);
+        read_channels_into(&locked, ffn_out_ch, seq, dim + hidden, hidden, &mut h3);
+        read_channels_into(&locked, ffn_out_ch, seq, dim + 2 * hidden, hidden, &mut gate);
     }
+    let read_ffn_ms = t.elapsed().as_secs_f32() * 1000.0;
 
     let total_ms = t_total.elapsed().as_secs_f32() * 1000.0;
 
     let cache = ForwardCache {
         x: x.to_vec(), xnorm, rms_inv1, q_rope, k_rope, v, attn_out, o_out,
-        x2, x2norm, rms_inv2, h1, h3, gate, w2t_scratch, w2t_generation: weights.w2_generation,
+        x2, x2norm, rms_inv2, h1, h3, gate,
     };
 
     let timings = ForwardTimings {
@@ -2082,7 +1636,6 @@ pub fn backward_into(
     // ASYNC: ANE ffnBwdW2t || pre-compute w1t, w3t + sigmoid(h1) for steps 3+4
     // Sigmoid chain (vsmul+expf+vsadd+recf) is the expensive part of SiLU backward.
     // Moving it here hides ~0.6ms/layer behind ANE dispatch time.
-    let w13t_sp = dyn_matmul::dual_spatial_width(seq, dim);
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
             kernels.ffn_bwd_w2t.run_cached_direct(&[&kernels.bufs.ffn_bwd_w2t_in], &[&kernels.bufs.ffn_bwd_w2t_out]).expect("ANE eval failed");
@@ -2114,6 +1667,7 @@ pub fn backward_into(
     }
 
     // 4. Stage ffnBwdW13t — fused single-pass (w1t, w3t from step 2 overlap)
+    let w13t_sp = dyn_matmul::dual_spatial_width(seq, dim);
     {
         let mut locked = kernels.bufs.ffn_bwd_w13t_in.as_f32_slice_mut();
         let buf = &mut *locked;

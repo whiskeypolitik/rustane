@@ -51,7 +51,6 @@ pub fn update_weights(
     adam::step(&mut weights.w1, &grads.dw1, &mut opt.m_w1, &mut opt.v_w1, t, adam_cfg);
     adam::step(&mut weights.w3, &grads.dw3, &mut opt.m_w3, &mut opt.v_w3, t, adam_cfg);
     adam::step(&mut weights.w2, &grads.dw2, &mut opt.m_w2, &mut opt.v_w2, t, adam_cfg);
-    weights.w2_generation = weights.w2_generation.wrapping_add(1);
     adam::step(&mut weights.gamma1, &grads.dgamma1, &mut opt.m_gamma1, &mut opt.v_gamma1, t, adam_cfg);
     adam::step(&mut weights.gamma2, &grads.dgamma2, &mut opt.m_gamma2, &mut opt.v_gamma2, t, adam_cfg);
 }

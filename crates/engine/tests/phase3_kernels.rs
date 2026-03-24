@@ -23,35 +23,6 @@ fn compile_and_eval(graph: Graph, input_data: &[f32], input_shape: Shape, output
     locked.to_vec()
 }
 
-fn compile_and_eval_multi(
-    graph: Graph,
-    inputs: &[(&[f32], Shape)],
-    output_shapes: &[Shape],
-) -> Vec<Vec<f32>> {
-    let exe = graph
-        .compile(NSQualityOfService::UserInteractive)
-        .expect("ANE compilation failed");
-
-    let input_tds: Vec<TensorData> = inputs
-        .iter()
-        .map(|(data, shape)| TensorData::with_f32(data, *shape))
-        .collect();
-    let output_tds: Vec<TensorData> = output_shapes
-        .iter()
-        .map(|shape| TensorData::new(*shape))
-        .collect();
-    let input_refs: Vec<&TensorData> = input_tds.iter().collect();
-    let output_refs: Vec<&TensorData> = output_tds.iter().collect();
-
-    exe.run_cached_direct(&input_refs, &output_refs)
-        .expect("ANE eval failed");
-
-    output_tds
-        .iter()
-        .map(|td| td.as_f32_slice().to_vec())
-        .collect()
-}
-
 #[test]
 fn wo_fwd_compiles_and_runs() {
     let cfg = ModelConfig::gpt_karpathy();
@@ -122,65 +93,21 @@ fn sdpa_fwd_compiles_and_runs() {
     let cfg = ModelConfig::gpt_karpathy();
     let graph = sdpa_fwd::build(&cfg);
 
-    let xnorm_shape = sdpa_fwd::xnorm_shape(&cfg);
-    let wq_shape = sdpa_fwd::wq_shape(&cfg);
-    let wk_shape = sdpa_fwd::wk_shape(&cfg);
-    let wv_shape = sdpa_fwd::wv_shape(&cfg);
-    let attn_shape = sdpa_fwd::attn_out_shape(&cfg);
-    let q_shape = sdpa_fwd::q_rope_shape(&cfg);
-    let k_shape = sdpa_fwd::k_rope_shape(&cfg);
-    let v_shape = sdpa_fwd::v_shape(&cfg);
+    let sp_in = sdpa_fwd::input_spatial_width(&cfg);
+    let out_ch = sdpa_fwd::output_channels(&cfg);
+    let input_shape = Shape { batch: 1, channels: cfg.dim, height: 1, width: sp_in };
+    let output_shape = Shape { batch: 1, channels: out_ch, height: 1, width: cfg.seq };
 
-    let xnorm_data: Vec<f32> = (0..xnorm_shape.total_elements())
+    // Small random-ish values
+    let input_data: Vec<f32> = (0..input_shape.total_elements())
         .map(|i| ((i % 200) as f32 - 100.0) * 0.001)
         .collect();
-    let wq_data: Vec<f32> = (0..wq_shape.total_elements())
-        .map(|i| ((i % 128) as f32 - 64.0) * 0.0005)
-        .collect();
-    let wk_data: Vec<f32> = (0..wk_shape.total_elements())
-        .map(|i| ((i % 127) as f32 - 63.0) * 0.0005)
-        .collect();
-    let wv_data: Vec<f32> = (0..wv_shape.total_elements())
-        .map(|i| ((i % 129) as f32 - 64.0) * 0.0005)
-        .collect();
 
-    let outputs = compile_and_eval_multi(
-        graph,
-        &[
-            (&xnorm_data, xnorm_shape),
-            (&wq_data, wq_shape),
-            (&wk_data, wk_shape),
-            (&wv_data, wv_shape),
-        ],
-        &[attn_shape, q_shape, k_shape, v_shape],
-    );
-    assert_eq!(outputs.len(), 4);
-    assert_eq!(outputs[0].len(), attn_shape.total_elements());
-    assert_eq!(outputs[1].len(), q_shape.total_elements());
-    assert_eq!(outputs[2].len(), k_shape.total_elements());
-    assert_eq!(outputs[3].len(), v_shape.total_elements());
-
-    let attn_sum: f32 = outputs[0].iter().map(|x| x.abs()).sum();
-    assert!(attn_sum > 0.0, "attn_out should not be all zeros");
-
-    let qk_max_diff = outputs[1]
-        .iter()
-        .zip(outputs[2].iter())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-    let qv_max_diff = outputs[1]
-        .iter()
-        .zip(outputs[3].iter())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-    assert!(
-        qk_max_diff > 0.0 || qv_max_diff > 0.0,
-        "sdpa outputs appear cross-wired or identical"
-    );
-
-    println!(
-        "sdpaFwd: compiled ✓, ran ✓, attn_out sum={attn_sum:.2}, qk_max_diff={qk_max_diff:.6}, qv_max_diff={qv_max_diff:.6}"
-    );
+    let output = compile_and_eval(graph, &input_data, input_shape, output_shape);
+    assert_eq!(output.len(), output_shape.total_elements());
+    let sum: f32 = output.iter().map(|x| x.abs()).sum();
+    assert!(sum > 0.0, "sdpa output should not be all zeros");
+    println!("sdpaFwd: compiled ✓, ran ✓, out_ch={out_ch}, output sum={sum:.2}");
 }
 
 #[test]
@@ -264,14 +191,10 @@ fn all_forward_kernels_1000_iters() {
     let wo_in = TensorData::new(Shape { batch: 1, channels: cfg.q_dim, height: 1, width: wo_sp });
     let wo_out = TensorData::new(Shape { batch: 1, channels: cfg.dim, height: 1, width: cfg.seq });
 
-    let sdpa_xnorm_in = TensorData::new(sdpa_fwd::xnorm_shape(&cfg));
-    let sdpa_wq_in = TensorData::new(sdpa_fwd::wq_shape(&cfg));
-    let sdpa_wk_in = TensorData::new(sdpa_fwd::wk_shape(&cfg));
-    let sdpa_wv_in = TensorData::new(sdpa_fwd::wv_shape(&cfg));
-    let sdpa_attn_out = TensorData::new(sdpa_fwd::attn_out_shape(&cfg));
-    let sdpa_q_out = TensorData::new(sdpa_fwd::q_rope_shape(&cfg));
-    let sdpa_k_out = TensorData::new(sdpa_fwd::k_rope_shape(&cfg));
-    let sdpa_v_out = TensorData::new(sdpa_fwd::v_shape(&cfg));
+    let sdpa_sp = sdpa_fwd::input_spatial_width(&cfg);
+    let sdpa_out_ch = sdpa_fwd::output_channels(&cfg);
+    let sdpa_in = TensorData::new(Shape { batch: 1, channels: cfg.dim, height: 1, width: sdpa_sp });
+    let sdpa_out = TensorData::new(Shape { batch: 1, channels: sdpa_out_ch, height: 1, width: cfg.seq });
 
     let ffn_sp = ffn_fused::input_spatial_width(&cfg);
     let ffn_out_ch = ffn_fused::output_channels(&cfg);
@@ -281,12 +204,7 @@ fn all_forward_kernels_1000_iters() {
     // Run 1000 iterations
     for i in 0..1000 {
         wo_exe.run(&[&wo_in], &[&wo_out]).unwrap();
-        sdpa_exe
-            .run(
-                &[&sdpa_xnorm_in, &sdpa_wq_in, &sdpa_wk_in, &sdpa_wv_in],
-                &[&sdpa_attn_out, &sdpa_q_out, &sdpa_k_out, &sdpa_v_out],
-            )
-            .unwrap();
+        sdpa_exe.run(&[&sdpa_in], &[&sdpa_out]).unwrap();
         ffn_exe.run(&[&ffn_in], &[&ffn_out]).unwrap();
 
         if i == 0 || i == 999 {
