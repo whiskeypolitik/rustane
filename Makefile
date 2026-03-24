@@ -76,14 +76,14 @@ forward-ceiling: ## Push forward pass to 25B/30B (~10 min, needs 130GB)
 
 forward-7b: ## Single forward pass at 7B (~30s, needs 31GB)
 	@if [ "$(STREAMS)" = "1" ]; then \
-		USE_LEAN_WORKSPACE=$(USE_LEAN_WORKSPACE) cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_7b; \
+		USE_LEAN_WORKSPACE=$(USE_LEAN_WORKSPACE) cargo test -p engine --test theory_runner_supervisor --release -- --ignored --nocapture theory_forward_7b_isolated; \
 	else \
 		STREAMS=$(STREAMS) cargo test -p engine --test bench_forward_multistream --release -- --ignored --nocapture forward_7b_multistream; \
 	fi
 
 forward-10b: ## Single forward pass at 10B (~45s, needs 46GB)
 	@if [ "$(STREAMS)" = "1" ]; then \
-		USE_LEAN_WORKSPACE=$(USE_LEAN_WORKSPACE) cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_10b; \
+		USE_LEAN_WORKSPACE=$(USE_LEAN_WORKSPACE) cargo test -p engine --test theory_runner_supervisor --release -- --ignored --nocapture theory_forward_10b_isolated; \
 	else \
 		STREAMS=$(STREAMS) cargo test -p engine --test bench_forward_multistream --release -- --ignored --nocapture forward_10b_multistream; \
 	fi
