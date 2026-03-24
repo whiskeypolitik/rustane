@@ -235,7 +235,18 @@ fn load_checkpoint(path: &std::path::Path, cfg: &ModelConfig) -> (u32, ModelWeig
         let w2 = read_f32_vec(&raw, &mut offset, cfg.dim * cfg.hidden);
         let gamma1 = read_f32_vec(&raw, &mut offset, cfg.dim);
         let gamma2 = read_f32_vec(&raw, &mut offset, cfg.dim);
-        layers.push(engine::layer::LayerWeights { wq, wk, wv, wo, w1, w3, w2, gamma1, gamma2 });
+        layers.push(engine::layer::LayerWeights {
+            wq,
+            wk,
+            wv,
+            wo,
+            w1,
+            w3,
+            w2,
+            gamma1,
+            gamma2,
+            w2_generation: 0,
+        });
     }
     println!("  loaded checkpoint: {} (step {}, {:.1} MB)", path.display(), step, raw.len() as f64 / 1e6);
     (step, full_model::ModelWeights { embed, gamma_final, layers })
@@ -440,5 +451,4 @@ fn main() {
         println!("  best val_bpb: {best_bpb:.4}");
     }
 }
-
 

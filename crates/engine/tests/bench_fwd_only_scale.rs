@@ -12,9 +12,13 @@ use engine::model::ModelConfig;
 use engine::bench_result;
 use std::time::Instant;
 
-/// If true, use lean workspace (2 cache slots) to save ~462MB/layer at dim=5120.
-/// Critical for 50B+ models on 512GB RAM.
-const USE_LEAN_WORKSPACE: bool = true;
+fn use_lean_workspace() -> bool {
+    std::env::var("USE_LEAN_WORKSPACE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v != 0)
+        .unwrap_or(true)
+}
 
 /// Build a custom ModelConfig (all MHA, hd=128, vocab=8192).
 fn custom_config(dim: usize, hidden: usize, heads: usize, nlayers: usize, seq: usize) -> ModelConfig {
@@ -46,11 +50,12 @@ struct FwdResult {
 /// Compile kernels, allocate weights, run 3 forward passes, report median timing.
 fn run_fwd_probe(cfg: &ModelConfig, name: &str) -> FwdResult {
     let params_b = cfg.param_count() as f64 / 1e9;
+    let use_lean = use_lean_workspace();
     // Estimate: weights (4B/param) + workspace.
     // Lean mode: 2 cache slots instead of nlayers (saves ~462MB/layer at dim=5120).
     let per_layer_cache_mb = (cfg.dim * cfg.seq * 4 * 5 + cfg.hidden * cfg.seq * 4 * 3
         + cfg.heads * cfg.seq * cfg.seq * 4) as f64 / 1e6;
-    let cache_layers = if USE_LEAN_WORKSPACE { 2 } else { cfg.nlayers };
+    let cache_layers = if use_lean { 2 } else { cfg.nlayers };
     let mem_est_gb = params_b * 4.0 + cache_layers as f64 * per_layer_cache_mb / 1000.0 + 0.5;
 
     println!("\n{}", "=".repeat(70));
@@ -61,7 +66,11 @@ fn run_fwd_probe(cfg: &ModelConfig, name: &str) -> FwdResult {
     // 1. Compile
     print!("  [1/3] Compiling ANE kernels... ");
     let t0 = Instant::now();
-    let kernels = CompiledKernels::compile(cfg);
+    let kernels = if use_lean {
+        CompiledKernels::compile_forward_only(cfg)
+    } else {
+        CompiledKernels::compile(cfg)
+    };
     let compile_s = t0.elapsed().as_secs_f32();
     println!("{compile_s:.1}s");
 
@@ -69,20 +78,20 @@ fn run_fwd_probe(cfg: &ModelConfig, name: &str) -> FwdResult {
     print!("  [2/3] Allocating {:.1}GB... ", mem_est_gb);
     let t0 = Instant::now();
     let weights = ModelWeights::random(cfg);
-    let mut fwd_ws = if USE_LEAN_WORKSPACE {
+    let mut fwd_ws = if use_lean {
         ModelForwardWorkspace::new_lean(cfg)
     } else {
         ModelForwardWorkspace::new(cfg)
     };
     let alloc_s = t0.elapsed().as_secs_f32();
-    println!("{alloc_s:.1}s (lean={})", USE_LEAN_WORKSPACE);
+    println!("{alloc_s:.1}s (lean={use_lean})");
 
     let tc = TrainConfig::default();
     let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
     let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
 
     // 3. Forward passes (1 warmup + 3 timed)
-    let fwd_fn = if USE_LEAN_WORKSPACE { full_model::forward_only_ws } else { full_model::forward_ws };
+    let fwd_fn = if use_lean { full_model::forward_only_ws } else { full_model::forward_ws };
     print!("  [3/3] Forward pass (1 warmup + 3 timed)... ");
     let _warmup_loss = fwd_fn(cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
 

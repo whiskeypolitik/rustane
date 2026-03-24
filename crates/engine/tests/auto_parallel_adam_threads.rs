@@ -55,6 +55,7 @@ fn random_model_weights(cfg: &ModelConfig, seed: u64) -> ModelWeights {
             w2: make_data(cfg.hidden * cfg.dim, next_seed(&mut s), 0.01),
             gamma1: vec![1.0; cfg.dim],
             gamma2: vec![1.0; cfg.dim],
+            w2_generation: 0,
         }).collect(),
         gamma_final: vec![1.0; cfg.dim],
     }
@@ -87,6 +88,7 @@ fn clone_weights(w: &ModelWeights) -> ModelWeights {
             wq: l.wq.clone(), wk: l.wk.clone(), wv: l.wv.clone(), wo: l.wo.clone(),
             w1: l.w1.clone(), w3: l.w3.clone(), w2: l.w2.clone(),
             gamma1: l.gamma1.clone(), gamma2: l.gamma2.clone(),
+            w2_generation: l.w2_generation,
         }).collect(),
         gamma_final: w.gamma_final.clone(),
     }
@@ -138,6 +140,7 @@ fn sequential_adam(
         adam::step_fused(&mut w.w1, &g.dw1, &mut o.m_w1, &mut o.v_w1, t, matrix_lr, b1, b2, eps, wd, grad_scale);
         adam::step_fused(&mut w.w3, &g.dw3, &mut o.m_w3, &mut o.v_w3, t, matrix_lr, b1, b2, eps, wd, grad_scale);
         adam::step_fused(&mut w.w2, &g.dw2, &mut o.m_w2, &mut o.v_w2, t, matrix_lr, b1, b2, eps, wd, grad_scale);
+        w.w2_generation = w.w2_generation.wrapping_add(1);
         adam::step_fused(&mut w.gamma1, &g.dgamma1, &mut o.m_gamma1, &mut o.v_gamma1, t, lr, b1, b2, eps, 0.0, grad_scale);
         adam::step_fused(&mut w.gamma2, &g.dgamma2, &mut o.m_gamma2, &mut o.v_gamma2, t, lr, b1, b2, eps, 0.0, grad_scale);
     }

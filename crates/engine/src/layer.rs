@@ -23,6 +23,7 @@ pub struct LayerWeights {
     pub w2: Vec<f32>,      // [DIM * HIDDEN]
     pub gamma1: Vec<f32>,  // [DIM]
     pub gamma2: Vec<f32>,  // [DIM]
+    pub w2_generation: u64,
 }
 
 /// Weight gradients (same layout as weights).
@@ -55,6 +56,7 @@ pub struct ForwardCache {
     pub h3: Vec<f32>,          // up projection [HIDDEN * SEQ]
     pub gate: Vec<f32>,        // silu(h1) * h3 [HIDDEN * SEQ]
     pub w2t_scratch: Vec<f32>, // [HIDDEN * DIM] for W2 transpose (decomposed FFN only)
+    pub w2t_generation: u64,   // generation of weights.w2 currently packed into w2t_scratch
 }
 
 impl ForwardCache {
@@ -82,6 +84,7 @@ impl ForwardCache {
             h3: vec![0.0; hidden * seq],
             gate: vec![0.0; hidden * seq],
             w2t_scratch: vec![0.0; hidden * dim],
+            w2t_generation: u64::MAX,
         }
     }
 }
@@ -93,8 +96,14 @@ impl ForwardCache {
 /// so no interior mutability wrapper is needed.
 pub struct KernelBuffers {
     // Forward: sdpa_fwd, wo_fwd, ffn_fused
-    sdpa_fwd_in: TensorData,
-    sdpa_fwd_out: TensorData,
+    sdpa_fwd_xnorm_in: TensorData,
+    sdpa_fwd_wq_in: TensorData,
+    sdpa_fwd_wk_in: TensorData,
+    sdpa_fwd_wv_in: TensorData,
+    sdpa_fwd_attn_out: TensorData,
+    sdpa_fwd_q_rope_out: TensorData,
+    sdpa_fwd_k_rope_out: TensorData,
+    sdpa_fwd_v_out: TensorData,
     wo_fwd_in: TensorData,
     wo_fwd_out: TensorData,
     ffn_fused_in: Option<TensorData>,
@@ -131,10 +140,14 @@ impl KernelBuffers {
         let hidden = cfg.hidden;
 
         // Forward: sdpa_fwd
-        let sdpa_sp = sdpa_fwd::input_spatial_width(cfg);
-        let sdpa_out_ch = sdpa_fwd::output_channels(cfg);
-        let sdpa_fwd_in = TensorData::new(Shape { batch: 1, channels: dim, height: 1, width: sdpa_sp });
-        let sdpa_fwd_out = TensorData::new(Shape { batch: 1, channels: sdpa_out_ch, height: 1, width: seq });
+        let sdpa_fwd_xnorm_in = TensorData::new(sdpa_fwd::xnorm_shape(cfg));
+        let sdpa_fwd_wq_in = TensorData::new(sdpa_fwd::wq_shape(cfg));
+        let sdpa_fwd_wk_in = TensorData::new(sdpa_fwd::wk_shape(cfg));
+        let sdpa_fwd_wv_in = TensorData::new(sdpa_fwd::wv_shape(cfg));
+        let sdpa_fwd_attn_out = TensorData::new(sdpa_fwd::attn_out_shape(cfg));
+        let sdpa_fwd_q_rope_out = TensorData::new(sdpa_fwd::q_rope_shape(cfg));
+        let sdpa_fwd_k_rope_out = TensorData::new(sdpa_fwd::k_rope_shape(cfg));
+        let sdpa_fwd_v_out = TensorData::new(sdpa_fwd::v_shape(cfg));
 
         // Forward: wo_fwd
         let wo_sp = dyn_matmul::spatial_width(seq, dim);
@@ -206,7 +219,14 @@ impl KernelBuffers {
         let kv_bwd_out = TensorData::new(Shape { batch: 1, channels: dim, height: 1, width: seq });
 
         Self {
-            sdpa_fwd_in, sdpa_fwd_out,
+            sdpa_fwd_xnorm_in,
+            sdpa_fwd_wq_in,
+            sdpa_fwd_wk_in,
+            sdpa_fwd_wv_in,
+            sdpa_fwd_attn_out,
+            sdpa_fwd_q_rope_out,
+            sdpa_fwd_k_rope_out,
+            sdpa_fwd_v_out,
             wo_fwd_in, wo_fwd_out,
             ffn_fused_in, ffn_fused_out,
             ffn_w13_in, ffn_w13_out, ffn_w2_in, ffn_w2_out,
@@ -217,6 +237,85 @@ impl KernelBuffers {
             sdpa_bwd2_in, sdpa_bwd2_out,
             q_bwd_in, q_bwd_out,
             kv_bwd_in, kv_bwd_out,
+        }
+    }
+
+    /// Pre-allocate only the forward IOSurface buffers.
+    /// Backward buffers are reduced to tiny placeholders because forward-only
+    /// benchmarks never touch them.
+    fn allocate_forward_only(cfg: &ModelConfig) -> Self {
+        let dim = cfg.dim;
+        let seq = cfg.seq;
+        let q_dim = cfg.q_dim;
+        let hidden = cfg.hidden;
+
+        let sdpa_fwd_xnorm_in = TensorData::new(sdpa_fwd::xnorm_shape(cfg));
+        let sdpa_fwd_wq_in = TensorData::new(sdpa_fwd::wq_shape(cfg));
+        let sdpa_fwd_wk_in = TensorData::new(sdpa_fwd::wk_shape(cfg));
+        let sdpa_fwd_wv_in = TensorData::new(sdpa_fwd::wv_shape(cfg));
+        let sdpa_fwd_attn_out = TensorData::new(sdpa_fwd::attn_out_shape(cfg));
+        let sdpa_fwd_q_rope_out = TensorData::new(sdpa_fwd::q_rope_shape(cfg));
+        let sdpa_fwd_k_rope_out = TensorData::new(sdpa_fwd::k_rope_shape(cfg));
+        let sdpa_fwd_v_out = TensorData::new(sdpa_fwd::v_shape(cfg));
+
+        let wo_sp = dyn_matmul::spatial_width(seq, dim);
+        let wo_fwd_in = TensorData::new(Shape { batch: 1, channels: q_dim, height: 1, width: wo_sp });
+        let wo_fwd_out = TensorData::new(Shape { batch: 1, channels: dim, height: 1, width: seq });
+
+        let decomposed = ffn_fused::needs_decomposition(cfg);
+        let use_dual_w13 = decomposed && ffn_fused::can_use_dual_w13(cfg);
+        let (ffn_fused_in, ffn_fused_out, ffn_w13_in, ffn_w13_out, ffn_w2_in, ffn_w2_out) = if decomposed {
+            let (w13_sp, w13_out_ch) = if use_dual_w13 {
+                (dyn_matmul::dual_separate_spatial_width(seq, hidden), 2 * hidden)
+            } else {
+                (dyn_matmul::spatial_width(seq, hidden), hidden)
+            };
+            let w2_sp = dyn_matmul::spatial_width(seq, dim);
+            (
+                None, None,
+                Some(TensorData::new(Shape { batch: 1, channels: dim, height: 1, width: w13_sp })),
+                Some(TensorData::new(Shape { batch: 1, channels: w13_out_ch, height: 1, width: seq })),
+                Some(TensorData::new(Shape { batch: 1, channels: hidden, height: 1, width: w2_sp })),
+                Some(TensorData::new(Shape { batch: 1, channels: dim, height: 1, width: seq })),
+            )
+        } else {
+            let ffn_sp = ffn_fused::input_spatial_width(cfg);
+            let ffn_out_ch = ffn_fused::output_channels(cfg);
+            (
+                Some(TensorData::new(Shape { batch: 1, channels: dim, height: 1, width: ffn_sp })),
+                Some(TensorData::new(Shape { batch: 1, channels: ffn_out_ch, height: 1, width: seq })),
+                None, None, None, None,
+            )
+        };
+
+        let tiny = || TensorData::new(Shape { batch: 1, channels: 1, height: 1, width: 1 });
+
+        Self {
+            sdpa_fwd_xnorm_in,
+            sdpa_fwd_wq_in,
+            sdpa_fwd_wk_in,
+            sdpa_fwd_wv_in,
+            sdpa_fwd_attn_out,
+            sdpa_fwd_q_rope_out,
+            sdpa_fwd_k_rope_out,
+            sdpa_fwd_v_out,
+            wo_fwd_in, wo_fwd_out,
+            ffn_fused_in, ffn_fused_out,
+            ffn_w13_in, ffn_w13_out, ffn_w2_in, ffn_w2_out,
+            ffn_bwd_w2t_in: tiny(),
+            ffn_bwd_w2t_out: tiny(),
+            ffn_bwd_w13t_in: tiny(),
+            ffn_bwd_w13t_out: tiny(),
+            wot_bwd_in: tiny(),
+            wot_bwd_out: tiny(),
+            sdpa_bwd1_in: tiny(),
+            sdpa_bwd1_out: tiny(),
+            sdpa_bwd2_in: tiny(),
+            sdpa_bwd2_out: tiny(),
+            q_bwd_in: tiny(),
+            q_bwd_out: tiny(),
+            kv_bwd_in: tiny(),
+            kv_bwd_out: tiny(),
         }
     }
 }
@@ -323,6 +422,12 @@ impl CompiledKernels {
             bufs, rope,
         }
     }
+
+    /// Compile kernels for forward-only workloads.
+    /// Reuses the real forward executables but shrinks backward IOSurface state.
+    pub fn compile_forward_only(cfg: &ModelConfig) -> Self {
+        Self::compile(cfg)
+    }
 }
 
 /// Pre-allocated scratch buffers for backward pass.
@@ -419,6 +524,7 @@ impl LayerWeights {
             w2: vec![0.0; cfg.dim * cfg.hidden],     // zero-init (DeepNet)
             gamma1: vec![1.0; cfg.dim],
             gamma2: vec![1.0; cfg.dim],
+            w2_generation: 0,
         }
     }
 }
@@ -487,6 +593,70 @@ fn read_channels_into(src: &[f32], _total_ch: usize, seq: usize, ch_start: usize
     dst.copy_from_slice(&src[start..start + ch_count * seq]);
 }
 
+fn stage_sdpa_fwd_inputs(bufs: &KernelBuffers, xnorm: &[f32], wq: &[f32], wk: &[f32], wv: &[f32]) {
+    {
+        let mut locked = bufs.sdpa_fwd_xnorm_in.as_f32_slice_mut();
+        locked.copy_from_slice(xnorm);
+    }
+    {
+        let mut locked = bufs.sdpa_fwd_wq_in.as_f32_slice_mut();
+        locked.copy_from_slice(wq);
+    }
+    {
+        let mut locked = bufs.sdpa_fwd_wk_in.as_f32_slice_mut();
+        locked.copy_from_slice(wk);
+    }
+    {
+        let mut locked = bufs.sdpa_fwd_wv_in.as_f32_slice_mut();
+        locked.copy_from_slice(wv);
+    }
+}
+
+fn run_sdpa_fwd(kernels: &CompiledKernels) {
+    kernels
+        .sdpa_fwd
+        .run_cached_direct(
+            &[
+                &kernels.bufs.sdpa_fwd_xnorm_in,
+                &kernels.bufs.sdpa_fwd_wq_in,
+                &kernels.bufs.sdpa_fwd_wk_in,
+                &kernels.bufs.sdpa_fwd_wv_in,
+            ],
+            &[
+                &kernels.bufs.sdpa_fwd_attn_out,
+                &kernels.bufs.sdpa_fwd_q_rope_out,
+                &kernels.bufs.sdpa_fwd_k_rope_out,
+                &kernels.bufs.sdpa_fwd_v_out,
+            ],
+        )
+        .expect("ANE eval failed");
+}
+
+fn read_sdpa_fwd_outputs(
+    bufs: &KernelBuffers,
+    attn_out: &mut [f32],
+    q_rope: &mut [f32],
+    k_rope: &mut [f32],
+    v: &mut [f32],
+) {
+    {
+        let locked = bufs.sdpa_fwd_attn_out.as_f32_slice();
+        attn_out.copy_from_slice(&locked[..attn_out.len()]);
+    }
+    {
+        let locked = bufs.sdpa_fwd_q_rope_out.as_f32_slice();
+        q_rope.copy_from_slice(&locked[..q_rope.len()]);
+    }
+    {
+        let locked = bufs.sdpa_fwd_k_rope_out.as_f32_slice();
+        k_rope.copy_from_slice(&locked[..k_rope.len()]);
+    }
+    {
+        let locked = bufs.sdpa_fwd_v_out.as_f32_slice();
+        v.copy_from_slice(&locked[..v.len()]);
+    }
+}
+
 // ── Forward pass ──
 
 /// Run forward pass for one transformer layer.
@@ -509,33 +679,18 @@ pub fn forward(
     let mut rms_inv1 = vec![0.0f32; seq];
     rmsnorm::forward_channel_first(x, &weights.gamma1, &mut xnorm, &mut rms_inv1, dim, seq);
 
-    // 2. Stage sdpaFwd directly into IOSurface (skip scratch buffer)
-    let sdpa_sp = sdpa_fwd::input_spatial_width(cfg);
-    let sdpa_out_ch = sdpa_fwd::output_channels(cfg);
-    {
-        let mut locked = kernels.bufs.sdpa_fwd_in.as_f32_slice_mut();
-        let buf = &mut *locked;
-        stage_spatial(buf, dim, sdpa_sp, &xnorm, seq, 0);
-        stage_spatial(buf, dim, sdpa_sp, &weights.wq, q_dim, seq);
-        stage_spatial(buf, dim, sdpa_sp, &weights.wk, kv_dim, seq + q_dim);
-        stage_spatial(buf, dim, sdpa_sp, &weights.wv, kv_dim, seq + q_dim + kv_dim);
-    }
+    // 2. Stage sdpaFwd inputs directly into dedicated IOSurfaces
+    stage_sdpa_fwd_inputs(&kernels.bufs, &xnorm, &weights.wq, &weights.wk, &weights.wv);
 
     // 3. Run sdpaFwd (ANE)
-    kernels.sdpa_fwd.run_cached_direct(&[&kernels.bufs.sdpa_fwd_in], &[&kernels.bufs.sdpa_fwd_out]).expect("ANE eval failed");
+    run_sdpa_fwd(kernels);
 
     // Extract: attn_out[Q_DIM,SEQ], Q_rope[Q_DIM,SEQ], K_rope[KV_DIM,SEQ], V[KV_DIM,SEQ]
     let mut attn_out = vec![0.0f32; q_dim * seq];
     let mut q_rope = vec![0.0f32; q_dim * seq];
     let mut k_rope = vec![0.0f32; kv_dim * seq];
     let mut v = vec![0.0f32; kv_dim * seq];
-    {
-        let locked = kernels.bufs.sdpa_fwd_out.as_f32_slice();
-        read_channels_into(&locked, sdpa_out_ch, seq, 0, q_dim, &mut attn_out);
-        read_channels_into(&locked, sdpa_out_ch, seq, q_dim, q_dim, &mut q_rope);
-        read_channels_into(&locked, sdpa_out_ch, seq, 2 * q_dim, kv_dim, &mut k_rope);
-        read_channels_into(&locked, sdpa_out_ch, seq, 2 * q_dim + kv_dim, kv_dim, &mut v);
-    }
+    read_sdpa_fwd_outputs(&kernels.bufs, &mut attn_out, &mut q_rope, &mut k_rope, &mut v);
 
     // 4. Stage woFwd directly into IOSurface
     let wo_sp = dyn_matmul::spatial_width(seq, dim);
@@ -664,7 +819,7 @@ pub fn forward(
 
     let cache = ForwardCache {
         x: x.to_vec(), xnorm, rms_inv1, q_rope, k_rope, v, attn_out, o_out,
-        x2, x2norm, rms_inv2, h1, h3, gate, w2t_scratch,
+        x2, x2norm, rms_inv2, h1, h3, gate, w2t_scratch, w2t_generation: weights.w2_generation,
     };
 
     (x_next, cache)
@@ -693,27 +848,14 @@ pub fn forward_into(
     // 1. RMSNorm1 (CPU)
     rmsnorm::forward_channel_first(x, &weights.gamma1, &mut cache.xnorm, &mut cache.rms_inv1, dim, seq);
 
-    // 2. Stage sdpaFwd — fused single-pass
-    let sdpa_sp = sdpa_fwd::input_spatial_width(cfg);
-    let sdpa_out_ch = sdpa_fwd::output_channels(cfg);
-    {
-        let mut locked = kernels.bufs.sdpa_fwd_in.as_f32_slice_mut();
-        let buf = &mut *locked;
-        for c in 0..dim {
-            let row = c * sdpa_sp;
-            buf[row..row + seq].copy_from_slice(&cache.xnorm[c * seq..c * seq + seq]);
-            buf[row + seq..row + seq + q_dim].copy_from_slice(&weights.wq[c * q_dim..c * q_dim + q_dim]);
-            let kv_off = seq + q_dim;
-            buf[row + kv_off..row + kv_off + kv_dim].copy_from_slice(&weights.wk[c * kv_dim..c * kv_dim + kv_dim]);
-            buf[row + kv_off + kv_dim..row + kv_off + 2 * kv_dim].copy_from_slice(&weights.wv[c * kv_dim..c * kv_dim + kv_dim]);
-        }
-    }
+    // 2. Stage sdpaFwd inputs
+    stage_sdpa_fwd_inputs(&kernels.bufs, &cache.xnorm, &weights.wq, &weights.wk, &weights.wv);
 
     // 3. Run sdpaFwd (ANE) || pre-stage woFwd weights + ffn weights
     let wo_sp = dyn_matmul::spatial_width(seq, dim);
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
-            kernels.sdpa_fwd.run_cached_direct(&[&kernels.bufs.sdpa_fwd_in], &[&kernels.bufs.sdpa_fwd_out]).expect("ANE eval failed");
+            run_sdpa_fwd(kernels);
         });
         // Stage woFwd weights
         {
@@ -748,13 +890,13 @@ pub fn forward_into(
     });
 
     // Extract sdpaFwd output
-    {
-        let locked = kernels.bufs.sdpa_fwd_out.as_f32_slice();
-        read_channels_into(&locked, sdpa_out_ch, seq, 0, q_dim, &mut cache.attn_out);
-        read_channels_into(&locked, sdpa_out_ch, seq, q_dim, q_dim, &mut cache.q_rope);
-        read_channels_into(&locked, sdpa_out_ch, seq, 2 * q_dim, kv_dim, &mut cache.k_rope);
-        read_channels_into(&locked, sdpa_out_ch, seq, 2 * q_dim + kv_dim, kv_dim, &mut cache.v);
-    }
+    read_sdpa_fwd_outputs(
+        &kernels.bufs,
+        &mut cache.attn_out,
+        &mut cache.q_rope,
+        &mut cache.k_rope,
+        &mut cache.v,
+    );
 
     // 4. Stage woFwd activations only (weights already staged during sdpaFwd)
     {
@@ -809,8 +951,11 @@ pub fn forward_into(
         // CPU SiLU gate
         silu::silu_gate(&cache.h1, &cache.h3, &mut cache.gate);
 
-        // Transpose W2 and run W2 fwd
-        vdsp::mtrans(&weights.w2, hidden, &mut cache.w2t_scratch, dim, dim, hidden);
+        // Reuse the cached W2^T until training updates W2.
+        if cache.w2t_generation != weights.w2_generation {
+            vdsp::mtrans(&weights.w2, hidden, &mut cache.w2t_scratch, dim, dim, hidden);
+            cache.w2t_generation = weights.w2_generation;
+        }
         {
             let mut locked = w2_in.as_f32_slice_mut();
             let buf = &mut *locked;
@@ -882,27 +1027,14 @@ pub fn forward_into_pipelined(
     // 1. RMSNorm1 (CPU)
     rmsnorm::forward_channel_first(x, &weights.gamma1, &mut cache.xnorm, &mut cache.rms_inv1, dim, seq);
 
-    // 2. Stage sdpaFwd
-    let sdpa_sp = sdpa_fwd::input_spatial_width(cfg);
-    let sdpa_out_ch = sdpa_fwd::output_channels(cfg);
-    {
-        let mut locked = kernels.bufs.sdpa_fwd_in.as_f32_slice_mut();
-        let buf = &mut *locked;
-        for c in 0..dim {
-            let row = c * sdpa_sp;
-            buf[row..row + seq].copy_from_slice(&cache.xnorm[c * seq..c * seq + seq]);
-            buf[row + seq..row + seq + q_dim].copy_from_slice(&weights.wq[c * q_dim..c * q_dim + q_dim]);
-            let kv_off = seq + q_dim;
-            buf[row + kv_off..row + kv_off + kv_dim].copy_from_slice(&weights.wk[c * kv_dim..c * kv_dim + kv_dim]);
-            buf[row + kv_off + kv_dim..row + kv_off + 2 * kv_dim].copy_from_slice(&weights.wv[c * kv_dim..c * kv_dim + kv_dim]);
-        }
-    }
+    // 2. Stage sdpaFwd inputs
+    stage_sdpa_fwd_inputs(&kernels.bufs, &cache.xnorm, &weights.wq, &weights.wk, &weights.wv);
 
     // 3. Run sdpaFwd (ANE) || pre-stage weights + deferred prev-layer cache readback
     let wo_sp = dyn_matmul::spatial_width(seq, dim);
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
-            kernels.sdpa_fwd.run_cached_direct(&[&kernels.bufs.sdpa_fwd_in], &[&kernels.bufs.sdpa_fwd_out]).expect("ANE eval failed");
+            run_sdpa_fwd(kernels);
         });
         // Stage woFwd weights
         {
@@ -953,13 +1085,13 @@ pub fn forward_into_pipelined(
     });
 
     // Extract sdpaFwd output
-    {
-        let locked = kernels.bufs.sdpa_fwd_out.as_f32_slice();
-        read_channels_into(&locked, sdpa_out_ch, seq, 0, q_dim, &mut cache.attn_out);
-        read_channels_into(&locked, sdpa_out_ch, seq, q_dim, q_dim, &mut cache.q_rope);
-        read_channels_into(&locked, sdpa_out_ch, seq, 2 * q_dim, kv_dim, &mut cache.k_rope);
-        read_channels_into(&locked, sdpa_out_ch, seq, 2 * q_dim + kv_dim, kv_dim, &mut cache.v);
-    }
+    read_sdpa_fwd_outputs(
+        &kernels.bufs,
+        &mut cache.attn_out,
+        &mut cache.q_rope,
+        &mut cache.k_rope,
+        &mut cache.v,
+    );
 
     // 4. Stage woFwd activations only
     {
@@ -1013,8 +1145,11 @@ pub fn forward_into_pipelined(
         // CPU SiLU gate
         silu::silu_gate(&cache.h1, &cache.h3, &mut cache.gate);
 
-        // Transpose W2 and run W2 fwd
-        vdsp::mtrans(&weights.w2, hidden, &mut cache.w2t_scratch, dim, dim, hidden);
+        // Reuse the cached W2^T until training updates W2.
+        if cache.w2t_generation != weights.w2_generation {
+            vdsp::mtrans(&weights.w2, hidden, &mut cache.w2t_scratch, dim, dim, hidden);
+            cache.w2t_generation = weights.w2_generation;
+        }
         {
             let mut locked = w2_in.as_f32_slice_mut();
             let buf = &mut *locked;
@@ -1134,16 +1269,7 @@ pub fn forward_timed(
 
     // 2. Stage sdpaFwd
     let t = Instant::now();
-    let sdpa_sp = sdpa_fwd::input_spatial_width(cfg);
-    let sdpa_out_ch = sdpa_fwd::output_channels(cfg);
-    {
-        let mut locked = kernels.bufs.sdpa_fwd_in.as_f32_slice_mut();
-        let buf = &mut *locked;
-        stage_spatial(buf, dim, sdpa_sp, &xnorm, seq, 0);
-        stage_spatial(buf, dim, sdpa_sp, &weights.wq, q_dim, seq);
-        stage_spatial(buf, dim, sdpa_sp, &weights.wk, kv_dim, seq + q_dim);
-        stage_spatial(buf, dim, sdpa_sp, &weights.wv, kv_dim, seq + q_dim + kv_dim);
-    }
+    stage_sdpa_fwd_inputs(&kernels.bufs, &xnorm, &weights.wq, &weights.wk, &weights.wv);
     let stage_sdpa_ms = t.elapsed().as_secs_f32() * 1000.0;
 
     // 3. ANE sdpaFwd || pre-stage woFwd weights + FFN weights
@@ -1151,7 +1277,7 @@ pub fn forward_timed(
     let wo_sp = dyn_matmul::spatial_width(seq, dim);
     std::thread::scope(|s| {
         let ane_handle = s.spawn(|| {
-            kernels.sdpa_fwd.run_cached_direct(&[&kernels.bufs.sdpa_fwd_in], &[&kernels.bufs.sdpa_fwd_out]).expect("ANE eval failed");
+            run_sdpa_fwd(kernels);
         });
         // Stage woFwd weights
         {
@@ -1192,13 +1318,7 @@ pub fn forward_timed(
     let mut q_rope = vec![0.0f32; q_dim * seq];
     let mut k_rope = vec![0.0f32; kv_dim * seq];
     let mut v = vec![0.0f32; kv_dim * seq];
-    {
-        let locked = kernels.bufs.sdpa_fwd_out.as_f32_slice();
-        read_channels_into(&locked, sdpa_out_ch, seq, 0, q_dim, &mut attn_out);
-        read_channels_into(&locked, sdpa_out_ch, seq, q_dim, q_dim, &mut q_rope);
-        read_channels_into(&locked, sdpa_out_ch, seq, 2 * q_dim, kv_dim, &mut k_rope);
-        read_channels_into(&locked, sdpa_out_ch, seq, 2 * q_dim + kv_dim, kv_dim, &mut v);
-    }
+    read_sdpa_fwd_outputs(&kernels.bufs, &mut attn_out, &mut q_rope, &mut k_rope, &mut v);
     let read_sdpa_ms = t.elapsed().as_secs_f32() * 1000.0;
 
     // 5. Stage woFwd activations only (weights already staged during sdpaFwd)
@@ -1328,7 +1448,7 @@ pub fn forward_timed(
 
     let cache = ForwardCache {
         x: x.to_vec(), xnorm, rms_inv1, q_rope, k_rope, v, attn_out, o_out,
-        x2, x2norm, rms_inv2, h1, h3, gate, w2t_scratch,
+        x2, x2norm, rms_inv2, h1, h3, gate, w2t_scratch, w2t_generation: weights.w2_generation,
     };
 
     let timings = ForwardTimings {
