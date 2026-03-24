@@ -1,0 +1,135 @@
+{
+  "config_name": "50B",
+  "dim": 5120,
+  "hidden": 13824,
+  "heads": 40,
+  "nlayers": 160,
+  "seq": 512,
+  "baseline": {
+    "mode": "baseline",
+    "shard_count": 1,
+    "compile_s": 3.0763414,
+    "warmup_wall_ms": 31299.344,
+    "timed_samples_ms": [
+      29202.959,
+      29213.338,
+      29218.227
+    ],
+    "median_full_forward_ms": 29213.338,
+    "tok_per_s": 17.526241,
+    "peak_rss_mb": 197010.31,
+    "avg_layer_ms": 182.58336,
+    "total_ffn_ms": 28186.127,
+    "total_non_ffn_ms": 1027.2109,
+    "ffn_pct_of_wall": 96.483765,
+    "diff_vs_baseline": {
+      "max_abs_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "cosine_similarity": 1.0,
+      "loss_abs_diff": 0.0
+    },
+    "correctness_pass": true,
+    "full_forward_win_pct_vs_baseline": 0.0,
+    "meets_perf_gate": false,
+    "bucket_note": "FFN/non-FFN totals are derived from a separate reference pass using layer::forward_timed; full wall time comes from full_model::forward_only_ws."
+  },
+  "modes": [
+    {
+      "mode": "shard2",
+      "shard_count": 2,
+      "compile_s": 0.74474597,
+      "warmup_wall_ms": 24281.74,
+      "timed_samples_ms": [
+        21753.727,
+        21753.664,
+        21743.707
+      ],
+      "median_full_forward_ms": 21753.664,
+      "tok_per_s": 23.536264,
+      "peak_rss_mb": 328261.47,
+      "avg_layer_ms": 135.9604,
+      "total_ffn_ms": 12136.244,
+      "total_non_ffn_ms": 9617.42,
+      "ffn_pct_of_wall": 55.78942,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 25.535164,
+      "meets_perf_gate": true,
+      "bucket_note": "FFN totals are accumulated from the custom sharded full-model loop; non-FFN is derived as total-forward minus total-FFN."
+    },
+    {
+      "mode": "shard4",
+      "shard_count": 4,
+      "compile_s": 0.76429105,
+      "warmup_wall_ms": 21686.762,
+      "timed_samples_ms": [
+        18691.848,
+        18759.33,
+        19856.871
+      ],
+      "median_full_forward_ms": 18759.33,
+      "tok_per_s": 27.293085,
+      "peak_rss_mb": 333845.6,
+      "avg_layer_ms": 117.24581,
+      "total_ffn_ms": 8982.234,
+      "total_non_ffn_ms": 9777.096,
+      "ffn_pct_of_wall": 47.881424,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 35.785053,
+      "meets_perf_gate": true,
+      "bucket_note": "FFN totals are accumulated from the custom sharded full-model loop; non-FFN is derived as total-forward minus total-FFN."
+    },
+    {
+      "mode": "shard6",
+      "shard_count": 6,
+      "compile_s": 1.0329722,
+      "warmup_wall_ms": 22093.729,
+      "timed_samples_ms": [
+        17304.645,
+        17294.4,
+        17266.434
+      ],
+      "median_full_forward_ms": 17294.4,
+      "tok_per_s": 29.604958,
+      "peak_rss_mb": 328200.66,
+      "avg_layer_ms": 108.090004,
+      "total_ffn_ms": 7753.336,
+      "total_non_ffn_ms": 9541.064,
+      "ffn_pct_of_wall": 44.831482,
+      "diff_vs_baseline": {
+        "max_abs_diff": 0.0,
+        "mean_abs_diff": 0.0,
+        "cosine_similarity": 1.0,
+        "loss_abs_diff": 0.0
+      },
+      "correctness_pass": true,
+      "full_forward_win_pct_vs_baseline": 40.79964,
+      "meets_perf_gate": true,
+      "bucket_note": "FFN totals are accumulated from the custom sharded full-model loop; non-FFN is derived as total-forward minus total-FFN."
+    }
+  ],
+  "primary_success": true,
+  "winning_modes": [
+    "shard2",
+    "shard4",
+    "shard6"
+  ],
+  "thresholds": {
+    "max_abs_diff_tol": 0.02,
+    "mean_abs_diff_tol": 0.005,
+    "cosine_similarity_tol": 0.999,
+    "loss_abs_diff_tol": 0.0001,
+    "perf_win_pct_tol": 5.0
+  }
+}
