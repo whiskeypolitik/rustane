@@ -3,6 +3,7 @@
 //! Run:
 //!   cargo test -p engine --test bench_forward_multistream --release -- --ignored --nocapture
 
+use engine::bench_result;
 use engine::full_model::{self, ModelForwardWorkspace, ModelWeights, TrainConfig};
 use engine::layer::CompiledKernels;
 use engine::model::ModelConfig;
@@ -63,6 +64,7 @@ struct StreamScenarioResult {
     max_stream_tok_per_s: f32,
     peak_rss_mb: f32,
     est_ram_gb: f64,
+    loss: Option<f32>,
     success: bool,
     error: Option<String>,
 }
@@ -128,13 +130,22 @@ fn current_rss_mb() -> Option<f32> {
     Some(kb / 1024.0)
 }
 
-fn lean_mem_estimate_gb(cfg: &ModelConfig) -> f64 {
-    let params_b = cfg.param_count() as f64 / 1e9;
+fn shared_weight_mem_gb(cfg: &ModelConfig) -> f64 {
+    cfg.param_count() as f64 * 4.0 / 1e9
+}
+
+fn per_stream_lean_overhead_gb(cfg: &ModelConfig) -> f64 {
     let per_layer_cache_mb =
         (cfg.dim * cfg.seq * 4 * 5 + cfg.hidden * cfg.seq * 4 * 3 + cfg.heads * cfg.seq * cfg.seq * 4)
             as f64
             / 1e6;
-    params_b * 4.0 + 2.0 * per_layer_cache_mb / 1000.0 + 0.5
+    2.0 * per_layer_cache_mb / 1000.0 + 0.5
+}
+
+fn lean_mem_estimate_gb(cfg: &ModelConfig, streams: usize) -> f64 {
+    // All streams share one weight set via Arc<ModelWeights>; only workspace-like
+    // overhead scales with stream count.
+    shared_weight_mem_gb(cfg) + per_stream_lean_overhead_gb(cfg) * streams as f64
 }
 
 fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -147,9 +158,46 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+fn write_submit_artifact(cfg: &ModelConfig, name: &str, streams: usize, result: &StreamScenarioResult) {
+    let loss = result.loss.unwrap_or(0.0);
+    let ms_per_step = result.total_wall_ms / (result.iter_count as f32 * streams as f32);
+    let mut bench = bench_result::BenchResult {
+        schema_version: 1,
+        rustane_version: env!("CARGO_PKG_VERSION").to_string(),
+        git_sha: bench_result::git_sha(),
+        benchmark: format!("fwd_{}_multistream_{}x", name.to_lowercase(), streams),
+        config: bench_result::ModelInfo {
+            name: name.to_string(),
+            dim: cfg.dim,
+            hidden: cfg.hidden,
+            heads: cfg.heads,
+            nlayers: cfg.nlayers,
+            seq: cfg.seq,
+            params_m: cfg.param_count() as f64 / 1e6,
+        },
+        results: bench_result::TimingResults {
+            ms_per_step,
+            ms_fwd: ms_per_step,
+            ms_bwd: 0.0,
+            ms_upd: 0.0,
+            tok_per_s: result.aggregate_tok_per_s,
+            loss_start: loss,
+            loss_end: loss,
+            loss_delta: 0.0,
+        },
+        loss_trace: if result.loss.is_some() { vec![loss] } else { Vec::new() },
+        hardware: bench_result::collect_hardware_info(),
+        submitter: bench_result::Submitter::default(),
+        timestamp_utc: bench_result::utc_timestamp(),
+        fingerprint: String::new(),
+    };
+    bench.fingerprint = bench_result::compute_fingerprint(&bench);
+    bench_result::write_result(&bench);
+}
+
 fn run_scenario(cfg: &ModelConfig, name: &str, streams: usize, physical_gb: Option<f64>) -> StreamScenarioResult {
     const TIMED_ITERS: usize = 3;
-    let est_ram_gb = lean_mem_estimate_gb(cfg) * streams as f64;
+    let est_ram_gb = lean_mem_estimate_gb(cfg, streams);
     if let Some(total_gb) = physical_gb {
         if est_ram_gb > total_gb * 0.85 {
             return StreamScenarioResult {
@@ -163,6 +211,7 @@ fn run_scenario(cfg: &ModelConfig, name: &str, streams: usize, physical_gb: Opti
                 max_stream_tok_per_s: 0.0,
                 peak_rss_mb: rss_mb().unwrap_or(0.0),
                 est_ram_gb,
+                loss: None,
                 success: false,
                 error: Some(format!(
                     "skipped for safety: estimated {:.1}GB exceeds 85% of physical {:.1}GB",
@@ -179,12 +228,14 @@ fn run_scenario(cfg: &ModelConfig, name: &str, streams: usize, physical_gb: Opti
     let weights = Arc::new(ModelWeights::random(cfg));
     let barrier = Arc::new(Barrier::new(streams + 1));
     let (tx, rx) = mpsc::channel();
+    let (loss_tx, loss_rx) = mpsc::channel();
 
     let run = std::panic::catch_unwind(|| {
         let mut handles = Vec::with_capacity(streams);
-        for _ in 0..streams {
+        for worker_idx in 0..streams {
             let barrier = barrier.clone();
             let tx = tx.clone();
+            let loss_tx = loss_tx.clone();
             let weights = Arc::clone(&weights);
             let tokens = Arc::clone(&tokens);
             let targets = Arc::clone(&targets);
@@ -192,7 +243,11 @@ fn run_scenario(cfg: &ModelConfig, name: &str, streams: usize, physical_gb: Opti
             handles.push(thread::spawn(move || {
                 let kernels = CompiledKernels::compile_forward_only(&cfg);
                 let mut ws = ModelForwardWorkspace::new_lean(&cfg);
-                let _ = full_model::forward_only_ws(&cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut ws);
+                let warmup_loss =
+                    full_model::forward_only_ws(&cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut ws);
+                if worker_idx == 0 {
+                    let _ = loss_tx.send(warmup_loss);
+                }
 
                 barrier.wait();
                 let t0 = Instant::now();
@@ -204,6 +259,7 @@ fn run_scenario(cfg: &ModelConfig, name: &str, streams: usize, physical_gb: Opti
             }));
         }
         drop(tx);
+        drop(loss_tx);
 
         barrier.wait();
         let t0 = Instant::now();
@@ -218,16 +274,17 @@ fn run_scenario(cfg: &ModelConfig, name: &str, streams: usize, physical_gb: Opti
             peak_rss = peak_rss.max(rss_mb().unwrap_or(peak_rss));
         }
         let total_wall_ms = t0.elapsed().as_secs_f32() * 1000.0;
+        let loss = loss_rx.recv().ok();
 
         for handle in handles {
             handle.join().expect("multistream thread panicked");
         }
 
-        (stream_ms, total_wall_ms, peak_rss)
+        (stream_ms, total_wall_ms, peak_rss, loss)
     });
 
     match run {
-        Ok((stream_ms, total_wall_ms, peak_rss)) => {
+        Ok((stream_ms, total_wall_ms, peak_rss, loss)) => {
             let mut stream_tok = Vec::new();
             for ms in &stream_ms {
                 let tok = cfg.seq as f32 * TIMED_ITERS as f32 * 1000.0 / *ms;
@@ -249,6 +306,7 @@ fn run_scenario(cfg: &ModelConfig, name: &str, streams: usize, physical_gb: Opti
                 max_stream_tok_per_s,
                 peak_rss_mb: peak_rss,
                 est_ram_gb,
+                loss,
                 success: true,
                 error: None,
             }
@@ -264,6 +322,7 @@ fn run_scenario(cfg: &ModelConfig, name: &str, streams: usize, physical_gb: Opti
             max_stream_tok_per_s: 0.0,
             peak_rss_mb: rss_mb().unwrap_or(0.0),
             est_ram_gb,
+            loss: None,
             success: false,
             error: Some(panic_payload_to_string(payload)),
         },
@@ -340,12 +399,20 @@ fn run_named_set(configs: Vec<(ModelConfig, &'static str)>) {
     let streams = stream_count_from_env();
 
     let mut results = load_results();
+    let mut submit_candidate: Option<(ModelConfig, &'static str, StreamScenarioResult)> = None;
     for (cfg, name) in configs {
         results.retain(|r| !(r.name == name && r.streams == streams));
-        results.push(run_scenario(&cfg, name, streams, physical_gb));
+        let result = run_scenario(&cfg, name, streams, physical_gb);
+        if result.success {
+            submit_candidate = Some((cfg.clone(), name, result.clone()));
+        }
+        results.push(result);
     }
     results.sort_by(|a, b| a.name.cmp(&b.name).then(a.streams.cmp(&b.streams)));
     write_results(&results);
+    if let Some((cfg, name, result)) = submit_candidate {
+        write_submit_artifact(&cfg, name, streams, &result);
+    }
 }
 
 #[test]
@@ -444,6 +511,12 @@ fn forward_10b_multistream() {
 
 #[test]
 #[ignore]
+fn forward_30b_multistream() {
+    run_named_set(vec![(custom_config(5120, 13824, 40, 96, 512), "30B")]);
+}
+
+#[test]
+#[ignore]
 fn forward_ladder_multistream() {
     run_named_set(vec![
         (custom_config(3072, 8192, 24, 44, 512), "5B"),
@@ -459,15 +532,17 @@ fn forward_ladder_multistream() {
 #[ignore]
 fn forward_ceiling_multistream() {
     run_named_set(vec![
-        (custom_config(5120, 13824, 40, 64, 512), "20B"),
-        (custom_config(6144, 16384, 48, 64, 512), "30B"),
+        (custom_config(5120, 13824, 40, 80, 512), "25B"),
+        (custom_config(5120, 13824, 40, 96, 512), "30B"),
         (custom_config(5120, 13824, 40, 128, 512), "40B"),
-        (custom_config(6144, 16384, 48, 110, 512), "50B"),
-        (custom_config(6144, 16384, 48, 132, 512), "60B"),
-        (custom_config(6144, 16384, 48, 154, 512), "70B"),
-        (custom_config(6144, 16384, 48, 176, 512), "80B"),
-        (custom_config(6144, 16384, 48, 198, 512), "90B"),
-        (custom_config(6144, 16384, 48, 220, 512), "100B"),
-        (custom_config(6144, 16384, 48, 242, 512), "110B"),
+        (custom_config(5120, 13824, 40, 160, 512), "50B"),
+        (custom_config(5120, 13824, 40, 192, 512), "60B"),
+        (custom_config(5120, 13824, 40, 224, 512), "70B"),
+        (custom_config(5120, 13824, 40, 256, 512), "80B"),
+        (custom_config(5120, 13824, 40, 320, 512), "100B"),
+        (custom_config(5120, 13824, 40, 352, 512), "110B"),
+        (custom_config(5120, 13824, 40, 368, 512), "115B"),
+        (custom_config(5120, 13824, 40, 384, 512), "120B"),
+        (custom_config(5120, 13824, 40, 390, 512), "122B"),
     ]);
 }
