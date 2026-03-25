@@ -7,6 +7,8 @@
 
 STREAMS ?= 1
 USE_LEAN_WORKSPACE ?= 1
+ATTN_SHARDS ?=
+FFN_SHARDS ?=
 
 help: ## Show this help
 	@echo "  Rustane — available commands:"
@@ -28,6 +30,10 @@ help: ## Show this help
 	@echo "  make forward-ceiling      Forward pass 25B/30B (~10 min, needs 130GB)"
 	@echo "  add STREAMS=<N>           Use multistream forward benchmark mode"
 	@echo "  example: make forward-ladder STREAMS=4"
+	@echo "  add ATTN_SHARDS=<1/2/4/8/10>   Attention head sharding for forward benchmarks"
+	@echo "  add FFN_SHARDS=<2/4/6/8/10/12/16> FFN sharding for forward benchmarks"
+	@echo "  examples: make forward-10b FFN_SHARDS=8"
+	@echo "            make forward-ladder ATTN_SHARDS=10 FFN_SHARDS=10"
 	@echo ""
 	@echo "  Training on real data:"
 	@echo "  make train-600m DATA=/path/to/train.bin"
@@ -62,28 +68,28 @@ sweep-full: ## Full parameter sweep, 25 configs, 600M-5B (~60 min, needs 85GB)
 
 forward-ladder: ## Forward pass 5B to 20B (~8 min, needs 93GB)
 	@if [ "$(STREAMS)" = "1" ]; then \
-		USE_LEAN_WORKSPACE=$(USE_LEAN_WORKSPACE) cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_scale_ladder; \
+		$(if $(ATTN_SHARDS),ATTN_SHARDS=$(ATTN_SHARDS) )$(if $(FFN_SHARDS),FFN_SHARDS=$(FFN_SHARDS) )USE_LEAN_WORKSPACE=$(USE_LEAN_WORKSPACE) cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_scale_ladder; \
 	else \
 		STREAMS=$(STREAMS) cargo test -p engine --test bench_forward_multistream --release -- --ignored --nocapture forward_ladder_multistream; \
 	fi
 
 forward-ceiling: ## Push forward pass to 25B/30B (~10 min, needs 130GB)
 	@if [ "$(STREAMS)" = "1" ]; then \
-		USE_LEAN_WORKSPACE=$(USE_LEAN_WORKSPACE) cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_find_ceiling; \
+		$(if $(ATTN_SHARDS),ATTN_SHARDS=$(ATTN_SHARDS) )$(if $(FFN_SHARDS),FFN_SHARDS=$(FFN_SHARDS) )USE_LEAN_WORKSPACE=$(USE_LEAN_WORKSPACE) cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_find_ceiling; \
 	else \
 		STREAMS=$(STREAMS) cargo test -p engine --test bench_forward_multistream --release -- --ignored --nocapture forward_ceiling_multistream; \
 	fi
 
 forward-7b: ## Single forward pass at 7B (~30s, needs 31GB)
 	@if [ "$(STREAMS)" = "1" ]; then \
-		USE_LEAN_WORKSPACE=$(USE_LEAN_WORKSPACE) cargo test -p engine --test theory_runner_supervisor --release -- --ignored --nocapture theory_forward_7b_isolated; \
+		$(if $(ATTN_SHARDS),ATTN_SHARDS=$(ATTN_SHARDS) )$(if $(FFN_SHARDS),FFN_SHARDS=$(FFN_SHARDS) )USE_LEAN_WORKSPACE=$(USE_LEAN_WORKSPACE) cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_7b; \
 	else \
 		STREAMS=$(STREAMS) cargo test -p engine --test bench_forward_multistream --release -- --ignored --nocapture forward_7b_multistream; \
 	fi
 
 forward-10b: ## Single forward pass at 10B (~45s, needs 46GB)
 	@if [ "$(STREAMS)" = "1" ]; then \
-		USE_LEAN_WORKSPACE=$(USE_LEAN_WORKSPACE) cargo test -p engine --test theory_runner_supervisor --release -- --ignored --nocapture theory_forward_10b_isolated; \
+		$(if $(ATTN_SHARDS),ATTN_SHARDS=$(ATTN_SHARDS) )$(if $(FFN_SHARDS),FFN_SHARDS=$(FFN_SHARDS) )USE_LEAN_WORKSPACE=$(USE_LEAN_WORKSPACE) cargo test -p engine --test bench_fwd_only_scale --release -- --ignored --nocapture fwd_10b; \
 	else \
 		STREAMS=$(STREAMS) cargo test -p engine --test bench_forward_multistream --release -- --ignored --nocapture forward_10b_multistream; \
 	fi

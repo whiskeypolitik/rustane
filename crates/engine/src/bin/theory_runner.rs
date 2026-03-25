@@ -2,9 +2,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use engine::bench_result;
-use engine::full_model::{self, ModelForwardWorkspace, ModelWeights, TrainConfig};
-use engine::layer::CompiledKernels;
+use engine::full_model::{ModelForwardWorkspace, ModelWeights, TrainConfig};
 use engine::model::ModelConfig;
+use engine::parallel_bench::{ParallelBenchRequest, ParallelBenchRunner, ShardPolicy};
 
 fn install_abort_on_panic() {
     let default_hook = std::panic::take_hook();
@@ -61,14 +61,17 @@ fn run_forward_probe(cfg: &ModelConfig, name: &str) {
     println!("{}", "=".repeat(70));
 
     print!("  [1/3] Compiling ANE kernels... ");
-    let t0 = Instant::now();
-    let kernels = if use_lean {
-        CompiledKernels::compile_forward_only(cfg)
-    } else {
-        CompiledKernels::compile(cfg)
-    };
-    let compile_s = t0.elapsed().as_secs_f32();
+    let request = ParallelBenchRequest::from_env(ShardPolicy::FailFast)
+        .expect("parse shard requests from env");
+    let (mut runner, compile_s) = ParallelBenchRunner::compile(cfg, request, use_lean)
+        .expect("compile parallel benchmark runner");
     println!("{compile_s:.1}s");
+    if runner.resolved().mode_label() != "baseline" {
+        println!("      mode={}", runner.resolved().mode_label());
+    }
+    for note in &runner.resolved().notes {
+        println!("      note: {note}");
+    }
 
     print!("  [2/3] Allocating {:.1}GB... ", mem_est_gb);
     let t0 = Instant::now();
@@ -84,19 +87,14 @@ fn run_forward_probe(cfg: &ModelConfig, name: &str) {
     let tc = TrainConfig::default();
     let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
     let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
-    let fwd_fn = if use_lean {
-        full_model::forward_only_ws
-    } else {
-        full_model::forward_ws
-    };
 
     print!("  [3/3] Forward pass (1 warmup + 3 timed)... ");
-    let _warmup_loss = fwd_fn(cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
+    let _warmup_loss = runner.forward_loss(&weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
     let mut times = Vec::with_capacity(3);
     let mut loss = 0.0f32;
     for _ in 0..3 {
         let t0 = Instant::now();
-        loss = fwd_fn(cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
+        loss = runner.forward_loss(&weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
         times.push(t0.elapsed().as_secs_f32() * 1000.0);
     }
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -108,9 +106,13 @@ fn run_forward_probe(cfg: &ModelConfig, name: &str) {
         schema_version: 1,
         rustane_version: env!("CARGO_PKG_VERSION").to_string(),
         git_sha: bench_result::git_sha(),
-        benchmark: format!("fwd_{}", name.to_lowercase()),
+        benchmark: format!(
+            "fwd_{}{}",
+            name.to_lowercase(),
+            runner.resolved().benchmark_suffix()
+        ),
         config: bench_result::ModelInfo {
-            name: name.to_string(),
+            name: format!("{}{}", name, runner.resolved().benchmark_suffix()),
             dim: cfg.dim,
             hidden: cfg.hidden,
             heads: cfg.heads,

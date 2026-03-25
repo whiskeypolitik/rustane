@@ -14,3 +14,4 @@ pub mod multistream;
 pub mod metal_adam;
 pub mod data;
 pub mod bench_result;
+pub mod parallel_bench;
