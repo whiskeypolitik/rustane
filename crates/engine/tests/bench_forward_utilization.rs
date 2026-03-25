@@ -67,7 +67,13 @@ fn branch_flavor() -> BranchFlavor {
             .output();
         let sha = output
             .ok()
-            .and_then(|o| if o.status.success() { String::from_utf8(o.stdout).ok() } else { None })
+            .and_then(|o| {
+                if o.status.success() {
+                    String::from_utf8(o.stdout).ok()
+                } else {
+                    None
+                }
+            })
             .unwrap_or_default();
         if sha.trim() == PR22_BASE_SHA {
             BranchFlavor::Base
@@ -77,7 +83,13 @@ fn branch_flavor() -> BranchFlavor {
     })
 }
 
-fn custom_config(dim: usize, hidden: usize, heads: usize, nlayers: usize, seq: usize) -> ModelConfig {
+fn custom_config(
+    dim: usize,
+    hidden: usize,
+    heads: usize,
+    nlayers: usize,
+    seq: usize,
+) -> ModelConfig {
     ModelConfig {
         dim,
         hidden,
@@ -200,14 +212,15 @@ fn results_dir() -> PathBuf {
     if let Ok(root) = env::var("RUSTANE_FORWARD_UTIL_RESULTS") {
         PathBuf::from(root)
     } else {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../results/forward_utilization")
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../results/forward_utilization")
     }
 }
 
 fn results_root_for(mode: ResultsMode) -> PathBuf {
     match mode {
-        ResultsMode::Default => Path::new(env!("CARGO_MANIFEST_DIR")).join("../../results/forward_utilization"),
+        ResultsMode::Default => {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../results/forward_utilization")
+        }
         ResultsMode::Compare => {
             let side = match branch_flavor() {
                 BranchFlavor::Base => "base",
@@ -277,10 +290,10 @@ fn percentile_f64(values: &[f64], pct: f64) -> f64 {
 
 fn mem_estimate_gb(cfg: &ModelConfig) -> f64 {
     let params_b = cfg.param_count() as f64 / 1e9;
-    let per_layer_cache_mb =
-        (cfg.dim * cfg.seq * 4 * 5 + cfg.hidden * cfg.seq * 4 * 3 + cfg.heads * cfg.seq * cfg.seq * 4)
-            as f64
-            / 1e6;
+    let per_layer_cache_mb = (cfg.dim * cfg.seq * 4 * 5
+        + cfg.hidden * cfg.seq * 4 * 3
+        + cfg.heads * cfg.seq * cfg.seq * 4) as f64
+        / 1e6;
     params_b * 4.0 + cfg.nlayers as f64 * per_layer_cache_mb / 1000.0 + 0.5
 }
 
@@ -306,13 +319,21 @@ fn rss_mb() -> Option<f32> {
     if !output.status.success() {
         return None;
     }
-    let kb: f32 = String::from_utf8(output.stdout).ok()?.trim().parse::<f32>().ok()?;
+    let kb: f32 = String::from_utf8(output.stdout)
+        .ok()?
+        .trim()
+        .parse::<f32>()
+        .ok()?;
     Some(kb / 1024.0)
 }
 
 fn deterministic_tokens(cfg: &ModelConfig) -> (Vec<u32>, Vec<u32>) {
-    let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
-    let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
+    let tokens: Vec<u32> = (0..cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
+    let targets: Vec<u32> = (1..=cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
     (tokens, targets)
 }
 
@@ -338,22 +359,67 @@ fn build_dual_separate(ic: usize, oc: usize, seq: usize) -> Graph {
     let sp = seq + 2 * oc;
     let mut g = Graph::new();
 
-    let input = g.placeholder(Shape { batch: 1, channels: ic, height: 1, width: sp });
+    let input = g.placeholder(Shape {
+        batch: 1,
+        channels: ic,
+        height: 1,
+        width: sp,
+    });
     let acts = g.slice(input, [0, 0, 0, 0], [1, ic, 1, seq]);
-    let acts_r = g.reshape(acts, Shape { batch: 1, channels: 1, height: ic, width: seq });
+    let acts_r = g.reshape(
+        acts,
+        Shape {
+            batch: 1,
+            channels: 1,
+            height: ic,
+            width: seq,
+        },
+    );
     let acts_t = g.transpose(acts_r, [0, 1, 3, 2]);
 
     let wts1 = g.slice(input, [0, 0, 0, seq], [1, ic, 1, oc]);
-    let wts1_r = g.reshape(wts1, Shape { batch: 1, channels: 1, height: ic, width: oc });
+    let wts1_r = g.reshape(
+        wts1,
+        Shape {
+            batch: 1,
+            channels: 1,
+            height: ic,
+            width: oc,
+        },
+    );
     let mm1 = g.matrix_multiplication(acts_t, wts1_r, false, false);
     let mm1_t = g.transpose(mm1, [0, 1, 3, 2]);
-    let out1 = g.reshape(mm1_t, Shape { batch: 1, channels: oc, height: 1, width: seq });
+    let out1 = g.reshape(
+        mm1_t,
+        Shape {
+            batch: 1,
+            channels: oc,
+            height: 1,
+            width: seq,
+        },
+    );
 
     let wts2 = g.slice(input, [0, 0, 0, seq + oc], [1, ic, 1, oc]);
-    let wts2_r = g.reshape(wts2, Shape { batch: 1, channels: 1, height: ic, width: oc });
+    let wts2_r = g.reshape(
+        wts2,
+        Shape {
+            batch: 1,
+            channels: 1,
+            height: ic,
+            width: oc,
+        },
+    );
     let mm2 = g.matrix_multiplication(acts_t, wts2_r, false, false);
     let mm2_t = g.transpose(mm2, [0, 1, 3, 2]);
-    let out2 = g.reshape(mm2_t, Shape { batch: 1, channels: oc, height: 1, width: seq });
+    let out2 = g.reshape(
+        mm2_t,
+        Shape {
+            batch: 1,
+            channels: oc,
+            height: 1,
+            width: seq,
+        },
+    );
 
     let _out = g.concat(&[out1, out2], 1);
     g
@@ -383,7 +449,14 @@ fn dispatch_info(cfg: &ModelConfig, flavor: BranchFlavor) -> DispatchInfo {
     }
 }
 
-fn stage_spatial(dst: &mut [f32], channels: usize, sp_width: usize, src: &[f32], src_width: usize, sp_offset: usize) {
+fn stage_spatial(
+    dst: &mut [f32],
+    channels: usize,
+    sp_width: usize,
+    src: &[f32],
+    src_width: usize,
+    sp_offset: usize,
+) {
     for c in 0..channels {
         let dst_row = c * sp_width;
         let src_row = c * src_width;
@@ -393,9 +466,12 @@ fn stage_spatial(dst: &mut [f32], channels: usize, sp_width: usize, src: &[f32],
 }
 
 fn write_summary() {
-    let scale_results: Vec<ScaleLadderResult> = maybe_read_json(&scale_json_path()).unwrap_or_default();
-    let layer_results: Vec<LayerBreakdownResult> = maybe_read_json(&layer_json_path()).unwrap_or_default();
-    let kernel_results: Vec<KernelHwWallResult> = maybe_read_json(&kernel_json_path()).unwrap_or_default();
+    let scale_results: Vec<ScaleLadderResult> =
+        maybe_read_json(&scale_json_path()).unwrap_or_default();
+    let layer_results: Vec<LayerBreakdownResult> =
+        maybe_read_json(&layer_json_path()).unwrap_or_default();
+    let kernel_results: Vec<KernelHwWallResult> =
+        maybe_read_json(&kernel_json_path()).unwrap_or_default();
 
     let mut summary = String::new();
     summary.push_str("# Forward Utilization Summary\n\n");
@@ -446,7 +522,11 @@ fn write_summary() {
             let _ = writeln!(
                 summary,
                 "| {} | {:.0} MB | {:.0} MB | {:.0} MB | {:.0} MB |",
-                r.name, r.rss_mb_after_compile, r.rss_mb_after_alloc, r.rss_mb_after_warmup, r.rss_mb_peak_timed
+                r.name,
+                r.rss_mb_after_compile,
+                r.rss_mb_after_alloc,
+                r.rss_mb_after_warmup,
+                r.rss_mb_peak_timed
             );
         }
         summary.push('\n');
@@ -455,7 +535,8 @@ fn write_summary() {
     if !layer_results.is_empty() {
         summary.push_str("## Single-layer bucket shares\n\n");
         summary.push_str("| scale | total(ms) | ane(ms) | stage(ms) | read(ms) | cpu(ms) | ane% | stage% | read% | cpu% |\n");
-        summary.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+        summary
+            .push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
         for r in &layer_results {
             if r.success {
                 let _ = writeln!(
@@ -473,7 +554,11 @@ fn write_summary() {
                     r.cpu_pct
                 );
             } else {
-                let _ = writeln!(summary, "| {} | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL |", r.name);
+                let _ = writeln!(
+                    summary,
+                    "| {} | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL | FAIL |",
+                    r.name
+                );
             }
         }
         summary.push('\n');
@@ -481,17 +566,28 @@ fn write_summary() {
 
     if !kernel_results.is_empty() {
         summary.push_str("## Per-kernel wall vs hardware\n\n");
-        summary.push_str("| scale | kernel | wall median(us) | hw median(ns) | overhead(us) | overhead% |\n");
+        summary.push_str(
+            "| scale | kernel | wall median(us) | hw median(ns) | overhead(us) | overhead% |\n",
+        );
         summary.push_str("| --- | --- | ---: | ---: | ---: | ---: |\n");
         for r in &kernel_results {
             if r.success {
                 let _ = writeln!(
                     summary,
                     "| {} | {} | {:.1} | {:.0} | {:.1} | {:.1}% |",
-                    r.scale, r.kernel, r.wall_median_us, r.hw_median_ns, r.overhead_us, r.overhead_pct
+                    r.scale,
+                    r.kernel,
+                    r.wall_median_us,
+                    r.hw_median_ns,
+                    r.overhead_us,
+                    r.overhead_pct
                 );
             } else {
-                let _ = writeln!(summary, "| {} | {} | FAIL | FAIL | FAIL | FAIL |", r.scale, r.kernel);
+                let _ = writeln!(
+                    summary,
+                    "| {} | {} | FAIL | FAIL | FAIL | FAIL |",
+                    r.scale, r.kernel
+                );
             }
         }
         summary.push('\n');
@@ -507,9 +603,18 @@ fn write_summary() {
     }
 
     let bottleneck = classify_bottleneck(&scale_results, &layer_results, &kernel_results);
-    let recommendation = recommend_next_action(&scale_results, &layer_results, &kernel_results, &bottleneck);
-    let _ = writeln!(summary, "## Conclusion\n\nCurrent classification: **{}**.\n", bottleneck);
-    let _ = writeln!(summary, "## Recommendation\n\nNext action: **{}**.\n", recommendation);
+    let recommendation =
+        recommend_next_action(&scale_results, &layer_results, &kernel_results, &bottleneck);
+    let _ = writeln!(
+        summary,
+        "## Conclusion\n\nCurrent classification: **{}**.\n",
+        bottleneck
+    );
+    let _ = writeln!(
+        summary,
+        "## Recommendation\n\nNext action: **{}**.\n",
+        recommendation
+    );
 
     ensure_results_dir();
     fs::write(summary_path(), summary).expect("write summary");
@@ -535,11 +640,15 @@ fn classify_bottleneck(
 
     let high_scale_overheads: Vec<f64> = kernel_results
         .iter()
-        .filter(|r| (r.scale == "5B" || r.scale == "13B") && (r.kernel == "wo_fwd" || r.kernel.starts_with("ffn_")))
+        .filter(|r| {
+            (r.scale == "5B" || r.scale == "13B")
+                && (r.kernel == "wo_fwd" || r.kernel.starts_with("ffn_"))
+        })
         .map(|r| r.overhead_pct)
         .collect();
     if !high_scale_overheads.is_empty()
-        && high_scale_overheads.iter().copied().sum::<f64>() / high_scale_overheads.len() as f64 > 25.0
+        && high_scale_overheads.iter().copied().sum::<f64>() / high_scale_overheads.len() as f64
+            > 25.0
     {
         return "staging/readback dominated";
     }
@@ -624,10 +733,18 @@ fn collect_failures(
 ) -> Vec<String> {
     let mut failures = Vec::new();
     for r in scale_results.iter().filter(|r| !r.success) {
-        failures.push(format!("scale {}: {}", r.name, r.error.as_deref().unwrap_or("unknown error")));
+        failures.push(format!(
+            "scale {}: {}",
+            r.name,
+            r.error.as_deref().unwrap_or("unknown error")
+        ));
     }
     for r in layer_results.iter().filter(|r| !r.success) {
-        failures.push(format!("layer {}: {}", r.name, r.error.as_deref().unwrap_or("unknown error")));
+        failures.push(format!(
+            "layer {}: {}",
+            r.name,
+            r.error.as_deref().unwrap_or("unknown error")
+        ));
     }
     for r in kernel_results.iter().filter(|r| !r.success) {
         failures.push(format!(
@@ -669,9 +786,11 @@ fn scale_probe(cfg: &ModelConfig, name: &str, safety_ram_gb: Option<f64>) -> Sca
                 ffn_mode: dispatch.ffn_mode.to_string(),
                 ffn_dispatches_per_layer: dispatch.ffn_dispatches_per_layer,
                 forward_dispatches_per_layer: dispatch.forward_dispatches_per_layer,
-                forward_dispatches_per_token: dispatch.forward_dispatches_per_layer as f32 / cfg.seq as f32,
+                forward_dispatches_per_token: dispatch.forward_dispatches_per_layer as f32
+                    / cfg.seq as f32,
                 dispatches_per_forward: dispatch.forward_dispatches_per_layer * cfg.nlayers,
-                dispatches_per_token: (dispatch.forward_dispatches_per_layer * cfg.nlayers) as f32 / cfg.seq as f32,
+                dispatches_per_token: (dispatch.forward_dispatches_per_layer * cfg.nlayers) as f32
+                    / cfg.seq as f32,
                 success: false,
                 error: Some(format!(
                     "skipped for safety: estimated {:.1}GB exceeds 90% of physical {:.1}GB",
@@ -706,7 +825,8 @@ fn scale_probe(cfg: &ModelConfig, name: &str, safety_ram_gb: Option<f64>) -> Sca
         forward_dispatches_per_layer: dispatch.forward_dispatches_per_layer,
         forward_dispatches_per_token: dispatch.forward_dispatches_per_layer as f32 / cfg.seq as f32,
         dispatches_per_forward: dispatch.forward_dispatches_per_layer * cfg.nlayers,
-        dispatches_per_token: (dispatch.forward_dispatches_per_layer * cfg.nlayers) as f32 / cfg.seq as f32,
+        dispatches_per_token: (dispatch.forward_dispatches_per_layer * cfg.nlayers) as f32
+            / cfg.seq as f32,
         success: false,
         error: None,
     };
@@ -726,7 +846,15 @@ fn scale_probe(cfg: &ModelConfig, name: &str, safety_ram_gb: Option<f64>) -> Sca
         let alloc_s = t0.elapsed().as_secs_f32();
         let rss_after_alloc = rss_mb().unwrap_or(0.0);
 
-        let warmup_loss = full_model::forward_ws(cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
+        let warmup_loss = full_model::forward_ws(
+            cfg,
+            &kernels,
+            &weights,
+            &tokens,
+            &targets,
+            tc.softcap,
+            &mut fwd_ws,
+        );
         assert!(warmup_loss.is_finite(), "warmup loss is not finite");
         let rss_after_warmup = rss_mb().unwrap_or(0.0);
 
@@ -735,7 +863,15 @@ fn scale_probe(cfg: &ModelConfig, name: &str, safety_ram_gb: Option<f64>) -> Sca
         let mut rss_peak = rss_after_warmup;
         for _ in 0..5 {
             let t0 = Instant::now();
-            loss = full_model::forward_ws(cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
+            loss = full_model::forward_ws(
+                cfg,
+                &kernels,
+                &weights,
+                &tokens,
+                &targets,
+                tc.softcap,
+                &mut fwd_ws,
+            );
             let ms = t0.elapsed().as_secs_f32() * 1000.0;
             assert!(loss.is_finite(), "timed loss is not finite");
             times.push(ms);
@@ -743,11 +879,29 @@ fn scale_probe(cfg: &ModelConfig, name: &str, safety_ram_gb: Option<f64>) -> Sca
         }
         times.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-        (compile_s, alloc_s, rss_after_compile, rss_after_alloc, rss_after_warmup, rss_peak, times, loss)
+        (
+            compile_s,
+            alloc_s,
+            rss_after_compile,
+            rss_after_alloc,
+            rss_after_warmup,
+            rss_peak,
+            times,
+            loss,
+        )
     });
 
     match run {
-        Ok((compile_s, alloc_s, rss_after_compile, rss_after_alloc, rss_after_warmup, rss_peak, times, loss)) => {
+        Ok((
+            compile_s,
+            alloc_s,
+            rss_after_compile,
+            rss_after_alloc,
+            rss_after_warmup,
+            rss_peak,
+            times,
+            loss,
+        )) => {
             result.compile_s = compile_s;
             result.alloc_s = alloc_s;
             result.rss_mb_after_compile = rss_after_compile;
@@ -879,12 +1033,26 @@ fn kernel_hw_probe(cfg: &ModelConfig, scale: &str) -> Vec<KernelHwWallResult> {
     let x = deterministic_input(cfg.dim * cfg.seq);
     let mut xnorm = vec![0.0f32; cfg.dim * cfg.seq];
     let mut rms_inv1 = vec![0.0f32; cfg.seq];
-    rmsnorm::forward_channel_first(&x, &weights.gamma1, &mut xnorm, &mut rms_inv1, cfg.dim, cfg.seq);
+    rmsnorm::forward_channel_first(
+        &x,
+        &weights.gamma1,
+        &mut xnorm,
+        &mut rms_inv1,
+        cfg.dim,
+        cfg.seq,
+    );
     let attn_out = deterministic_input(cfg.q_dim * cfg.seq);
     let x2 = deterministic_input(cfg.dim * cfg.seq);
     let mut x2norm = vec![0.0f32; cfg.dim * cfg.seq];
     let mut rms_inv2 = vec![0.0f32; cfg.seq];
-    rmsnorm::forward_channel_first(&x2, &weights.gamma2, &mut x2norm, &mut rms_inv2, cfg.dim, cfg.seq);
+    rmsnorm::forward_channel_first(
+        &x2,
+        &weights.gamma2,
+        &mut x2norm,
+        &mut rms_inv2,
+        cfg.dim,
+        cfg.seq,
+    );
 
     let mut results = Vec::new();
 
@@ -904,8 +1072,18 @@ fn kernel_hw_probe(cfg: &ModelConfig, scale: &str) -> Vec<KernelHwWallResult> {
             scale,
             "sdpa_fwd",
             &exe,
-            &[&sdpa_xnorm_input, &sdpa_wq_input, &sdpa_wk_input, &sdpa_wv_input],
-            &[&sdpa_attn_output, &sdpa_q_output, &sdpa_k_output, &sdpa_v_output],
+            &[
+                &sdpa_xnorm_input,
+                &sdpa_wq_input,
+                &sdpa_wk_input,
+                &sdpa_wv_input,
+            ],
+            &[
+                &sdpa_attn_output,
+                &sdpa_q_output,
+                &sdpa_k_output,
+                &sdpa_v_output,
+            ],
         )
     }));
 
@@ -913,12 +1091,15 @@ fn kernel_hw_probe(cfg: &ModelConfig, scale: &str) -> Vec<KernelHwWallResult> {
     let mut wo_in = vec![0.0f32; cfg.q_dim * wo_sp];
     stage_spatial(&mut wo_in, cfg.q_dim, wo_sp, &attn_out, cfg.seq, 0);
     stage_spatial(&mut wo_in, cfg.q_dim, wo_sp, &weights.wo, cfg.dim, cfg.seq);
-    let wo_input = TensorData::with_f32(&wo_in, Shape {
-        batch: 1,
-        channels: cfg.q_dim,
-        height: 1,
-        width: wo_sp,
-    });
+    let wo_input = TensorData::with_f32(
+        &wo_in,
+        Shape {
+            batch: 1,
+            channels: cfg.q_dim,
+            height: 1,
+            width: wo_sp,
+        },
+    );
     let wo_output = TensorData::new(Shape {
         batch: 1,
         channels: cfg.dim,
@@ -936,7 +1117,14 @@ fn kernel_hw_probe(cfg: &ModelConfig, scale: &str) -> Vec<KernelHwWallResult> {
     let mut ffn_in = vec![0.0f32; cfg.dim * ffn_sp];
     stage_spatial(&mut ffn_in, cfg.dim, ffn_sp, &x2norm, cfg.seq, 0);
     stage_spatial(&mut ffn_in, cfg.dim, ffn_sp, &x2, cfg.seq, cfg.seq);
-    stage_spatial(&mut ffn_in, cfg.dim, ffn_sp, &weights.w1, cfg.hidden, 2 * cfg.seq);
+    stage_spatial(
+        &mut ffn_in,
+        cfg.dim,
+        ffn_sp,
+        &weights.w1,
+        cfg.hidden,
+        2 * cfg.seq,
+    );
     stage_spatial(
         &mut ffn_in,
         cfg.dim,
@@ -953,12 +1141,15 @@ fn kernel_hw_probe(cfg: &ModelConfig, scale: &str) -> Vec<KernelHwWallResult> {
         cfg.hidden,
         2 * cfg.seq + 2 * cfg.hidden,
     );
-    let ffn_input = TensorData::with_f32(&ffn_in, Shape {
-        batch: 1,
-        channels: cfg.dim,
-        height: 1,
-        width: ffn_sp,
-    });
+    let ffn_input = TensorData::with_f32(
+        &ffn_in,
+        Shape {
+            batch: 1,
+            channels: cfg.dim,
+            height: 1,
+            width: ffn_sp,
+        },
+    );
     let ffn_output = TensorData::new(Shape {
         batch: 1,
         channels: ffn_fused::output_channels(cfg),
@@ -978,14 +1169,31 @@ fn kernel_hw_probe(cfg: &ModelConfig, scale: &str) -> Vec<KernelHwWallResult> {
             let w13_sp = dual_separate_spatial_width(cfg.seq, cfg.hidden);
             let mut w13_in = vec![0.0f32; cfg.dim * w13_sp];
             stage_spatial(&mut w13_in, cfg.dim, w13_sp, &x2norm, cfg.seq, 0);
-            stage_spatial(&mut w13_in, cfg.dim, w13_sp, &weights.w1, cfg.hidden, cfg.seq);
-            stage_spatial(&mut w13_in, cfg.dim, w13_sp, &weights.w3, cfg.hidden, cfg.seq + cfg.hidden);
-            let w13_input = TensorData::with_f32(&w13_in, Shape {
-                batch: 1,
-                channels: cfg.dim,
-                height: 1,
-                width: w13_sp,
-            });
+            stage_spatial(
+                &mut w13_in,
+                cfg.dim,
+                w13_sp,
+                &weights.w1,
+                cfg.hidden,
+                cfg.seq,
+            );
+            stage_spatial(
+                &mut w13_in,
+                cfg.dim,
+                w13_sp,
+                &weights.w3,
+                cfg.hidden,
+                cfg.seq + cfg.hidden,
+            );
+            let w13_input = TensorData::with_f32(
+                &w13_in,
+                Shape {
+                    batch: 1,
+                    channels: cfg.dim,
+                    height: 1,
+                    width: w13_sp,
+                },
+            );
             let w13_output = TensorData::new(Shape {
                 batch: 1,
                 channels: 2 * cfg.hidden,
@@ -1002,13 +1210,23 @@ fn kernel_hw_probe(cfg: &ModelConfig, scale: &str) -> Vec<KernelHwWallResult> {
             let w13_sp = dyn_matmul::spatial_width(cfg.seq, cfg.hidden);
             let mut w1_in = vec![0.0f32; cfg.dim * w13_sp];
             stage_spatial(&mut w1_in, cfg.dim, w13_sp, &x2norm, cfg.seq, 0);
-            stage_spatial(&mut w1_in, cfg.dim, w13_sp, &weights.w1, cfg.hidden, cfg.seq);
-            let w1_input = TensorData::with_f32(&w1_in, Shape {
-                batch: 1,
-                channels: cfg.dim,
-                height: 1,
-                width: w13_sp,
-            });
+            stage_spatial(
+                &mut w1_in,
+                cfg.dim,
+                w13_sp,
+                &weights.w1,
+                cfg.hidden,
+                cfg.seq,
+            );
+            let w1_input = TensorData::with_f32(
+                &w1_in,
+                Shape {
+                    batch: 1,
+                    channels: cfg.dim,
+                    height: 1,
+                    width: w13_sp,
+                },
+            );
             let w1_output = TensorData::new(Shape {
                 batch: 1,
                 channels: cfg.hidden,
@@ -1024,13 +1242,23 @@ fn kernel_hw_probe(cfg: &ModelConfig, scale: &str) -> Vec<KernelHwWallResult> {
 
             let mut w3_in = vec![0.0f32; cfg.dim * w13_sp];
             stage_spatial(&mut w3_in, cfg.dim, w13_sp, &x2norm, cfg.seq, 0);
-            stage_spatial(&mut w3_in, cfg.dim, w13_sp, &weights.w3, cfg.hidden, cfg.seq);
-            let w3_input = TensorData::with_f32(&w3_in, Shape {
-                batch: 1,
-                channels: cfg.dim,
-                height: 1,
-                width: w13_sp,
-            });
+            stage_spatial(
+                &mut w3_in,
+                cfg.dim,
+                w13_sp,
+                &weights.w3,
+                cfg.hidden,
+                cfg.seq,
+            );
+            let w3_input = TensorData::with_f32(
+                &w3_in,
+                Shape {
+                    batch: 1,
+                    channels: cfg.dim,
+                    height: 1,
+                    width: w13_sp,
+                },
+            );
             let w3_output = TensorData::new(Shape {
                 batch: 1,
                 channels: cfg.hidden,
@@ -1049,12 +1277,15 @@ fn kernel_hw_probe(cfg: &ModelConfig, scale: &str) -> Vec<KernelHwWallResult> {
         let mut w2_in = vec![0.0f32; cfg.hidden * w2_sp];
         stage_spatial(&mut w2_in, cfg.hidden, w2_sp, &gate, cfg.seq, 0);
         stage_spatial(&mut w2_in, cfg.hidden, w2_sp, &w2t, cfg.dim, cfg.seq);
-        let w2_input = TensorData::with_f32(&w2_in, Shape {
-            batch: 1,
-            channels: cfg.hidden,
-            height: 1,
-            width: w2_sp,
-        });
+        let w2_input = TensorData::with_f32(
+            &w2_in,
+            Shape {
+                batch: 1,
+                channels: cfg.hidden,
+                height: 1,
+                width: w2_sp,
+            },
+        );
         let w2_output = TensorData::new(Shape {
             batch: 1,
             channels: cfg.dim,
@@ -1120,22 +1351,24 @@ fn bench_kernel_multi(
     outputs: &[&TensorData],
 ) -> KernelHwWallResult {
     for _ in 0..5 {
-        exe.run_cached(inputs, outputs).expect("kernel warmup failed");
+        exe.run_cached(inputs, outputs)
+            .expect("kernel warmup failed");
     }
 
     let mut wall_us = Vec::with_capacity(50);
     for _ in 0..50 {
         let t0 = Instant::now();
-        exe.run_cached(inputs, outputs).expect("kernel wall eval failed");
+        exe.run_cached(inputs, outputs)
+            .expect("kernel wall eval failed");
         wall_us.push(t0.elapsed().as_secs_f64() * 1_000_000.0);
     }
 
     let mut hw_ns = Vec::with_capacity(50);
     for _ in 0..50 {
-        let hw = exe
-            .run_cached_with_stats(inputs, outputs)
-            .expect("kernel stats eval failed");
-        hw_ns.push(hw as f64);
+        let perf = exe
+            .run_cached_with_perf_stats(inputs, outputs)
+            .expect("kernel perf eval failed");
+        hw_ns.push(perf.hw_execution_time_ns as f64);
     }
 
     wall_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -1176,7 +1409,11 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-fn run_scale_suite(configs: Vec<(ModelConfig, &'static str)>, mode: ResultsMode, _forward_mode: ForwardMode) {
+fn run_scale_suite(
+    configs: Vec<(ModelConfig, &'static str)>,
+    mode: ResultsMode,
+    _forward_mode: ForwardMode,
+) {
     let _guard = run_lock().lock().unwrap();
     let physical_gb = physical_mem_gb();
     with_results_root(results_root_for(mode), || {
