@@ -1365,10 +1365,10 @@ fn bench_kernel_multi(
 
     let mut hw_ns = Vec::with_capacity(50);
     for _ in 0..50 {
-        let perf = exe
-            .run_cached_with_perf_stats(inputs, outputs)
+        let hw = exe
+            .run_cached_with_stats(inputs, outputs)
             .expect("kernel perf eval failed");
-        hw_ns.push(perf.hw_execution_time_ns as f64);
+        hw_ns.push(hw as f64);
     }
 
     wall_us.sort_by(|a, b| a.partial_cmp(b).unwrap());

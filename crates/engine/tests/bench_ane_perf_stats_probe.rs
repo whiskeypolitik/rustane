@@ -1,10 +1,10 @@
-//! Tiny isolated ANE perf-stats probe using the public `PerfStats` API.
+//! Tiny isolated ANE perf-stats probe using the public `run_cached_with_stats` API.
 //!
 //! Run manually:
 //!   cargo test -p engine --test bench_ane_perf_stats_probe --release -- --ignored --nocapture probe_stats_768
 //!   cargo test -p engine --test bench_ane_perf_stats_probe --release -- --ignored --nocapture probe_stats_1536
 
-use ane_bridge::ane::{Executable, PerfStats, Shape, TensorData};
+use ane_bridge::ane::{Executable, Shape, TensorData};
 use engine::kernels::dyn_matmul;
 use objc2_foundation::NSQualityOfService;
 use std::time::Instant;
@@ -61,7 +61,7 @@ fn warmup_cached(exe: &Executable, input: &TensorData, output: &TensorData) {
 fn warmup_perf(exe: &Executable, input: &TensorData, output: &TensorData) {
     for _ in 0..WARMUP_RUNS {
         let _ = exe
-            .run_cached_with_perf_stats(&[input], &[output])
+            .run_cached_with_stats(&[input], &[output])
             .expect("perf warmup failed");
     }
 }
@@ -88,22 +88,18 @@ fn collect_perf_samples(
     exe: &Executable,
     input: &TensorData,
     output: &TensorData,
-) -> (Vec<u64>, Vec<f64>, Option<PerfStats>) {
+) -> (Vec<u64>, Vec<f64>) {
     let mut hw_ns = Vec::with_capacity(SAMPLE_RUNS);
     let mut wall_us = Vec::with_capacity(SAMPLE_RUNS);
-    let mut sample = None;
     for _ in 0..SAMPLE_RUNS {
         let t0 = Instant::now();
-        let perf = exe
-            .run_cached_with_perf_stats(&[input], &[output])
+        let hw = exe
+            .run_cached_with_stats(&[input], &[output])
             .expect("perf sample failed");
         wall_us.push(t0.elapsed().as_secs_f64() * 1_000_000.0);
-        hw_ns.push(perf.hw_execution_time_ns);
-        if sample.is_none() {
-            sample = Some(perf);
-        }
+        hw_ns.push(hw);
     }
-    (hw_ns, wall_us, sample)
+    (hw_ns, wall_us)
 }
 
 fn summarize(values: &[u64]) -> (usize, u64, u64) {
@@ -121,22 +117,6 @@ fn mean_wall_us(values: &[f64]) -> f64 {
     }
 }
 
-fn format_top_counters(perf: &PerfStats) -> String {
-    let mut counters = perf
-        .counters
-        .iter()
-        .filter(|(_, value)| **value != 0)
-        .map(|(name, value)| (name.as_str(), *value))
-        .collect::<Vec<_>>();
-    counters.sort_by(|lhs, rhs| rhs.1.cmp(&lhs.1).then_with(|| lhs.0.cmp(rhs.0)));
-    counters
-        .into_iter()
-        .take(8)
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 fn print_phase(label: &str, hw_ns: &[u64], wall_us: &[f64]) {
     let (nonzero, min, max) = summarize(hw_ns);
     let first_ten = hw_ns.iter().take(10).copied().collect::<Vec<_>>();
@@ -145,20 +125,6 @@ fn print_phase(label: &str, hw_ns: &[u64], wall_us: &[f64]) {
         total = hw_ns.len(),
         wall = mean_wall_us(wall_us),
     );
-}
-
-fn print_perf_snapshot(perf: &PerfStats) {
-    println!(
-        "  perf snapshot: hw={}ns bytes={} words={} named_counters={}",
-        perf.hw_execution_time_ns,
-        perf.counter_bytes.len(),
-        perf.counter_words.len(),
-        perf.counters.len()
-    );
-    let top = format_top_counters(perf);
-    if !top.is_empty() {
-        println!("  top counters: {top}");
-    }
 }
 
 fn probe_kernel(spec: KernelSpec) {
@@ -176,19 +142,13 @@ fn probe_kernel(spec: KernelSpec) {
     let (input_b, output_b) = make_io(spec);
     let exe_b = compile_kernel(spec);
     warmup_perf(&exe_b, &input_b, &output_b);
-    let (hw_b, wall_b, perf_b) = collect_perf_samples(&exe_b, &input_b, &output_b);
+    let (hw_b, wall_b) = collect_perf_samples(&exe_b, &input_b, &output_b);
     print_phase("perf warmup -> perf", &hw_b, &wall_b);
-    if let Some(perf) = perf_b.as_ref() {
-        print_perf_snapshot(perf);
-    }
 
     let (input_c, output_c) = make_io(spec);
     let exe_c = compile_kernel(spec);
-    let (hw_c, wall_c, perf_c) = collect_perf_samples(&exe_c, &input_c, &output_c);
+    let (hw_c, wall_c) = collect_perf_samples(&exe_c, &input_c, &output_c);
     print_phase("perf only fresh", &hw_c, &wall_c);
-    if let Some(perf) = perf_c.as_ref() {
-        print_perf_snapshot(perf);
-    }
 }
 
 #[test]
