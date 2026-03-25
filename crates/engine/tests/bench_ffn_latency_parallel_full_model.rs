@@ -11,6 +11,9 @@
 //!
 //! Run 50B equal-shard benchmark:
 //!   cargo test -p engine --test bench_ffn_latency_parallel_full_model --release -- --ignored --nocapture bench_ffn_shard_full_model_50b_equal
+//!
+//! Run 80B equal-shard benchmark:
+//!   cargo test -p engine --test bench_ffn_latency_parallel_full_model --release -- --ignored --nocapture bench_ffn_shard_full_model_80b_equal
 
 use ane_bridge::ane::{Executable, TensorData};
 use engine::cpu::{cross_entropy, embedding, rmsnorm, silu, vdsp};
@@ -86,6 +89,10 @@ fn cfg_50b() -> ModelConfig {
     custom_config(5120, 13824, 40, 160, 512)
 }
 
+fn cfg_80b() -> ModelConfig {
+    custom_config(5120, 13824, 40, 256, 512)
+}
+
 fn deterministic_tokens(cfg: &ModelConfig) -> (Vec<u32>, Vec<u32>) {
     let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
     let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
@@ -129,14 +136,40 @@ fn read_channels_into(src: &[f32], total_ch: usize, seq: usize, ch_start: usize,
     dst.copy_from_slice(&src[start..end]);
 }
 
-fn slice_weight_columns(src: &[f32], rows: usize, cols: usize, col_start: usize, col_count: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; rows * col_count];
+fn stage_weight_columns(
+    dst: &mut [f32],
+    rows: usize,
+    sp_width: usize,
+    src: &[f32],
+    total_cols: usize,
+    col_start: usize,
+    col_count: usize,
+    sp_offset: usize,
+) {
     for r in 0..rows {
-        let src_row = r * cols + col_start;
-        let dst_row = r * col_count;
-        out[dst_row..dst_row + col_count].copy_from_slice(&src[src_row..src_row + col_count]);
+        let src_row = r * total_cols + col_start;
+        let dst_row = r * sp_width + sp_offset;
+        dst[dst_row..dst_row + col_count]
+            .copy_from_slice(&src[src_row..src_row + col_count]);
     }
-    out
+}
+
+fn stage_transposed_weight_columns(
+    dst: &mut [f32],
+    src: &[f32],
+    rows: usize,
+    total_cols: usize,
+    col_start: usize,
+    col_count: usize,
+    sp_width: usize,
+    sp_offset: usize,
+) {
+    for c in 0..col_count {
+        let dst_row = c * sp_width + sp_offset;
+        for r in 0..rows {
+            dst[dst_row + r] = src[r * total_cols + col_start + c];
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -300,11 +333,10 @@ struct WoRunner {
     output: TensorData,
 }
 
-#[derive(Clone)]
-struct ShardWeights {
-    w1: Vec<f32>,
-    w3: Vec<f32>,
-    w2: Vec<f32>,
+#[derive(Clone, Copy)]
+struct ShardLayout {
+    col_start: usize,
+    col_count: usize,
 }
 
 struct ShardWorker {
@@ -317,8 +349,6 @@ struct ShardWorker {
     h1: Vec<f32>,
     h3: Vec<f32>,
     gate: Vec<f32>,
-    w2t: Vec<f32>,
-    partial_out: Vec<f32>,
 }
 
 struct LayerScratch {
@@ -356,7 +386,7 @@ struct ShardedFfnRunner {
     wo: WoRunner,
     workers: Vec<ShardWorker>,
     layer_scratch: LayerScratch,
-    model_shard_weights: Vec<Vec<ShardWeights>>,
+    shard_layouts: Vec<ShardLayout>,
 }
 
 struct BaselineRunner {
@@ -406,29 +436,17 @@ fn compile_wo_runner(cfg: &ModelConfig) -> WoRunner {
     }
 }
 
-fn shard_layer_weights(weights: &LayerWeights, cfg: &ModelConfig, shard_count: usize) -> Vec<ShardWeights> {
+fn shard_layouts(cfg: &ModelConfig, shard_count: usize) -> Vec<ShardLayout> {
     let shard_hidden = cfg.hidden / shard_count;
     (0..shard_count)
-        .map(|i| {
-            let start = i * shard_hidden;
-            ShardWeights {
-                w1: slice_weight_columns(&weights.w1, cfg.dim, cfg.hidden, start, shard_hidden),
-                w3: slice_weight_columns(&weights.w3, cfg.dim, cfg.hidden, start, shard_hidden),
-                w2: slice_weight_columns(&weights.w2, cfg.dim, cfg.hidden, start, shard_hidden),
-            }
+        .map(|i| ShardLayout {
+            col_start: i * shard_hidden,
+            col_count: shard_hidden,
         })
         .collect()
 }
 
-fn shard_model_weights(weights: &ModelWeights, cfg: &ModelConfig, shard_count: usize) -> Vec<Vec<ShardWeights>> {
-    weights
-        .layers
-        .iter()
-        .map(|layer| shard_layer_weights(layer, cfg, shard_count))
-        .collect()
-}
-
-fn compile_sharded_runner(cfg: &ModelConfig, weights: &ModelWeights, shard_count: usize) -> (ShardedFfnRunner, f32) {
+fn compile_sharded_runner(cfg: &ModelConfig, shard_count: usize) -> (ShardedFfnRunner, f32) {
     assert!(cfg.hidden % shard_count == 0, "hidden must be divisible by shard count");
     let shard_hidden = cfg.hidden / shard_count;
     let qos = NSQualityOfService::UserInteractive;
@@ -455,8 +473,6 @@ fn compile_sharded_runner(cfg: &ModelConfig, weights: &ModelWeights, shard_count
             h1: vec![0.0; shard_hidden * cfg.seq],
             h3: vec![0.0; shard_hidden * cfg.seq],
             gate: vec![0.0; shard_hidden * cfg.seq],
-            w2t: vec![0.0; shard_hidden * cfg.dim],
-            partial_out: vec![0.0; cfg.dim * cfg.seq],
         });
     }
     let compile_s = t0.elapsed().as_secs_f32();
@@ -468,7 +484,7 @@ fn compile_sharded_runner(cfg: &ModelConfig, weights: &ModelWeights, shard_count
             wo,
             workers,
             layer_scratch: LayerScratch::new(cfg),
-            model_shard_weights: shard_model_weights(weights, cfg, shard_count),
+            shard_layouts: shard_layouts(cfg, shard_count),
         },
         compile_s,
     )
@@ -588,7 +604,7 @@ fn run_wo(
 fn run_sharded_layer_forward_into(
     runner: &mut ShardedFfnRunner,
     layer_weights: &LayerWeights,
-    shard_weights: &[ShardWeights],
+    shard_layouts: &[ShardLayout],
     x: &[f32],
     x_next: &mut [f32],
 ) -> (f32, u64) {
@@ -619,10 +635,10 @@ fn run_sharded_layer_forward_into(
 
     thread::scope(|scope| {
         let mut handles = Vec::with_capacity(runner.shard_count);
-        for (worker, shard_w) in runner.workers.iter_mut().zip(shard_weights.iter()) {
+        for (worker, shard) in runner.workers.iter_mut().zip(shard_layouts.iter()) {
             let barrier = Arc::clone(&barrier);
             handles.push(scope.spawn(move || {
-                let shard_hidden = shard_w.w1.len() / dim;
+                let shard_hidden = shard.col_count;
                 let w13_sp = dyn_matmul::dual_separate_spatial_width(seq, shard_hidden);
                 let w2_sp = dyn_matmul::spatial_width(seq, dim);
 
@@ -632,8 +648,17 @@ fn run_sharded_layer_forward_into(
                     let mut locked = worker.w13_in.as_f32_slice_mut();
                     let buf = &mut *locked;
                     stage_spatial(buf, dim, w13_sp, x2norm_ref, seq, 0);
-                    stage_spatial(buf, dim, w13_sp, &shard_w.w1, shard_hidden, seq);
-                    stage_spatial(buf, dim, w13_sp, &shard_w.w3, shard_hidden, seq + shard_hidden);
+                    stage_weight_columns(buf, dim, w13_sp, &layer_weights.w1, cfg.hidden, shard.col_start, shard_hidden, seq);
+                    stage_weight_columns(
+                        buf,
+                        dim,
+                        w13_sp,
+                        &layer_weights.w3,
+                        cfg.hidden,
+                        shard.col_start,
+                        shard_hidden,
+                        seq + shard_hidden,
+                    );
                 }
                 worker.w13_exe
                     .run_cached_direct(&[&worker.w13_in], &[&worker.w13_out])
@@ -646,21 +671,24 @@ fn run_sharded_layer_forward_into(
 
                 silu::silu_gate(&worker.h1, &worker.h3, &mut worker.gate);
 
-                vdsp::mtrans(&shard_w.w2, shard_hidden, &mut worker.w2t, dim, dim, shard_hidden);
                 {
                     let mut locked = worker.w2_in.as_f32_slice_mut();
                     let buf = &mut *locked;
                     stage_spatial(buf, shard_hidden, w2_sp, &worker.gate, seq, 0);
-                    stage_spatial(buf, shard_hidden, w2_sp, &worker.w2t, dim, seq);
+                    stage_transposed_weight_columns(
+                        buf,
+                        &layer_weights.w2,
+                        dim,
+                        cfg.hidden,
+                        shard.col_start,
+                        shard_hidden,
+                        w2_sp,
+                        seq,
+                    );
                 }
                 worker.w2_exe
                     .run_cached_direct(&[&worker.w2_in], &[&worker.w2_out])
                     .expect("w2 shard run");
-                {
-                    let locked = worker.w2_out.as_f32_slice();
-                    let len = worker.partial_out.len();
-                    worker.partial_out.copy_from_slice(&locked[..len]);
-                }
             }));
         }
 
@@ -672,7 +700,8 @@ fn run_sharded_layer_forward_into(
 
     scratch.ffn_out.fill(0.0);
     for worker in &runner.workers {
-        vdsp::vadd(&scratch.ffn_out, &worker.partial_out, &mut scratch.merge_tmp);
+        let locked = worker.w2_out.as_f32_slice();
+        vdsp::vadd(&scratch.ffn_out, &locked[..scratch.ffn_out.len()], &mut scratch.merge_tmp);
         scratch.ffn_out.copy_from_slice(&scratch.merge_tmp);
     }
     vdsp::vsma(&scratch.ffn_out, alpha, &scratch.x2, x_next);
@@ -682,7 +711,7 @@ fn run_sharded_layer_forward_into(
 fn run_sharded_layer_forward_into_stats(
     runner: &mut ShardedFfnRunner,
     layer_weights: &LayerWeights,
-    shard_weights: &[ShardWeights],
+    shard_layouts: &[ShardLayout],
     x: &[f32],
     x_next: &mut [f32],
 ) -> (f32, u64) {
@@ -713,10 +742,10 @@ fn run_sharded_layer_forward_into_stats(
 
     thread::scope(|scope| {
         let mut handles = Vec::with_capacity(runner.shard_count);
-        for (worker, shard_w) in runner.workers.iter_mut().zip(shard_weights.iter()) {
+        for (worker, shard) in runner.workers.iter_mut().zip(shard_layouts.iter()) {
             let barrier = Arc::clone(&barrier);
             handles.push(scope.spawn(move || -> u64 {
-                let shard_hidden = shard_w.w1.len() / dim;
+                let shard_hidden = shard.col_count;
                 let w13_sp = dyn_matmul::dual_separate_spatial_width(seq, shard_hidden);
                 let w2_sp = dyn_matmul::spatial_width(seq, dim);
 
@@ -726,8 +755,17 @@ fn run_sharded_layer_forward_into_stats(
                     let mut locked = worker.w13_in.as_f32_slice_mut();
                     let buf = &mut *locked;
                     stage_spatial(buf, dim, w13_sp, x2norm_ref, seq, 0);
-                    stage_spatial(buf, dim, w13_sp, &shard_w.w1, shard_hidden, seq);
-                    stage_spatial(buf, dim, w13_sp, &shard_w.w3, shard_hidden, seq + shard_hidden);
+                    stage_weight_columns(buf, dim, w13_sp, &layer_weights.w1, cfg.hidden, shard.col_start, shard_hidden, seq);
+                    stage_weight_columns(
+                        buf,
+                        dim,
+                        w13_sp,
+                        &layer_weights.w3,
+                        cfg.hidden,
+                        shard.col_start,
+                        shard_hidden,
+                        seq + shard_hidden,
+                    );
                 }
                 let mut shard_hw_ns = worker
                     .w13_exe
@@ -741,22 +779,25 @@ fn run_sharded_layer_forward_into_stats(
 
                 silu::silu_gate(&worker.h1, &worker.h3, &mut worker.gate);
 
-                vdsp::mtrans(&shard_w.w2, shard_hidden, &mut worker.w2t, dim, dim, shard_hidden);
                 {
                     let mut locked = worker.w2_in.as_f32_slice_mut();
                     let buf = &mut *locked;
                     stage_spatial(buf, shard_hidden, w2_sp, &worker.gate, seq, 0);
-                    stage_spatial(buf, shard_hidden, w2_sp, &worker.w2t, dim, seq);
+                    stage_transposed_weight_columns(
+                        buf,
+                        &layer_weights.w2,
+                        dim,
+                        cfg.hidden,
+                        shard.col_start,
+                        shard_hidden,
+                        w2_sp,
+                        seq,
+                    );
                 }
                 shard_hw_ns += worker
                     .w2_exe
                     .run_cached_with_stats(&[&worker.w2_in], &[&worker.w2_out])
                     .expect("w2 shard stats run");
-                {
-                    let locked = worker.w2_out.as_f32_slice();
-                    let len = worker.partial_out.len();
-                    worker.partial_out.copy_from_slice(&locked[..len]);
-                }
                 shard_hw_ns
             }));
         }
@@ -769,7 +810,8 @@ fn run_sharded_layer_forward_into_stats(
 
     scratch.ffn_out.fill(0.0);
     for worker in &runner.workers {
-        vdsp::vadd(&scratch.ffn_out, &worker.partial_out, &mut scratch.merge_tmp);
+        let locked = worker.w2_out.as_f32_slice();
+        vdsp::vadd(&scratch.ffn_out, &locked[..scratch.ffn_out.len()], &mut scratch.merge_tmp);
         scratch.ffn_out.copy_from_slice(&scratch.merge_tmp);
     }
     vdsp::vsma(&scratch.ffn_out, alpha, &scratch.x2, x_next);
@@ -986,13 +1028,13 @@ fn run_sharded_full_forward_once(
     vdsp::mtrans(&ws.x_row, dim, &mut ws.x_buf, seq, seq, dim);
 
     let mut total_ffn_ms = 0.0f32;
-    for (layer_idx, layer_weights) in weights.layers.iter().enumerate() {
-        let shard_weights = runner.model_shard_weights[layer_idx].clone();
+    for layer_weights in &weights.layers {
+        let shard_layouts = runner.shard_layouts.clone();
         let x_buf = ws.x_buf.clone();
         let (ffn_ms, _) = run_sharded_layer_forward_into(
             runner,
             layer_weights,
-            &shard_weights,
+            &shard_layouts,
             &x_buf,
             &mut ws.x_next_buf,
         );
@@ -1021,13 +1063,13 @@ fn run_sharded_full_forward_once_with_stats(
 
     let mut total_ffn_ms = 0.0f32;
     let mut total_hw_ns = 0u64;
-    for (layer_idx, layer_weights) in weights.layers.iter().enumerate() {
-        let shard_weights = runner.model_shard_weights[layer_idx].clone();
+    for layer_weights in &weights.layers {
+        let shard_layouts = runner.shard_layouts.clone();
         let x_buf = ws.x_buf.clone();
         let (ffn_ms, hw_ns) = run_sharded_layer_forward_into_stats(
             runner,
             layer_weights,
-            &shard_weights,
+            &shard_layouts,
             &x_buf,
             &mut ws.x_next_buf,
         );
@@ -1135,7 +1177,7 @@ fn measure_sharded_ane_stats(
     shard_count: usize,
 ) -> AneSample {
     let softcap = TrainConfig::default().softcap;
-    let (mut runner, _) = compile_sharded_runner(cfg, weights, shard_count);
+    let (mut runner, _) = compile_sharded_runner(cfg, shard_count);
     let mut ws = ModelForwardWorkspace::new_lean(cfg);
 
     let (warmup, _) = run_sharded_full_forward_once_with_stats(
@@ -1288,7 +1330,7 @@ fn run_sharded_mode(
     baseline_mean_ms: f32,
 ) -> ModeResult {
     let softcap = TrainConfig::default().softcap;
-    let (mut runner, compile_s) = compile_sharded_runner(cfg, weights, shard_count);
+    let (mut runner, compile_s) = compile_sharded_runner(cfg, shard_count);
     let mut ws = ModelForwardWorkspace::new_lean(cfg);
     let mut peak_rss_mb = rss_mb().unwrap_or(0.0);
 
@@ -1678,4 +1720,89 @@ fn bench_ffn_shard_full_model_50b_equal() {
 
     write_json(&json_path("50b"), &result);
     write_selected_summary(&result, &summary_path("50b"));
+}
+
+#[test]
+#[ignore]
+fn ffn_shard_full_model_smoke_80b_matches_baseline() {
+    let _guard = run_lock().lock().unwrap();
+    let cfg = cfg_80b();
+    let weights = ModelWeights::random(&cfg);
+    let (tokens, targets) = deterministic_tokens(&cfg);
+    let (baseline, baseline_logits, baseline_loss) = run_baseline_mode(&cfg, &weights, &tokens, &targets);
+
+    let shard2 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 2, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
+    let shard4 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 4, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
+    let shard6 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 6, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
+    let shard8 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 8, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
+    let shard12 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 12, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
+    let shard16 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 16, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
+    let shard24 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 24, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
+    let shard32 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 32, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
+
+    assert!(shard2.correctness_pass, "80B shard2 correctness failed: {:?}", shard2.diff_vs_baseline);
+    assert!(shard4.correctness_pass, "80B shard4 correctness failed: {:?}", shard4.diff_vs_baseline);
+    assert!(shard6.correctness_pass, "80B shard6 correctness failed: {:?}", shard6.diff_vs_baseline);
+    assert!(shard8.correctness_pass, "80B shard8 correctness failed: {:?}", shard8.diff_vs_baseline);
+    assert!(shard12.correctness_pass, "80B shard12 correctness failed: {:?}", shard12.diff_vs_baseline);
+    assert!(shard16.correctness_pass, "80B shard16 correctness failed: {:?}", shard16.diff_vs_baseline);
+    assert!(shard24.correctness_pass, "80B shard24 correctness failed: {:?}", shard24.diff_vs_baseline);
+    assert!(shard32.correctness_pass, "80B shard32 correctness failed: {:?}", shard32.diff_vs_baseline);
+}
+
+#[test]
+#[ignore]
+fn bench_ffn_shard_full_model_80b_equal() {
+    let _guard = run_lock().lock().unwrap();
+    let cfg = cfg_80b();
+    let weights = ModelWeights::random(&cfg);
+    let (tokens, targets) = deterministic_tokens(&cfg);
+    let (baseline, baseline_logits, baseline_loss) = run_baseline_mode(&cfg, &weights, &tokens, &targets);
+
+    let shard2 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 2, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
+    let shard4 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 4, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
+    let shard6 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 6, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
+    let shard8 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 8, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
+    let shard12 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 12, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
+    let shard16 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 16, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
+    let shard24 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 24, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
+    let shard32 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 32, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
+
+    assert!(shard2.correctness_pass, "80B shard2 correctness failed");
+    assert!(shard4.correctness_pass, "80B shard4 correctness failed");
+    assert!(shard6.correctness_pass, "80B shard6 correctness failed");
+    assert!(shard8.correctness_pass, "80B shard8 correctness failed");
+    assert!(shard12.correctness_pass, "80B shard12 correctness failed");
+    assert!(shard16.correctness_pass, "80B shard16 correctness failed");
+    assert!(shard24.correctness_pass, "80B shard24 correctness failed");
+    assert!(shard32.correctness_pass, "80B shard32 correctness failed");
+
+    let modes = vec![shard2, shard4, shard6, shard8, shard12, shard16, shard24, shard32];
+    let winning_modes = modes
+        .iter()
+        .filter_map(|m| m.meets_perf_gate.then_some(m.mode.clone()))
+        .collect::<Vec<_>>();
+
+    let result = SelectedExperimentResult {
+        config_name: "80B".to_string(),
+        dim: cfg.dim,
+        hidden: cfg.hidden,
+        heads: cfg.heads,
+        nlayers: cfg.nlayers,
+        seq: cfg.seq,
+        baseline,
+        modes,
+        primary_success: !winning_modes.is_empty(),
+        winning_modes,
+        thresholds: Thresholds {
+            max_abs_diff_tol: MAX_ABS_DIFF_TOL,
+            mean_abs_diff_tol: MEAN_ABS_DIFF_TOL,
+            cosine_similarity_tol: COSINE_SIM_TOL,
+            loss_abs_diff_tol: LOSS_ABS_DIFF_TOL,
+            perf_win_pct_tol: PERF_WIN_PCT_TOL,
+        },
+    };
+
+    write_json(&json_path("80b"), &result);
+    write_selected_summary(&result, &summary_path("80b"));
 }
