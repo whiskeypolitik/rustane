@@ -69,6 +69,34 @@ impl Default for TrainConfig {
     }
 }
 
+/// Training-path parallelization controls.
+///
+/// Phase 4 scaffolding only: all current training code still executes the
+/// baseline path. These fields exist so training benchmarks and the trainer
+/// can thread an explicit options object before sharded forward/backward is
+/// enabled.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrainingParallelOptions {
+    pub forward_attn_request: Option<usize>,
+    pub forward_ffn_request: Option<usize>,
+    pub backward_attn_request: Option<usize>,
+    pub backward_ffn_request: Option<usize>,
+}
+
+impl TrainingParallelOptions {
+    pub fn disabled() -> Self {
+        Self::default()
+    }
+
+    pub fn forward_enabled(&self) -> bool {
+        self.forward_attn_request.is_some() || self.forward_ffn_request.is_some()
+    }
+
+    pub fn backward_enabled(&self) -> bool {
+        self.backward_attn_request.is_some() || self.backward_ffn_request.is_some()
+    }
+}
+
 /// Everything needed from forward pass for backward.
 pub struct ForwardResult {
     pub loss: f32,
@@ -414,6 +442,38 @@ pub fn backward_ws(
     // 6. Embedding backward (after dembed sgemm completes)
     embedding::backward_channel_first(&bwd_ws.dy, dim, tokens, &mut grads.dembed);
     0.0 // caller should use grad_norm() if needed
+}
+
+pub fn forward_ws_with_options(
+    cfg: &ModelConfig,
+    kernels: &CompiledKernels,
+    weights: &ModelWeights,
+    tokens: &[u32],
+    targets: &[u32],
+    softcap: f32,
+    ws: &mut ModelForwardWorkspace,
+    options: &TrainingParallelOptions,
+) -> f32 {
+    let _ = options;
+    forward_ws(cfg, kernels, weights, tokens, targets, softcap, ws)
+}
+
+pub fn backward_ws_with_options(
+    cfg: &ModelConfig,
+    kernels: &CompiledKernels,
+    weights: &ModelWeights,
+    fwd_ws: &ModelForwardWorkspace,
+    tokens: &[u32],
+    softcap: f32,
+    loss_scale: f32,
+    grads: &mut ModelGrads,
+    bwd_ws: &mut ModelBackwardWorkspace,
+    options: &TrainingParallelOptions,
+) -> f32 {
+    let _ = options;
+    backward_ws(
+        cfg, kernels, weights, fwd_ws, tokens, softcap, loss_scale, grads, bwd_ws,
+    )
 }
 
 /// Cosine LR schedule with linear warmup.
@@ -769,6 +829,36 @@ pub fn train_step(
     fwd_ws: &mut ModelForwardWorkspace,
     bwd_ws: &mut ModelBackwardWorkspace,
 ) -> f32 {
+    train_step_with_options(
+        cfg,
+        kernels,
+        weights,
+        grads,
+        opt,
+        data,
+        step,
+        tc,
+        metal_adam,
+        fwd_ws,
+        bwd_ws,
+        &TrainingParallelOptions::disabled(),
+    )
+}
+
+pub fn train_step_with_options(
+    cfg: &ModelConfig,
+    kernels: &CompiledKernels,
+    weights: &mut ModelWeights,
+    grads: &mut ModelGrads,
+    opt: &mut ModelOptState,
+    data: &[u16],          // all training tokens
+    step: u32,
+    tc: &TrainConfig,
+    metal_adam: &MetalAdam,
+    fwd_ws: &mut ModelForwardWorkspace,
+    bwd_ws: &mut ModelBackwardWorkspace,
+    options: &TrainingParallelOptions,
+) -> f32 {
     let seq = cfg.seq;
     grads.zero_out();
 
@@ -781,13 +871,13 @@ pub fn train_step(
         let input_tokens: Vec<u32> = data[pos..pos + seq].iter().map(|&t| t as u32).collect();
         let target_tokens: Vec<u32> = data[pos + 1..pos + seq + 1].iter().map(|&t| t as u32).collect();
 
-        let loss = forward_ws(
-            cfg, kernels, weights, &input_tokens, &target_tokens, tc.softcap, fwd_ws,
+        let loss = forward_ws_with_options(
+            cfg, kernels, weights, &input_tokens, &target_tokens, tc.softcap, fwd_ws, options,
         );
         total_loss += loss;
 
-        backward_ws(
-            cfg, kernels, weights, fwd_ws, &input_tokens, tc.softcap, tc.loss_scale, grads, bwd_ws,
+        backward_ws_with_options(
+            cfg, kernels, weights, fwd_ws, &input_tokens, tc.softcap, tc.loss_scale, grads, bwd_ws, options,
         );
     }
 

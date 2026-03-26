@@ -7,7 +7,7 @@
 //! Run one:    cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_600m_a
 //! By scale:   cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_all_600m
 
-use engine::full_model::{self, ModelWeights, ModelGrads, ModelOptState, ModelForwardWorkspace, ModelBackwardWorkspace, TrainConfig};
+use engine::full_model::{self, ModelWeights, ModelGrads, ModelOptState, ModelForwardWorkspace, ModelBackwardWorkspace, TrainConfig, TrainingParallelOptions};
 use engine::layer::CompiledKernels;
 use engine::model::ModelConfig;
 use engine::metal_adam::MetalAdam;
@@ -59,6 +59,7 @@ fn run_sweep(cfg: &ModelConfig, name: &str) -> SweepResult {
 fn run_sweep_with_tc(cfg: &ModelConfig, name: &str, tc: TrainConfig) -> SweepResult {
     let params_m = cfg.param_count() as f64 / 1e6;
     let hd_ratio = cfg.hidden as f64 / cfg.dim as f64;
+    let training_parallel = TrainingParallelOptions::disabled();
 
     println!("\n{}", "=".repeat(60));
     println!("  {name} — {d}d/{h}h/{nl}L/seq{s} — ~{p:.0}M params — h/d={r:.2}x",
@@ -78,7 +79,9 @@ fn run_sweep_with_tc(cfg: &ModelConfig, name: &str, tc: TrainConfig) -> SweepRes
     let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
     let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
     let mut fwd_ws = ModelForwardWorkspace::new(cfg);
-    let loss0 = full_model::forward_ws(cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
+    let loss0 = full_model::forward_ws_with_options(
+        cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws, &training_parallel,
+    );
     assert!(loss0.is_finite(), "initial loss is not finite: {loss0}");
     println!("loss={loss0:.4}");
 
@@ -92,16 +95,22 @@ fn run_sweep_with_tc(cfg: &ModelConfig, name: &str, tc: TrainConfig) -> SweepRes
     let mut losses = vec![loss0];
     for step in 0..10u32 {
         grads.zero_out();
-        let loss = full_model::forward_ws(cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
+        let loss = full_model::forward_ws_with_options(
+            cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws, &training_parallel,
+        );
         losses.push(loss);
-        full_model::backward_ws(cfg, &kernels, &weights, &fwd_ws, &tokens, tc.softcap, tc.loss_scale, &mut grads, &mut bwd_ws);
+        full_model::backward_ws_with_options(
+            cfg, &kernels, &weights, &fwd_ws, &tokens, tc.softcap, tc.loss_scale, &mut grads, &mut bwd_ws, &training_parallel,
+        );
         let gsc = 1.0 / tc.loss_scale;
         let raw_norm = full_model::grad_norm(&grads);
         let combined_scale = if raw_norm * gsc > tc.grad_clip { tc.grad_clip / raw_norm } else { gsc };
         let lr = full_model::learning_rate(step, &tc);
         full_model::update_weights(cfg, &mut weights, &grads, &mut opt, step + 1, lr, &tc, &metal_adam, combined_scale);
     }
-    let final_loss = full_model::forward_ws(cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
+    let final_loss = full_model::forward_ws_with_options(
+        cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws, &training_parallel,
+    );
     losses.push(final_loss);
 
     let loss_delta = final_loss - loss0;
@@ -120,11 +129,15 @@ fn run_sweep_with_tc(cfg: &ModelConfig, name: &str, tc: TrainConfig) -> SweepRes
         let t_total = Instant::now();
 
         let t_fwd = Instant::now();
-        let _loss = full_model::forward_ws(cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
+        let _loss = full_model::forward_ws_with_options(
+            cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws, &training_parallel,
+        );
         let fwd_ms = t_fwd.elapsed().as_secs_f32() * 1000.0;
 
         let t_bwd = Instant::now();
-        full_model::backward_ws(cfg, &kernels, &weights, &fwd_ws, &tokens, tc.softcap, tc.loss_scale, &mut grads, &mut bwd_ws);
+        full_model::backward_ws_with_options(
+            cfg, &kernels, &weights, &fwd_ws, &tokens, tc.softcap, tc.loss_scale, &mut grads, &mut bwd_ws, &training_parallel,
+        );
         let bwd_ms = t_bwd.elapsed().as_secs_f32() * 1000.0;
 
         let gsc = 1.0 / tc.loss_scale;

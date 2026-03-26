@@ -7,7 +7,7 @@
 //!   [--steps 72000] [--val-interval 500] [--val-steps 20]
 
 use engine::data::{TokenData, TokenBytes, compute_bpb};
-use engine::full_model::{self, ModelWeights, ModelGrads, ModelOptState, ModelForwardWorkspace, ModelBackwardWorkspace, TrainConfig};
+use engine::full_model::{self, ModelWeights, ModelGrads, ModelOptState, ModelForwardWorkspace, ModelBackwardWorkspace, TrainConfig, TrainingParallelOptions};
 use engine::layer::CompiledKernels;
 use engine::metal_adam::MetalAdam;
 use engine::model::ModelConfig;
@@ -330,6 +330,7 @@ fn main() {
     let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
 
     let mut tc = TrainConfig::default();
+    let training_parallel = TrainingParallelOptions::disabled();
     tc.total_steps = args.total_steps;
     tc.warmup_steps = args.warmup_steps;
     tc.max_lr = args.max_lr;
@@ -384,12 +385,12 @@ fn main() {
             let input_tokens = train_data.tokens(pos, seq);
             let target_tokens = train_data.tokens(pos + 1, seq);
 
-            let loss = full_model::forward_ws(
-                &cfg, kernels, &weights, &input_tokens, &target_tokens, tc.softcap, &mut fwd_ws,
+            let loss = full_model::forward_ws_with_options(
+                &cfg, kernels, &weights, &input_tokens, &target_tokens, tc.softcap, &mut fwd_ws, &training_parallel,
             );
             total_loss += loss;
-            full_model::backward_ws(
-                &cfg, kernels, &weights, &fwd_ws, &input_tokens, tc.softcap, tc.loss_scale, &mut grads, &mut bwd_ws,
+            full_model::backward_ws_with_options(
+                &cfg, kernels, &weights, &fwd_ws, &input_tokens, tc.softcap, tc.loss_scale, &mut grads, &mut bwd_ws, &training_parallel,
             );
         }
 
@@ -451,4 +452,3 @@ fn main() {
         println!("  best val_bpb: {best_bpb:.4}");
     }
 }
-
