@@ -130,7 +130,7 @@ impl TrainingParallelOptions {
             forward_attn_request: attn_request.filter(|&v| v > 1),
             forward_ffn_request: ffn_request,
             backward_attn_request: None,
-            backward_ffn_request: None,
+            backward_ffn_request: ffn_request,
         })
     }
 }
@@ -195,6 +195,7 @@ pub struct ModelBackwardWorkspace {
     pub dy_buf: Vec<f32>,        // [DIM * SEQ] swap buffer for backward_into
     pub rms_dot_buf: Vec<f32>,   // [SEQ]
     pub layer_ws: BackwardWorkspace,
+    pub training_ffn_sharded: Option<layer::ShardedFfnBackwardRuntime>,
 }
 
 impl ModelBackwardWorkspace {
@@ -206,6 +207,7 @@ impl ModelBackwardWorkspace {
             dy_buf: vec![0.0; cfg.dim * cfg.seq],
             rms_dot_buf: vec![0.0; cfg.seq],
             layer_ws: BackwardWorkspace::new(cfg),
+            training_ffn_sharded: None,
         }
     }
 }
@@ -563,10 +565,99 @@ pub fn backward_ws_with_options(
     bwd_ws: &mut ModelBackwardWorkspace,
     options: &TrainingParallelOptions,
 ) -> f32 {
-    let _ = options;
-    backward_ws(
-        cfg, kernels, weights, fwd_ws, tokens, softcap, loss_scale, grads, bwd_ws,
-    )
+    if let Some(ffn_shards) = options.backward_ffn_request {
+        if bwd_ws
+            .training_ffn_sharded
+            .as_ref()
+            .map(|runtime| runtime.shard_count())
+            != Some(ffn_shards)
+        {
+            bwd_ws.training_ffn_sharded = Some(
+                layer::ShardedFfnBackwardRuntime::compile(cfg, ffn_shards)
+                    .expect("compile training sharded FFN backward runtime"),
+            );
+        }
+
+        let dim = cfg.dim;
+        let seq = cfg.seq;
+        let vocab = cfg.vocab;
+
+        if softcap > 0.0 {
+            let dl = &mut bwd_ws.dl;
+            let dlog = &fwd_ws.dlogits;
+            let t = &fwd_ws.logits_capped;
+            for i in 0..dl.len() {
+                dl[i] = dlog[i] * loss_scale * (1.0 - t[i] * t[i]);
+            }
+        } else {
+            vdsp::vsmul(&fwd_ws.dlogits, loss_scale, &mut bwd_ws.dl);
+        }
+
+        unsafe {
+            vdsp::cblas_sgemm(
+                101, 112, 112,
+                dim as i32, seq as i32, vocab as i32,
+                1.0,
+                weights.embed.as_ptr(), dim as i32,
+                bwd_ws.dl.as_ptr(), vocab as i32,
+                0.0,
+                bwd_ws.dx_final.as_mut_ptr(), seq as i32,
+            );
+        }
+
+        let dl_addr = bwd_ws.dl.as_ptr() as usize;
+        let xf_addr = fwd_ws.x_final.as_ptr() as usize;
+        let de_addr = grads.dembed.as_mut_ptr() as usize;
+        let (sv, sd, ss) = (vocab as i32, dim as i32, seq as i32);
+        std::thread::scope(|s| {
+            let sgemm_handle = s.spawn(move || {
+                unsafe {
+                    vdsp::cblas_sgemm(
+                        101, 112, 112,
+                        sv, sd, ss,
+                        1.0,
+                        dl_addr as *const f32, sv,
+                        xf_addr as *const f32, ss,
+                        1.0,
+                        de_addr as *mut f32, sd,
+                    );
+                }
+            });
+
+            rmsnorm::backward_channel_first(
+                &bwd_ws.dx_final, &fwd_ws.x_prenorm, &weights.gamma_final, &fwd_ws.rms_inv_final,
+                &mut bwd_ws.dy, &mut grads.dgamma_final, dim, seq, &mut bwd_ws.rms_dot_buf,
+            );
+
+            for l in (0..cfg.nlayers).rev() {
+                let sharded_runtime = bwd_ws
+                    .training_ffn_sharded
+                    .as_mut()
+                    .expect("training sharded FFN backward runtime present");
+                layer::backward_into_with_training_ffn(
+                    cfg,
+                    kernels,
+                    &weights.layers[l],
+                    &fwd_ws.caches[l],
+                    &bwd_ws.dy,
+                    &mut grads.layers[l],
+                    &mut bwd_ws.layer_ws,
+                    &mut bwd_ws.dy_buf,
+                    Some(sharded_runtime),
+                );
+                std::mem::swap(&mut bwd_ws.dy, &mut bwd_ws.dy_buf);
+            }
+
+            sgemm_handle.join().expect("dembed sgemm thread panicked");
+        });
+
+        embedding::backward_channel_first(&bwd_ws.dy, dim, tokens, &mut grads.dembed);
+        0.0
+    } else {
+        backward_ws(
+            cfg, kernels, weights, fwd_ws, tokens, softcap, loss_scale, grads, bwd_ws,
+        )
+    }
 }
 
 /// Cosine LR schedule with linear warmup.
