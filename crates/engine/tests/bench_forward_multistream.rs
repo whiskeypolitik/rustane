@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Barrier, Mutex, OnceLock};
+use std::sync::{Arc, Barrier, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,7 +20,13 @@ fn run_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn custom_config(dim: usize, hidden: usize, heads: usize, nlayers: usize, seq: usize) -> ModelConfig {
+fn custom_config(
+    dim: usize,
+    hidden: usize,
+    heads: usize,
+    nlayers: usize,
+    seq: usize,
+) -> ModelConfig {
     ModelConfig {
         dim,
         hidden,
@@ -39,7 +45,11 @@ fn custom_config(dim: usize, hidden: usize, heads: usize, nlayers: usize, seq: u
 fn scenarios() -> Vec<(ModelConfig, &'static str, Vec<usize>)> {
     vec![
         (custom_config(3072, 8192, 24, 44, 512), "5B", vec![1, 2, 4]),
-        (custom_config(5120, 13824, 40, 40, 512), "13B", vec![1, 2, 4]),
+        (
+            custom_config(5120, 13824, 40, 40, 512),
+            "13B",
+            vec![1, 2, 4],
+        ),
         (custom_config(5120, 13824, 40, 64, 512), "20B", vec![1, 2]),
     ]
 }
@@ -94,7 +104,11 @@ fn rss_mb() -> Option<f32> {
     if !output.status.success() {
         return None;
     }
-    let kb: f32 = String::from_utf8(output.stdout).ok()?.trim().parse::<f32>().ok()?;
+    let kb: f32 = String::from_utf8(output.stdout)
+        .ok()?
+        .trim()
+        .parse::<f32>()
+        .ok()?;
     Some(kb / 1024.0)
 }
 
@@ -112,8 +126,12 @@ fn physical_mem_gb() -> Option<f64> {
 }
 
 fn deterministic_tokens(cfg: &ModelConfig) -> (Vec<u32>, Vec<u32>) {
-    let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
-    let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
+    let tokens: Vec<u32> = (0..cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
+    let targets: Vec<u32> = (1..=cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
     (tokens, targets)
 }
 
@@ -126,7 +144,11 @@ fn current_rss_mb() -> Option<f32> {
     if !output.status.success() {
         return None;
     }
-    let kb: f32 = String::from_utf8(output.stdout).ok()?.trim().parse::<f32>().ok()?;
+    let kb: f32 = String::from_utf8(output.stdout)
+        .ok()?
+        .trim()
+        .parse::<f32>()
+        .ok()?;
     Some(kb / 1024.0)
 }
 
@@ -135,10 +157,10 @@ fn shared_weight_mem_gb(cfg: &ModelConfig) -> f64 {
 }
 
 fn per_stream_lean_overhead_gb(cfg: &ModelConfig) -> f64 {
-    let per_layer_cache_mb =
-        (cfg.dim * cfg.seq * 4 * 5 + cfg.hidden * cfg.seq * 4 * 3 + cfg.heads * cfg.seq * cfg.seq * 4)
-            as f64
-            / 1e6;
+    let per_layer_cache_mb = (cfg.dim * cfg.seq * 4 * 5
+        + cfg.hidden * cfg.seq * 4 * 3
+        + cfg.heads * cfg.seq * cfg.seq * 4) as f64
+        / 1e6;
     2.0 * per_layer_cache_mb / 1000.0 + 0.5
 }
 
@@ -158,7 +180,12 @@ fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-fn write_submit_artifact(cfg: &ModelConfig, name: &str, streams: usize, result: &StreamScenarioResult) {
+fn write_submit_artifact(
+    cfg: &ModelConfig,
+    name: &str,
+    streams: usize,
+    result: &StreamScenarioResult,
+) {
     let loss = result.loss.unwrap_or(0.0);
     let ms_per_step = result.total_wall_ms / (result.iter_count as f32 * streams as f32);
     let mut bench = bench_result::BenchResult {
@@ -185,7 +212,11 @@ fn write_submit_artifact(cfg: &ModelConfig, name: &str, streams: usize, result: 
             loss_end: loss,
             loss_delta: 0.0,
         },
-        loss_trace: if result.loss.is_some() { vec![loss] } else { Vec::new() },
+        loss_trace: if result.loss.is_some() {
+            vec![loss]
+        } else {
+            Vec::new()
+        },
         hardware: bench_result::collect_hardware_info(),
         submitter: bench_result::Submitter::default(),
         timestamp_utc: bench_result::utc_timestamp(),
@@ -195,7 +226,12 @@ fn write_submit_artifact(cfg: &ModelConfig, name: &str, streams: usize, result: 
     bench_result::write_result(&bench);
 }
 
-fn run_scenario(cfg: &ModelConfig, name: &str, streams: usize, physical_gb: Option<f64>) -> StreamScenarioResult {
+fn run_scenario(
+    cfg: &ModelConfig,
+    name: &str,
+    streams: usize,
+    physical_gb: Option<f64>,
+) -> StreamScenarioResult {
     const TIMED_ITERS: usize = 3;
     let est_ram_gb = lean_mem_estimate_gb(cfg, streams);
     if let Some(total_gb) = physical_gb {
@@ -243,8 +279,9 @@ fn run_scenario(cfg: &ModelConfig, name: &str, streams: usize, physical_gb: Opti
             handles.push(thread::spawn(move || {
                 let kernels = CompiledKernels::compile_forward_only(&cfg);
                 let mut ws = ModelForwardWorkspace::new_lean(&cfg);
-                let warmup_loss =
-                    full_model::forward_only_ws(&cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut ws);
+                let warmup_loss = full_model::forward_only_ws(
+                    &cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut ws,
+                );
                 if worker_idx == 0 {
                     let _ = loss_tx.send(warmup_loss);
                 }
@@ -252,7 +289,9 @@ fn run_scenario(cfg: &ModelConfig, name: &str, streams: usize, physical_gb: Opti
                 barrier.wait();
                 let t0 = Instant::now();
                 for _ in 0..TIMED_ITERS {
-                    let _ = full_model::forward_only_ws(&cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut ws);
+                    let _ = full_model::forward_only_ws(
+                        &cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut ws,
+                    );
                 }
                 let elapsed_ms = t0.elapsed().as_secs_f32() * 1000.0;
                 tx.send(elapsed_ms).expect("send stream timing");
@@ -349,7 +388,11 @@ fn write_summary(results: &[StreamScenarioResult]) {
                 r.peak_rss_mb
             );
         } else {
-            let _ = writeln!(summary, "| {} | {} | FAIL | FAIL | FAIL | FAIL | FAIL | {:.0} |", r.name, r.streams, r.peak_rss_mb);
+            let _ = writeln!(
+                summary,
+                "| {} | {} | FAIL | FAIL | FAIL | FAIL | FAIL | {:.0} |",
+                r.name, r.streams, r.peak_rss_mb
+            );
         }
     }
 
@@ -357,22 +400,34 @@ fn write_summary(results: &[StreamScenarioResult]) {
     summary.push_str("| scale | streams | scaling vs 1-stream |\n");
     summary.push_str("| --- | ---: | ---: |\n");
     for scale in ["5B", "13B", "20B"] {
-        let base = results.iter().find(|r| r.name == scale && r.streams == 1 && r.success);
+        let base = results
+            .iter()
+            .find(|r| r.name == scale && r.streams == 1 && r.success);
         for r in results.iter().filter(|r| r.name == scale && r.success) {
             let scale_ratio = base
                 .map(|b| r.aggregate_tok_per_s / b.aggregate_tok_per_s)
                 .unwrap_or(0.0);
-            let _ = writeln!(summary, "| {} | {} | {:.2}x |", r.name, r.streams, scale_ratio);
+            let _ = writeln!(
+                summary,
+                "| {} | {} | {:.2}x |",
+                r.name, r.streams, scale_ratio
+            );
         }
     }
 
-    let any_superlinear = results.iter().any(|r| r.streams > 1 && r.success && r.aggregate_tok_per_s > 0.0);
+    let any_superlinear = results
+        .iter()
+        .any(|r| r.streams > 1 && r.success && r.aggregate_tok_per_s > 0.0);
     let recommendation = if any_superlinear {
         "both"
     } else {
         "more FFN optimization"
     };
-    let _ = writeln!(summary, "\n## Recommendation\n\nFocus next on **{}**.\n", recommendation);
+    let _ = writeln!(
+        summary,
+        "\n## Recommendation\n\nFocus next on **{}**.\n",
+        recommendation
+    );
 
     ensure_results_dir();
     fs::write(summary_path(), summary).expect("write summary");
@@ -446,7 +501,10 @@ fn bench_forward_multistream_20b_x4() {
     results.sort_by(|a, b| a.name.cmp(&b.name).then(a.streams.cmp(&b.streams)));
     write_results(&results);
 
-    assert!(results.iter().any(|r| r.name == "20B" && r.streams == 4), "expected 20B x4 result");
+    assert!(
+        results.iter().any(|r| r.name == "20B" && r.streams == 4),
+        "expected 20B x4 result"
+    );
 }
 
 #[test]
@@ -456,16 +514,27 @@ fn diagnose_30b_x4_bringup() {
     let cfg = custom_config(6144, 16384, 48, 64, 512);
     let weights = Arc::new(ModelWeights::random(&cfg));
     println!("diagnose 30B x4 sequential bring-up");
-    println!("rss after weights: {:.0} MB", current_rss_mb().unwrap_or(0.0));
+    println!(
+        "rss after weights: {:.0} MB",
+        current_rss_mb().unwrap_or(0.0)
+    );
 
     let mut workers = Vec::new();
     for worker_idx in 0..4usize {
         println!("worker {}: compile kernels", worker_idx + 1);
         let result = std::panic::catch_unwind(|| {
             let kernels = CompiledKernels::compile(&cfg);
-            println!("worker {}: compiled, rss {:.0} MB", worker_idx + 1, current_rss_mb().unwrap_or(0.0));
+            println!(
+                "worker {}: compiled, rss {:.0} MB",
+                worker_idx + 1,
+                current_rss_mb().unwrap_or(0.0)
+            );
             let mut ws = ModelForwardWorkspace::new_lean(&cfg);
-            println!("worker {}: workspace ready, rss {:.0} MB", worker_idx + 1, current_rss_mb().unwrap_or(0.0));
+            println!(
+                "worker {}: workspace ready, rss {:.0} MB",
+                worker_idx + 1,
+                current_rss_mb().unwrap_or(0.0)
+            );
             let (tokens, targets) = deterministic_tokens(&cfg);
             let _ = full_model::forward_only_ws(
                 &cfg,
@@ -476,7 +545,11 @@ fn diagnose_30b_x4_bringup() {
                 TrainConfig::default().softcap,
                 &mut ws,
             );
-            println!("worker {}: warmup ok, rss {:.0} MB", worker_idx + 1, current_rss_mb().unwrap_or(0.0));
+            println!(
+                "worker {}: warmup ok, rss {:.0} MB",
+                worker_idx + 1,
+                current_rss_mb().unwrap_or(0.0)
+            );
             (kernels, ws)
         });
 

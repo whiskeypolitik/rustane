@@ -1,8 +1,9 @@
 use crate::cpu::{cross_entropy, embedding, rmsnorm, silu, vdsp};
-use crate::full_model::{self, ModelForwardWorkspace, ModelWeights};
+use crate::full_model::{self, ModelForwardWorkspace, ModelWeights, TrainingParallelOptions};
 use crate::kernels::{dyn_matmul, ffn_fused, sdpa_fwd};
-use crate::layer::{tensor_data_new_logged, CompiledKernels, LayerWeights};
+use crate::layer::{CompiledKernels, LayerWeights, tensor_data_new_logged};
 use crate::model::ModelConfig;
+use crate::sharding::{ResolvedBackwardMode, ResolvedForwardMode, ShardRequest, resolve_modes};
 use ane_bridge::ane::{Error as AneError, Executable, TensorData};
 use objc2_foundation::NSQualityOfService;
 use std::fmt;
@@ -28,9 +29,10 @@ pub struct ParallelBenchRequest {
 
 impl ParallelBenchRequest {
     pub fn from_env(policy: ShardPolicy) -> Result<Self, ParallelBenchError> {
+        let request = ShardRequest::from_env().map_err(ParallelBenchError::new)?;
         Ok(Self {
-            attn_request: parse_env_count("ATTN_SHARDS", ATTN_ALLOWED_REQUESTS, true)?,
-            ffn_request: parse_env_count("FFN_SHARDS", FFN_ALLOWED_REQUESTS, false)?,
+            attn_request: request.attn_fwd_shards,
+            ffn_request: request.ffn_fwd_shards,
             policy,
         })
     }
@@ -39,9 +41,16 @@ impl ParallelBenchRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParallelMode {
     Baseline,
-    Attention { shards: usize },
-    Ffn { shards: usize },
-    AttentionFfn { attn_shards: usize, ffn_shards: usize },
+    Attention {
+        shards: usize,
+    },
+    Ffn {
+        shards: usize,
+    },
+    AttentionFfn {
+        attn_shards: usize,
+        ffn_shards: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,8 +115,14 @@ pub struct ParallelBenchRunner {
 }
 
 enum ParallelBenchRunnerKind {
-    Baseline { kernels: CompiledKernels },
-    Mode { runner: ModeRunner },
+    Baseline {
+        kernels: CompiledKernels,
+    },
+    Mode {
+        kernels: CompiledKernels,
+        mode: ResolvedForwardMode,
+        precompiled_runtime: Option<crate::layer::CombinedForwardRuntime>,
+    },
 }
 
 /// Retry a closure when the local ane path reports an IOSurface allocation
@@ -123,19 +138,19 @@ fn compile_with_iosurface_retry<T>(
             Ok(result) => return Ok(result),
             Err(err) => match err {
                 AneError::IOSurfaceAlloc { .. } => {
-                if attempt == max_attempts {
-                    eprintln!(
-                        "      ✗ {label} failed after {max_attempts} attempts, giving up"
-                    );
+                    if attempt == max_attempts {
+                        eprintln!(
+                            "      ✗ {label} failed after {max_attempts} attempts, giving up"
+                        );
                         return Err(err);
-                }
-                eprintln!(
-                    "      ⚠ {label}: IOSurface allocation failed (attempt {attempt}/{max_attempts}), retrying in 2s..."
-                );
-                thread::sleep(Duration::from_secs(2));
+                    }
+                    eprintln!(
+                        "      ⚠ {label}: IOSurface allocation failed (attempt {attempt}/{max_attempts}), retrying in 2s..."
+                    );
+                    thread::sleep(Duration::from_secs(2));
                 }
                 _ => return Err(err),
-            }
+            },
         }
     }
     unreachable!()
@@ -152,33 +167,52 @@ impl ParallelBenchRunner {
             ParallelMode::Baseline => {
                 let t0 = Instant::now();
                 let cfg_clone = cfg.clone();
-                let kernels = compile_with_iosurface_retry(
-                    "ANE kernel compilation",
-                    3,
-                    move || {
+                let kernels =
+                    compile_with_iosurface_retry("ANE kernel compilation", 3, move || {
                         if use_lean_workspace {
                             CompiledKernels::try_compile_forward_only(&cfg_clone)
                         } else {
                             CompiledKernels::try_compile(&cfg_clone)
                         }
-                    },
-                )
-                .map_err(|err| ParallelBenchError::new(format!("ANE kernel compilation: {err}")))?;
+                    })
+                    .map_err(|err| {
+                        ParallelBenchError::new(format!("ANE kernel compilation: {err}"))
+                    })?;
                 (
                     ParallelBenchRunnerKind::Baseline { kernels },
                     t0.elapsed().as_secs_f32(),
                 )
             }
             _ => {
+                let t0 = Instant::now();
                 let cfg_clone = cfg.clone();
-                let mode_clone = resolved.mode.clone();
-                let (runner, compile_s) = compile_with_iosurface_retry(
-                    "ANE sharded kernel compilation",
-                    3,
-                    move || compile_mode_runner(&cfg_clone, &mode_clone),
+                let resolved_mode = convert_parallel_mode(&resolved.mode);
+                let kernels =
+                    compile_with_iosurface_retry("ANE kernel compilation", 3, move || {
+                        if use_lean_workspace {
+                            CompiledKernels::try_compile_forward_only(&cfg_clone)
+                        } else {
+                            CompiledKernels::try_compile(&cfg_clone)
+                        }
+                    })
+                    .map_err(|err| {
+                        ParallelBenchError::new(format!("ANE sharded kernel compilation: {err}"))
+                    })?;
+                let runtime =
+                    compile_with_iosurface_retry("ANE sharded kernel compilation", 3, move || {
+                        crate::layer::CombinedForwardRuntime::compile(cfg, resolved_mode)
+                    })
+                    .map_err(|err| {
+                        ParallelBenchError::new(format!("ANE sharded kernel compilation: {err}"))
+                    })?;
+                (
+                    ParallelBenchRunnerKind::Mode {
+                        kernels,
+                        mode: resolved_mode,
+                        precompiled_runtime: Some(runtime),
+                    },
+                    t0.elapsed().as_secs_f32(),
                 )
-                .map_err(|err| ParallelBenchError::new(format!("ANE sharded kernel compilation: {err}")))?;
-                (ParallelBenchRunnerKind::Mode { runner }, compile_s)
             }
         };
 
@@ -217,9 +251,34 @@ impl ParallelBenchRunner {
                     )
                 }
             }
-            ParallelBenchRunnerKind::Mode { runner } => run_mode_full_forward_once(
-                &self.cfg, runner, ws, weights, tokens, targets, softcap,
-            ),
+            ParallelBenchRunnerKind::Mode {
+                kernels,
+                mode,
+                precompiled_runtime,
+            } => {
+                if ws.combined_forward.as_ref().map(|runtime| runtime.mode()) != Some(*mode) {
+                    ws.combined_forward = precompiled_runtime.take().or_else(|| {
+                        Some(
+                            crate::layer::CombinedForwardRuntime::compile(&self.cfg, *mode)
+                                .expect("compile combined forward runtime"),
+                        )
+                    });
+                }
+                if self.use_lean_workspace {
+                    full_model::forward_only_ws_with_options(
+                        &self.cfg, kernels, weights, tokens, targets, softcap, ws, *mode,
+                    )
+                } else {
+                    let options = TrainingParallelOptions {
+                        forward_mode: *mode,
+                        backward_mode: ResolvedBackwardMode::Baseline,
+                        adjustments: Vec::new(),
+                    };
+                    full_model::forward_ws_with_options(
+                        &self.cfg, kernels, weights, tokens, targets, softcap, ws, &options,
+                    )
+                }
+            }
         }
     }
 }
@@ -253,36 +312,37 @@ fn resolve_parallel_bench_config(
     cfg: &ModelConfig,
     request: ParallelBenchRequest,
 ) -> Result<ResolvedParallelBenchConfig, ParallelBenchError> {
-    let attn_shape = gcd(cfg.heads, cfg.kv_heads);
-    let attn_valid = divisors(attn_shape);
-    let (applied_attn, mut notes) = resolve_shard_count(
-        "ATTN_SHARDS",
-        "attention group count",
-        attn_shape,
-        request.attn_request,
-        request.policy,
-        true,
-        &attn_valid,
-    )?;
-
-    let ffn_valid = divisors(cfg.hidden);
-    let (applied_ffn, ffn_notes) = resolve_shard_count(
-        "FFN_SHARDS",
-        "hidden width",
-        cfg.hidden,
-        request.ffn_request,
-        request.policy,
-        false,
-        &ffn_valid,
-    )?;
-    notes.extend(ffn_notes);
+    let policy = match request.policy {
+        ShardPolicy::FailFast => crate::sharding::ShardPolicy::FailFast,
+        ShardPolicy::AutoAdjustNearest => crate::sharding::ShardPolicy::AutoAdjustNearest,
+    };
+    let resolution = resolve_modes(
+        cfg,
+        ShardRequest::from_forward_requests(request.attn_request, request.ffn_request),
+        policy,
+    )
+    .map_err(ParallelBenchError::new)?;
+    let applied_attn = resolution.forward.attn_shards();
+    let applied_ffn = resolution.forward.ffn_shards();
+    let notes = resolution
+        .adjustments
+        .iter()
+        .map(|adjustment| {
+            format!(
+                "requested {}={}, applied {} ({})",
+                adjustment.axis, adjustment.requested, adjustment.applied, adjustment.reason
+            )
+        })
+        .collect::<Vec<_>>();
 
     let mode = match (applied_attn > 1, applied_ffn > 1) {
         (false, false) => ParallelMode::Baseline,
         (true, false) => ParallelMode::Attention {
             shards: applied_attn,
         },
-        (false, true) => ParallelMode::Ffn { shards: applied_ffn },
+        (false, true) => ParallelMode::Ffn {
+            shards: applied_ffn,
+        },
         (true, true) => ParallelMode::AttentionFfn {
             attn_shards: applied_attn,
             ffn_shards: applied_ffn,
@@ -297,6 +357,23 @@ fn resolve_parallel_bench_config(
         mode,
         notes,
     })
+}
+
+fn convert_parallel_mode(mode: &ParallelMode) -> ResolvedForwardMode {
+    match *mode {
+        ParallelMode::Baseline => ResolvedForwardMode::Baseline,
+        ParallelMode::Attention { shards } => ResolvedForwardMode::AttentionOnly {
+            attn_shards: shards,
+        },
+        ParallelMode::Ffn { shards } => ResolvedForwardMode::FfnOnly { ffn_shards: shards },
+        ParallelMode::AttentionFfn {
+            attn_shards,
+            ffn_shards,
+        } => ResolvedForwardMode::AttentionFfn {
+            attn_shards,
+            ffn_shards,
+        },
+    }
 }
 
 fn resolve_shard_count(
@@ -620,22 +697,30 @@ fn allocate_wo_buffers(exe: Executable, cfg: &ModelConfig) -> WoRunner {
     let sp = dyn_matmul::spatial_width(cfg.seq, cfg.dim);
     WoRunner {
         exe,
-        input: tensor_data_new_logged("parallel_wo_input", ane_bridge::ane::Shape {
-            batch: 1,
-            channels: cfg.q_dim,
-            height: 1,
-            width: sp,
-        }),
-        output: tensor_data_new_logged("parallel_wo_output", ane_bridge::ane::Shape {
-            batch: 1,
-            channels: cfg.dim,
-            height: 1,
-            width: cfg.seq,
-        }),
+        input: tensor_data_new_logged(
+            "parallel_wo_input",
+            ane_bridge::ane::Shape {
+                batch: 1,
+                channels: cfg.q_dim,
+                height: 1,
+                width: sp,
+            },
+        ),
+        output: tensor_data_new_logged(
+            "parallel_wo_output",
+            ane_bridge::ane::Shape {
+                batch: 1,
+                channels: cfg.dim,
+                height: 1,
+                width: cfg.seq,
+            },
+        ),
     }
 }
 
-fn compile_baseline_attention_exes(cfg: &ModelConfig) -> Result<CompiledAttentionArtifacts, AneError> {
+fn compile_baseline_attention_exes(
+    cfg: &ModelConfig,
+) -> Result<CompiledAttentionArtifacts, AneError> {
     Ok(CompiledAttentionArtifacts::Baseline {
         sdpa_exe: compile_sdpa_exe(cfg)?,
         wo_exe: compile_wo_exe(cfg)?,
@@ -700,11 +785,6 @@ fn compile_baseline_ffn_exes(cfg: &ModelConfig) -> Result<CompiledFfnArtifacts, 
     } else {
         dyn_matmul::build(cfg.dim, cfg.hidden, cfg.seq).compile(qos)?
     };
-    let w13_sp = if use_dual_w13 {
-        dyn_matmul::dual_separate_spatial_width(cfg.seq, cfg.hidden)
-    } else {
-        dyn_matmul::spatial_width(cfg.seq, cfg.hidden)
-    };
     let w13_out_channels = if use_dual_w13 {
         2 * cfg.hidden
     } else {
@@ -739,31 +819,43 @@ fn allocate_baseline_ffn_buffers(
         cfg: cfg.clone(),
         use_dual_w13,
         w13_exe,
-        w13_in: tensor_data_new_logged("parallel_baseline_w13_in", ane_bridge::ane::Shape {
-            batch: 1,
-            channels: cfg.dim,
-            height: 1,
-            width: w13_sp,
-        }),
-        w13_out: tensor_data_new_logged("parallel_baseline_w13_out", ane_bridge::ane::Shape {
-            batch: 1,
-            channels: w13_out_channels,
-            height: 1,
-            width: cfg.seq,
-        }),
+        w13_in: tensor_data_new_logged(
+            "parallel_baseline_w13_in",
+            ane_bridge::ane::Shape {
+                batch: 1,
+                channels: cfg.dim,
+                height: 1,
+                width: w13_sp,
+            },
+        ),
+        w13_out: tensor_data_new_logged(
+            "parallel_baseline_w13_out",
+            ane_bridge::ane::Shape {
+                batch: 1,
+                channels: w13_out_channels,
+                height: 1,
+                width: cfg.seq,
+            },
+        ),
         w2_exe,
-        w2_in: tensor_data_new_logged("parallel_baseline_w2_in", ane_bridge::ane::Shape {
-            batch: 1,
-            channels: cfg.hidden,
-            height: 1,
-            width: w2_sp,
-        }),
-        w2_out: tensor_data_new_logged("parallel_baseline_w2_out", ane_bridge::ane::Shape {
-            batch: 1,
-            channels: cfg.dim,
-            height: 1,
-            width: cfg.seq,
-        }),
+        w2_in: tensor_data_new_logged(
+            "parallel_baseline_w2_in",
+            ane_bridge::ane::Shape {
+                batch: 1,
+                channels: cfg.hidden,
+                height: 1,
+                width: w2_sp,
+            },
+        ),
+        w2_out: tensor_data_new_logged(
+            "parallel_baseline_w2_out",
+            ane_bridge::ane::Shape {
+                batch: 1,
+                channels: cfg.dim,
+                height: 1,
+                width: cfg.seq,
+            },
+        ),
         h1: vec![0.0; cfg.hidden * cfg.seq],
         h3: vec![0.0; cfg.hidden * cfg.seq],
         gate: vec![0.0; cfg.hidden * cfg.seq],
@@ -804,30 +896,42 @@ fn allocate_sharded_ffn_runner(
                 layout: worker.layout,
                 w13_exe: worker.w13_exe,
                 w2_exe: worker.w2_exe,
-                w13_in: tensor_data_new_logged("parallel_sharded_w13_in", ane_bridge::ane::Shape {
-                    batch: 1,
-                    channels: cfg.dim,
-                    height: 1,
-                    width: w13_sp,
-                }),
-                w13_out: tensor_data_new_logged("parallel_sharded_w13_out", ane_bridge::ane::Shape {
-                    batch: 1,
-                    channels: 2 * shard_hidden,
-                    height: 1,
-                    width: cfg.seq,
-                }),
-                w2_in: tensor_data_new_logged("parallel_sharded_w2_in", ane_bridge::ane::Shape {
-                    batch: 1,
-                    channels: shard_hidden,
-                    height: 1,
-                    width: w2_sp,
-                }),
-                w2_out: tensor_data_new_logged("parallel_sharded_w2_out", ane_bridge::ane::Shape {
-                    batch: 1,
-                    channels: cfg.dim,
-                    height: 1,
-                    width: cfg.seq,
-                }),
+                w13_in: tensor_data_new_logged(
+                    "parallel_sharded_w13_in",
+                    ane_bridge::ane::Shape {
+                        batch: 1,
+                        channels: cfg.dim,
+                        height: 1,
+                        width: w13_sp,
+                    },
+                ),
+                w13_out: tensor_data_new_logged(
+                    "parallel_sharded_w13_out",
+                    ane_bridge::ane::Shape {
+                        batch: 1,
+                        channels: 2 * shard_hidden,
+                        height: 1,
+                        width: cfg.seq,
+                    },
+                ),
+                w2_in: tensor_data_new_logged(
+                    "parallel_sharded_w2_in",
+                    ane_bridge::ane::Shape {
+                        batch: 1,
+                        channels: shard_hidden,
+                        height: 1,
+                        width: w2_sp,
+                    },
+                ),
+                w2_out: tensor_data_new_logged(
+                    "parallel_sharded_w2_out",
+                    ane_bridge::ane::Shape {
+                        batch: 1,
+                        channels: cfg.dim,
+                        height: 1,
+                        width: cfg.seq,
+                    },
+                ),
                 h1: vec![0.0; shard_hidden * cfg.seq],
                 h3: vec![0.0; shard_hidden * cfg.seq],
                 gate: vec![0.0; shard_hidden * cfg.seq],
@@ -843,18 +947,24 @@ fn allocate_sharded_ffn_runner(
 /// Keep this function purely compile-oriented. It is called inside the typed
 /// `compile_with_iosurface_retry` wrapper above, so it must preserve `Result`
 /// semantics and avoid `TensorData::new()` allocations in the compile phase.
-fn compile_mode_runner(cfg: &ModelConfig, mode: &ParallelMode) -> Result<(ModeRunner, f32), AneError> {
+fn compile_mode_runner(
+    cfg: &ModelConfig,
+    mode: &ParallelMode,
+) -> Result<(ModeRunner, f32), AneError> {
     let t0 = Instant::now();
     let compiled_attn = match mode {
-        ParallelMode::Attention { shards } | ParallelMode::AttentionFfn { attn_shards: shards, .. } => {
-            compile_sharded_attention_exes(cfg, *shards)?
-        }
+        ParallelMode::Attention { shards }
+        | ParallelMode::AttentionFfn {
+            attn_shards: shards,
+            ..
+        } => compile_sharded_attention_exes(cfg, *shards)?,
         _ => compile_baseline_attention_exes(cfg)?,
     };
     let compiled_ffn = match mode {
-        ParallelMode::Ffn { shards } | ParallelMode::AttentionFfn { ffn_shards: shards, .. } => {
-            compile_sharded_ffn_exes(cfg, *shards)?
-        }
+        ParallelMode::Ffn { shards }
+        | ParallelMode::AttentionFfn {
+            ffn_shards: shards, ..
+        } => compile_sharded_ffn_exes(cfg, *shards)?,
         _ => compile_baseline_ffn_exes(cfg)?,
     };
 
@@ -924,8 +1034,7 @@ fn stage_weight_columns(
     for r in 0..rows {
         let src_row = r * total_cols + col_start;
         let dst_row = r * sp_width + sp_offset;
-        dst[dst_row..dst_row + col_count]
-            .copy_from_slice(&src[src_row..src_row + col_count]);
+        dst[dst_row..dst_row + col_count].copy_from_slice(&src[src_row..src_row + col_count]);
     }
 }
 
@@ -1008,7 +1117,14 @@ fn run_baseline_attention_into(
         let attn_locked = runner.sdpa.attn_out.as_f32_slice();
         let mut wo_locked = runner.wo.input.as_f32_slice_mut();
         let buf = &mut *wo_locked;
-        stage_spatial(buf, cfg.q_dim, wo_sp, &attn_locked[..cfg.q_dim * seq], seq, 0);
+        stage_spatial(
+            buf,
+            cfg.q_dim,
+            wo_sp,
+            &attn_locked[..cfg.q_dim * seq],
+            seq,
+            0,
+        );
         stage_spatial(buf, cfg.q_dim, wo_sp, &layer_weights.wo, dim, seq);
     }
     runner
@@ -1129,7 +1245,14 @@ fn run_sharded_attention_into(
                     let attn_locked = worker.sdpa.attn_out.as_f32_slice();
                     let mut wo_locked = worker.wo.input.as_f32_slice_mut();
                     let buf = &mut *wo_locked;
-                    stage_spatial(buf, worker.cfg.q_dim, wo_sp, &attn_locked[..worker.cfg.q_dim * seq], seq, 0);
+                    stage_spatial(
+                        buf,
+                        worker.cfg.q_dim,
+                        wo_sp,
+                        &attn_locked[..worker.cfg.q_dim * seq],
+                        seq,
+                        0,
+                    );
                     stage_spatial(
                         buf,
                         worker.cfg.q_dim,
@@ -1196,7 +1319,16 @@ fn run_baseline_ffn_into(
         let mut locked = runner.w13_in.as_f32_slice_mut();
         let buf = &mut *locked;
         stage_spatial(buf, dim, w13_sp, &scratch.x2norm, seq, 0);
-        stage_weight_columns(buf, dim, w13_sp, &layer_weights.w1, cfg.hidden, 0, cfg.hidden, seq);
+        stage_weight_columns(
+            buf,
+            dim,
+            w13_sp,
+            &layer_weights.w1,
+            cfg.hidden,
+            0,
+            cfg.hidden,
+            seq,
+        );
         if runner.use_dual_w13 {
             stage_weight_columns(
                 buf,
@@ -1241,7 +1373,16 @@ fn run_baseline_ffn_into(
             let mut locked = runner.w13_in.as_f32_slice_mut();
             let buf = &mut *locked;
             stage_spatial(buf, dim, w13_sp, &scratch.x2norm, seq, 0);
-            stage_weight_columns(buf, dim, w13_sp, &layer_weights.w3, cfg.hidden, 0, cfg.hidden, seq);
+            stage_weight_columns(
+                buf,
+                dim,
+                w13_sp,
+                &layer_weights.w3,
+                cfg.hidden,
+                0,
+                cfg.hidden,
+                seq,
+            );
         }
         runner
             .w13_exe
@@ -1258,7 +1399,16 @@ fn run_baseline_ffn_into(
         let mut locked = runner.w2_in.as_f32_slice_mut();
         let buf = &mut *locked;
         stage_spatial(buf, cfg.hidden, w2_sp, &runner.gate, seq, 0);
-        stage_transposed_weight_columns(buf, &layer_weights.w2, dim, cfg.hidden, 0, cfg.hidden, w2_sp, seq);
+        stage_transposed_weight_columns(
+            buf,
+            &layer_weights.w2,
+            dim,
+            cfg.hidden,
+            0,
+            cfg.hidden,
+            w2_sp,
+            seq,
+        );
     }
     runner
         .w2_exe
@@ -1328,7 +1478,14 @@ fn run_sharded_ffn_into(
                     .expect("sharded ffn w13 run");
                 {
                     let locked = worker.w13_out.as_f32_slice();
-                    read_channels_into(&locked, 2 * shard_hidden, seq, 0, shard_hidden, &mut worker.h1);
+                    read_channels_into(
+                        &locked,
+                        2 * shard_hidden,
+                        seq,
+                        0,
+                        shard_hidden,
+                        &mut worker.h1,
+                    );
                     read_channels_into(
                         &locked,
                         2 * shard_hidden,
@@ -1428,7 +1585,14 @@ fn finalize_logits_and_loss(
     );
     vdsp::mtrans(&ws.x_final, seq, &mut ws.x_final_row, dim, dim, seq);
     ws.logits.fill(0.0);
-    vdsp::sgemm_at(&ws.x_final_row, seq, dim, &weights.embed, vocab, &mut ws.logits);
+    vdsp::sgemm_at(
+        &ws.x_final_row,
+        seq,
+        dim,
+        &weights.embed,
+        vocab,
+        &mut ws.logits,
+    );
 
     if softcap > 0.0 {
         vdsp::sscal(&mut ws.logits, 1.0 / softcap);
@@ -1503,7 +1667,10 @@ mod tests {
     fn parse_rejects_unsupported_attention_request() {
         unsafe { std::env::set_var("ATTN_SHARDS", "3") };
         let err = ParallelBenchRequest::from_env(ShardPolicy::FailFast).unwrap_err();
-        assert!(err.to_string().contains("allowed values are 1, 2, 4, 8, 10"));
+        assert!(
+            err.to_string()
+                .contains("allowed values are 1, 2, 4, 8, 10")
+        );
         unsafe { std::env::remove_var("ATTN_SHARDS") };
     }
 

@@ -67,7 +67,13 @@ fn write_json<T: Serialize>(path: &Path, value: &T) {
     fs::write(path, json).expect("write json");
 }
 
-fn custom_config(dim: usize, hidden: usize, heads: usize, nlayers: usize, seq: usize) -> ModelConfig {
+fn custom_config(
+    dim: usize,
+    hidden: usize,
+    heads: usize,
+    nlayers: usize,
+    seq: usize,
+) -> ModelConfig {
     ModelConfig {
         dim,
         hidden,
@@ -116,8 +122,12 @@ fn attention_group_cfg(cfg: &ModelConfig, head_count: usize) -> ModelConfig {
 }
 
 fn deterministic_tokens(cfg: &ModelConfig) -> (Vec<u32>, Vec<u32>) {
-    let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
-    let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
+    let tokens: Vec<u32> = (0..cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
+    let targets: Vec<u32> = (1..=cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
     (tokens, targets)
 }
 
@@ -138,7 +148,11 @@ fn rss_mb() -> Option<f32> {
     if !output.status.success() {
         return None;
     }
-    let kb: f32 = String::from_utf8(output.stdout).ok()?.trim().parse::<f32>().ok()?;
+    let kb: f32 = String::from_utf8(output.stdout)
+        .ok()?
+        .trim()
+        .parse::<f32>()
+        .ok()?;
     Some(kb / 1024.0)
 }
 
@@ -146,7 +160,14 @@ fn layer_alpha(cfg: &ModelConfig) -> f32 {
     1.0 / (2.0 * cfg.nlayers as f32).sqrt()
 }
 
-fn stage_spatial(dst: &mut [f32], channels: usize, sp_width: usize, src: &[f32], src_width: usize, sp_offset: usize) {
+fn stage_spatial(
+    dst: &mut [f32],
+    channels: usize,
+    sp_width: usize,
+    src: &[f32],
+    src_width: usize,
+    sp_offset: usize,
+) {
     for c in 0..channels {
         let dst_row = c * sp_width;
         let src_row = c * src_width;
@@ -168,8 +189,7 @@ fn stage_weight_columns(
     for r in 0..rows {
         let src_row = r * total_cols + col_start;
         let dst_row = r * sp_width + sp_offset;
-        dst[dst_row..dst_row + col_count]
-            .copy_from_slice(&src[src_row..src_row + col_count]);
+        dst[dst_row..dst_row + col_count].copy_from_slice(&src[src_row..src_row + col_count]);
     }
 }
 
@@ -191,7 +211,14 @@ fn stage_transposed_weight_columns(
     }
 }
 
-fn read_channels_into(src: &[f32], total_ch: usize, seq: usize, ch_start: usize, ch_count: usize, dst: &mut [f32]) {
+fn read_channels_into(
+    src: &[f32],
+    total_ch: usize,
+    seq: usize,
+    ch_start: usize,
+    ch_count: usize,
+    dst: &mut [f32],
+) {
     let start = ch_start * seq;
     let end = (ch_start + ch_count).min(total_ch) * seq;
     assert_eq!(dst.len(), end - start, "destination length mismatch");
@@ -215,8 +242,17 @@ impl DiffMetrics {
     }
 }
 
-fn compare_logits_and_loss(actual_logits: &[f32], actual_loss: f32, expected_logits: &[f32], expected_loss: f32) -> DiffMetrics {
-    assert_eq!(actual_logits.len(), expected_logits.len(), "logits length mismatch");
+fn compare_logits_and_loss(
+    actual_logits: &[f32],
+    actual_loss: f32,
+    expected_logits: &[f32],
+    expected_loss: f32,
+) -> DiffMetrics {
+    assert_eq!(
+        actual_logits.len(),
+        expected_logits.len(),
+        "logits length mismatch"
+    );
 
     let mut max_abs = 0.0f32;
     let mut sum_abs = 0.0f32;
@@ -344,7 +380,6 @@ impl ModeSpec {
             ffn_shards,
         }
     }
-
 }
 
 fn mode_specs() -> Vec<ModeSpec> {
@@ -494,7 +529,10 @@ struct ModeRunner {
 }
 
 fn attention_shard_layouts(cfg: &ModelConfig, shard_count: usize) -> Vec<AttentionShardLayout> {
-    assert!(cfg.heads % shard_count == 0, "heads must be divisible by attention shard count");
+    assert!(
+        cfg.heads % shard_count == 0,
+        "heads must be divisible by attention shard count"
+    );
     let head_count = cfg.heads / shard_count;
     let q_col_count = head_count * cfg.hd;
     (0..shard_count)
@@ -507,7 +545,10 @@ fn attention_shard_layouts(cfg: &ModelConfig, shard_count: usize) -> Vec<Attenti
 }
 
 fn ffn_shard_layouts(cfg: &ModelConfig, shard_count: usize) -> Vec<FfnShardLayout> {
-    assert!(cfg.hidden % shard_count == 0, "hidden must be divisible by ffn shard count");
+    assert!(
+        cfg.hidden % shard_count == 0,
+        "hidden must be divisible by ffn shard count"
+    );
     let col_count = cfg.hidden / shard_count;
     (0..shard_count)
         .map(|i| FfnShardLayout {
@@ -541,8 +582,18 @@ fn compile_wo_runner(cfg: &ModelConfig) -> WoRunner {
     let sp = dyn_matmul::spatial_width(cfg.seq, cfg.dim);
     WoRunner {
         exe,
-        input: TensorData::new(ane_bridge::ane::Shape { batch: 1, channels: cfg.q_dim, height: 1, width: sp }),
-        output: TensorData::new(ane_bridge::ane::Shape { batch: 1, channels: cfg.dim, height: 1, width: cfg.seq }),
+        input: TensorData::new(ane_bridge::ane::Shape {
+            batch: 1,
+            channels: cfg.q_dim,
+            height: 1,
+            width: sp,
+        }),
+        output: TensorData::new(ane_bridge::ane::Shape {
+            batch: 1,
+            channels: cfg.dim,
+            height: 1,
+            width: cfg.seq,
+        }),
     }
 }
 
@@ -556,7 +607,10 @@ fn compile_baseline_attention_runner(cfg: &ModelConfig) -> (BaselineAttentionRun
     (runner, t0.elapsed().as_secs_f32())
 }
 
-fn compile_sharded_attention_runner(cfg: &ModelConfig, shard_count: usize) -> (ShardedAttentionRunner, f32) {
+fn compile_sharded_attention_runner(
+    cfg: &ModelConfig,
+    shard_count: usize,
+) -> (ShardedAttentionRunner, f32) {
     let t0 = Instant::now();
     let workers = attention_shard_layouts(cfg, shard_count)
         .into_iter()
@@ -597,7 +651,11 @@ fn compile_baseline_ffn_runner(cfg: &ModelConfig) -> (BaselineFfnRunner, f32) {
     } else {
         dyn_matmul::spatial_width(cfg.seq, cfg.hidden)
     };
-    let w13_out_channels = if use_dual_w13 { 2 * cfg.hidden } else { cfg.hidden };
+    let w13_out_channels = if use_dual_w13 {
+        2 * cfg.hidden
+    } else {
+        cfg.hidden
+    };
     let w2_exe = dyn_matmul::build(cfg.hidden, cfg.dim, cfg.seq)
         .compile(qos)
         .expect("baseline w2 compile");
@@ -607,8 +665,18 @@ fn compile_baseline_ffn_runner(cfg: &ModelConfig) -> (BaselineFfnRunner, f32) {
             cfg: cfg.clone(),
             use_dual_w13,
             w13_exe,
-            w13_in: TensorData::new(ane_bridge::ane::Shape { batch: 1, channels: cfg.dim, height: 1, width: w13_sp }),
-            w13_out: TensorData::new(ane_bridge::ane::Shape { batch: 1, channels: w13_out_channels, height: 1, width: cfg.seq }),
+            w13_in: TensorData::new(ane_bridge::ane::Shape {
+                batch: 1,
+                channels: cfg.dim,
+                height: 1,
+                width: w13_sp,
+            }),
+            w13_out: TensorData::new(ane_bridge::ane::Shape {
+                batch: 1,
+                channels: w13_out_channels,
+                height: 1,
+                width: cfg.seq,
+            }),
             w2_exe,
             w2_in: TensorData::new(ane_bridge::ane::Shape {
                 batch: 1,
@@ -616,7 +684,12 @@ fn compile_baseline_ffn_runner(cfg: &ModelConfig) -> (BaselineFfnRunner, f32) {
                 height: 1,
                 width: w2_sp,
             }),
-            w2_out: TensorData::new(ane_bridge::ane::Shape { batch: 1, channels: cfg.dim, height: 1, width: cfg.seq }),
+            w2_out: TensorData::new(ane_bridge::ane::Shape {
+                batch: 1,
+                channels: cfg.dim,
+                height: 1,
+                width: cfg.seq,
+            }),
             h1: vec![0.0; cfg.hidden * cfg.seq],
             h3: vec![0.0; cfg.hidden * cfg.seq],
             gate: vec![0.0; cfg.hidden * cfg.seq],
@@ -644,10 +717,30 @@ fn compile_sharded_ffn_runner(cfg: &ModelConfig, shard_count: usize) -> (Sharded
                 layout,
                 w13_exe,
                 w2_exe,
-                w13_in: TensorData::new(ane_bridge::ane::Shape { batch: 1, channels: cfg.dim, height: 1, width: w13_sp }),
-                w13_out: TensorData::new(ane_bridge::ane::Shape { batch: 1, channels: 2 * shard_hidden, height: 1, width: cfg.seq }),
-                w2_in: TensorData::new(ane_bridge::ane::Shape { batch: 1, channels: shard_hidden, height: 1, width: w2_sp }),
-                w2_out: TensorData::new(ane_bridge::ane::Shape { batch: 1, channels: cfg.dim, height: 1, width: cfg.seq }),
+                w13_in: TensorData::new(ane_bridge::ane::Shape {
+                    batch: 1,
+                    channels: cfg.dim,
+                    height: 1,
+                    width: w13_sp,
+                }),
+                w13_out: TensorData::new(ane_bridge::ane::Shape {
+                    batch: 1,
+                    channels: 2 * shard_hidden,
+                    height: 1,
+                    width: cfg.seq,
+                }),
+                w2_in: TensorData::new(ane_bridge::ane::Shape {
+                    batch: 1,
+                    channels: shard_hidden,
+                    height: 1,
+                    width: w2_sp,
+                }),
+                w2_out: TensorData::new(ane_bridge::ane::Shape {
+                    batch: 1,
+                    channels: cfg.dim,
+                    height: 1,
+                    width: cfg.seq,
+                }),
                 h1: vec![0.0; shard_hidden * cfg.seq],
                 h3: vec![0.0; shard_hidden * cfg.seq],
                 gate: vec![0.0; shard_hidden * cfg.seq],
@@ -702,15 +795,34 @@ fn run_baseline_attention_into(
     let alpha = layer_alpha(cfg);
     let t0 = Instant::now();
 
-    rmsnorm::forward_channel_first(x, &layer_weights.gamma1, &mut scratch.xnorm, &mut scratch.rms_inv1, dim, seq);
+    rmsnorm::forward_channel_first(
+        x,
+        &layer_weights.gamma1,
+        &mut scratch.xnorm,
+        &mut scratch.rms_inv1,
+        dim,
+        seq,
+    );
     runner.sdpa.xnorm_in.copy_from_f32(&scratch.xnorm);
     runner.sdpa.wq_in.copy_from_f32(&layer_weights.wq);
     runner.sdpa.wk_in.copy_from_f32(&layer_weights.wk);
     runner.sdpa.wv_in.copy_from_f32(&layer_weights.wv);
-    runner.sdpa.exe
+    runner
+        .sdpa
+        .exe
         .run_cached_direct(
-            &[&runner.sdpa.xnorm_in, &runner.sdpa.wq_in, &runner.sdpa.wk_in, &runner.sdpa.wv_in],
-            &[&runner.sdpa.attn_out, &runner.sdpa.q_rope_out, &runner.sdpa.k_rope_out, &runner.sdpa.v_out],
+            &[
+                &runner.sdpa.xnorm_in,
+                &runner.sdpa.wq_in,
+                &runner.sdpa.wk_in,
+                &runner.sdpa.wv_in,
+            ],
+            &[
+                &runner.sdpa.attn_out,
+                &runner.sdpa.q_rope_out,
+                &runner.sdpa.k_rope_out,
+                &runner.sdpa.v_out,
+            ],
         )
         .expect("baseline sdpa run");
 
@@ -719,10 +831,19 @@ fn run_baseline_attention_into(
         let attn_locked = runner.sdpa.attn_out.as_f32_slice();
         let mut wo_locked = runner.wo.input.as_f32_slice_mut();
         let buf = &mut *wo_locked;
-        stage_spatial(buf, cfg.q_dim, wo_sp, &attn_locked[..cfg.q_dim * seq], seq, 0);
+        stage_spatial(
+            buf,
+            cfg.q_dim,
+            wo_sp,
+            &attn_locked[..cfg.q_dim * seq],
+            seq,
+            0,
+        );
         stage_spatial(buf, cfg.q_dim, wo_sp, &layer_weights.wo, dim, seq);
     }
-    runner.wo.exe
+    runner
+        .wo
+        .exe
         .run_cached_direct(&[&runner.wo.input], &[&runner.wo.output])
         .expect("baseline wo run");
     {
@@ -732,7 +853,14 @@ fn run_baseline_attention_into(
     }
 
     vdsp::vsma(&scratch.o_out, alpha, x, &mut scratch.x2);
-    rmsnorm::forward_channel_first(&scratch.x2, &layer_weights.gamma2, &mut scratch.x2norm, &mut scratch.rms_inv2, dim, seq);
+    rmsnorm::forward_channel_first(
+        &scratch.x2,
+        &layer_weights.gamma2,
+        &mut scratch.x2norm,
+        &mut scratch.rms_inv2,
+        dim,
+        seq,
+    );
     t0.elapsed().as_secs_f32() * 1000.0
 }
 
@@ -748,7 +876,14 @@ fn run_sharded_attention_into(
     let alpha = layer_alpha(cfg);
     let t0 = Instant::now();
 
-    rmsnorm::forward_channel_first(x, &layer_weights.gamma1, &mut scratch.xnorm, &mut scratch.rms_inv1, dim, seq);
+    rmsnorm::forward_channel_first(
+        x,
+        &layer_weights.gamma1,
+        &mut scratch.xnorm,
+        &mut scratch.rms_inv1,
+        dim,
+        seq,
+    );
     let barrier = Arc::new(Barrier::new(runner.workers.len() + 1));
     let xnorm_ref = &scratch.xnorm;
 
@@ -800,10 +935,22 @@ fn run_sharded_attention_into(
                     );
                 }
 
-                worker.sdpa.exe
+                worker
+                    .sdpa
+                    .exe
                     .run_cached_direct(
-                        &[&worker.sdpa.xnorm_in, &worker.sdpa.wq_in, &worker.sdpa.wk_in, &worker.sdpa.wv_in],
-                        &[&worker.sdpa.attn_out, &worker.sdpa.q_rope_out, &worker.sdpa.k_rope_out, &worker.sdpa.v_out],
+                        &[
+                            &worker.sdpa.xnorm_in,
+                            &worker.sdpa.wq_in,
+                            &worker.sdpa.wk_in,
+                            &worker.sdpa.wv_in,
+                        ],
+                        &[
+                            &worker.sdpa.attn_out,
+                            &worker.sdpa.q_rope_out,
+                            &worker.sdpa.k_rope_out,
+                            &worker.sdpa.v_out,
+                        ],
                     )
                     .expect("sharded sdpa run");
 
@@ -814,7 +961,14 @@ fn run_sharded_attention_into(
                     let attn_locked = worker.sdpa.attn_out.as_f32_slice();
                     let mut wo_locked = worker.wo.input.as_f32_slice_mut();
                     let buf = &mut *wo_locked;
-                    stage_spatial(buf, worker.cfg.q_dim, wo_sp, &attn_locked[..worker.cfg.q_dim * seq], seq, 0);
+                    stage_spatial(
+                        buf,
+                        worker.cfg.q_dim,
+                        wo_sp,
+                        &attn_locked[..worker.cfg.q_dim * seq],
+                        seq,
+                        0,
+                    );
                     stage_spatial(
                         buf,
                         worker.cfg.q_dim,
@@ -824,7 +978,9 @@ fn run_sharded_attention_into(
                         seq,
                     );
                 }
-                worker.wo.exe
+                worker
+                    .wo
+                    .exe
                     .run_cached_direct(&[&worker.wo.input], &[&worker.wo.output])
                     .expect("sharded wo run");
             }));
@@ -839,12 +995,23 @@ fn run_sharded_attention_into(
     scratch.o_out.fill(0.0);
     for worker in &runner.workers {
         let locked = worker.wo.output.as_f32_slice();
-        vdsp::vadd(&scratch.o_out, &locked[..scratch.o_out.len()], &mut scratch.merge_tmp);
+        vdsp::vadd(
+            &scratch.o_out,
+            &locked[..scratch.o_out.len()],
+            &mut scratch.merge_tmp,
+        );
         scratch.o_out.copy_from_slice(&scratch.merge_tmp);
     }
 
     vdsp::vsma(&scratch.o_out, alpha, x, &mut scratch.x2);
-    rmsnorm::forward_channel_first(&scratch.x2, &layer_weights.gamma2, &mut scratch.x2norm, &mut scratch.rms_inv2, dim, seq);
+    rmsnorm::forward_channel_first(
+        &scratch.x2,
+        &layer_weights.gamma2,
+        &mut scratch.x2norm,
+        &mut scratch.rms_inv2,
+        dim,
+        seq,
+    );
     t0.elapsed().as_secs_f32() * 1000.0
 }
 
@@ -871,23 +1038,50 @@ fn run_baseline_ffn_into(
         let mut locked = runner.w13_in.as_f32_slice_mut();
         let buf = &mut *locked;
         stage_spatial(buf, dim, w13_sp, &scratch.x2norm, seq, 0);
-        stage_weight_columns(buf, dim, w13_sp, &layer_weights.w1, cfg.hidden, 0, cfg.hidden, seq);
+        stage_weight_columns(
+            buf,
+            dim,
+            w13_sp,
+            &layer_weights.w1,
+            cfg.hidden,
+            0,
+            cfg.hidden,
+            seq,
+        );
         if runner.use_dual_w13 {
-            stage_weight_columns(buf, dim, w13_sp, &layer_weights.w3, cfg.hidden, 0, cfg.hidden, seq + cfg.hidden);
+            stage_weight_columns(
+                buf,
+                dim,
+                w13_sp,
+                &layer_weights.w3,
+                cfg.hidden,
+                0,
+                cfg.hidden,
+                seq + cfg.hidden,
+            );
         }
     }
 
     if runner.use_dual_w13 {
-        runner.w13_exe
+        runner
+            .w13_exe
             .run_cached_direct(&[&runner.w13_in], &[&runner.w13_out])
             .expect("baseline w13 dual run");
         {
             let locked = runner.w13_out.as_f32_slice();
             read_channels_into(&locked, 2 * cfg.hidden, seq, 0, cfg.hidden, &mut runner.h1);
-            read_channels_into(&locked, 2 * cfg.hidden, seq, cfg.hidden, cfg.hidden, &mut runner.h3);
+            read_channels_into(
+                &locked,
+                2 * cfg.hidden,
+                seq,
+                cfg.hidden,
+                cfg.hidden,
+                &mut runner.h3,
+            );
         }
     } else {
-        runner.w13_exe
+        runner
+            .w13_exe
             .run_cached_direct(&[&runner.w13_in], &[&runner.w13_out])
             .expect("baseline w1 run");
         {
@@ -898,9 +1092,19 @@ fn run_baseline_ffn_into(
             let mut locked = runner.w13_in.as_f32_slice_mut();
             let buf = &mut *locked;
             stage_spatial(buf, dim, w13_sp, &scratch.x2norm, seq, 0);
-            stage_weight_columns(buf, dim, w13_sp, &layer_weights.w3, cfg.hidden, 0, cfg.hidden, seq);
+            stage_weight_columns(
+                buf,
+                dim,
+                w13_sp,
+                &layer_weights.w3,
+                cfg.hidden,
+                0,
+                cfg.hidden,
+                seq,
+            );
         }
-        runner.w13_exe
+        runner
+            .w13_exe
             .run_cached_direct(&[&runner.w13_in], &[&runner.w13_out])
             .expect("baseline w3 run");
         {
@@ -914,9 +1118,19 @@ fn run_baseline_ffn_into(
         let mut locked = runner.w2_in.as_f32_slice_mut();
         let buf = &mut *locked;
         stage_spatial(buf, cfg.hidden, w2_sp, &runner.gate, seq, 0);
-        stage_transposed_weight_columns(buf, &layer_weights.w2, dim, cfg.hidden, 0, cfg.hidden, w2_sp, seq);
+        stage_transposed_weight_columns(
+            buf,
+            &layer_weights.w2,
+            dim,
+            cfg.hidden,
+            0,
+            cfg.hidden,
+            w2_sp,
+            seq,
+        );
     }
-    runner.w2_exe
+    runner
+        .w2_exe
         .run_cached_direct(&[&runner.w2_in], &[&runner.w2_out])
         .expect("baseline w2 run");
     {
@@ -980,13 +1194,28 @@ fn run_sharded_ffn_into(
                         seq + shard_hidden,
                     );
                 }
-                worker.w13_exe
+                worker
+                    .w13_exe
                     .run_cached_direct(&[&worker.w13_in], &[&worker.w13_out])
                     .expect("sharded ffn w13 run");
                 {
                     let locked = worker.w13_out.as_f32_slice();
-                    read_channels_into(&locked, 2 * shard_hidden, seq, 0, shard_hidden, &mut worker.h1);
-                    read_channels_into(&locked, 2 * shard_hidden, seq, shard_hidden, shard_hidden, &mut worker.h3);
+                    read_channels_into(
+                        &locked,
+                        2 * shard_hidden,
+                        seq,
+                        0,
+                        shard_hidden,
+                        &mut worker.h1,
+                    );
+                    read_channels_into(
+                        &locked,
+                        2 * shard_hidden,
+                        seq,
+                        shard_hidden,
+                        shard_hidden,
+                        &mut worker.h3,
+                    );
                 }
 
                 silu::silu_gate(&worker.h1, &worker.h3, &mut worker.gate);
@@ -1005,7 +1234,8 @@ fn run_sharded_ffn_into(
                         seq,
                     );
                 }
-                worker.w2_exe
+                worker
+                    .w2_exe
                     .run_cached_direct(&[&worker.w2_in], &[&worker.w2_out])
                     .expect("sharded ffn w2 run");
             }));
@@ -1020,7 +1250,11 @@ fn run_sharded_ffn_into(
     scratch.ffn_out.fill(0.0);
     for worker in &runner.workers {
         let locked = worker.w2_out.as_f32_slice();
-        vdsp::vadd(&scratch.ffn_out, &locked[..scratch.ffn_out.len()], &mut scratch.merge_tmp);
+        vdsp::vadd(
+            &scratch.ffn_out,
+            &locked[..scratch.ffn_out.len()],
+            &mut scratch.merge_tmp,
+        );
         scratch.ffn_out.copy_from_slice(&scratch.merge_tmp);
     }
 
@@ -1035,26 +1269,54 @@ fn run_mode_layer_forward_into(
     x_next: &mut [f32],
 ) -> (f32, f32) {
     let attn_ms = match &mut runner.attn {
-        AttentionRunner::Baseline(attn) => run_baseline_attention_into(attn, layer_weights, x, &mut runner.scratch),
-        AttentionRunner::Sharded(attn) => run_sharded_attention_into(attn, layer_weights, x, &mut runner.scratch),
+        AttentionRunner::Baseline(attn) => {
+            run_baseline_attention_into(attn, layer_weights, x, &mut runner.scratch)
+        }
+        AttentionRunner::Sharded(attn) => {
+            run_sharded_attention_into(attn, layer_weights, x, &mut runner.scratch)
+        }
     };
     let ffn_ms = match &mut runner.ffn {
-        FfnRunner::Baseline(ffn) => run_baseline_ffn_into(ffn, layer_weights, &mut runner.scratch, x_next),
-        FfnRunner::Sharded(ffn) => run_sharded_ffn_into(ffn, layer_weights, &mut runner.scratch, x_next),
+        FfnRunner::Baseline(ffn) => {
+            run_baseline_ffn_into(ffn, layer_weights, &mut runner.scratch, x_next)
+        }
+        FfnRunner::Sharded(ffn) => {
+            run_sharded_ffn_into(ffn, layer_weights, &mut runner.scratch, x_next)
+        }
     };
     (attn_ms, ffn_ms)
 }
 
-fn finalize_logits_and_loss(cfg: &ModelConfig, weights: &ModelWeights, ws: &mut ModelForwardWorkspace, targets: &[u32], softcap: f32) -> (Vec<f32>, f32) {
+fn finalize_logits_and_loss(
+    cfg: &ModelConfig,
+    weights: &ModelWeights,
+    ws: &mut ModelForwardWorkspace,
+    targets: &[u32],
+    softcap: f32,
+) -> (Vec<f32>, f32) {
     let dim = cfg.dim;
     let seq = cfg.seq;
     let vocab = cfg.vocab;
 
     ws.x_prenorm.copy_from_slice(&ws.x_buf);
-    rmsnorm::forward_channel_first(&ws.x_prenorm, &weights.gamma_final, &mut ws.x_final, &mut ws.rms_inv_final, dim, seq);
+    rmsnorm::forward_channel_first(
+        &ws.x_prenorm,
+        &weights.gamma_final,
+        &mut ws.x_final,
+        &mut ws.rms_inv_final,
+        dim,
+        seq,
+    );
     vdsp::mtrans(&ws.x_final, seq, &mut ws.x_final_row, dim, dim, seq);
     ws.logits.fill(0.0);
-    vdsp::sgemm_at(&ws.x_final_row, seq, dim, &weights.embed, vocab, &mut ws.logits);
+    vdsp::sgemm_at(
+        &ws.x_final_row,
+        seq,
+        dim,
+        &weights.embed,
+        vocab,
+        &mut ws.logits,
+    );
 
     if softcap > 0.0 {
         vdsp::sscal(&mut ws.logits, 1.0 / softcap);
@@ -1092,17 +1354,28 @@ fn run_mode_full_forward_once(
     let mut total_ffn_ms = 0.0f32;
     for layer_weights in &weights.layers {
         let x_buf = ws.x_buf.clone();
-        let (attn_ms, ffn_ms) = run_mode_layer_forward_into(runner, layer_weights, &x_buf, &mut ws.x_next_buf);
+        let (attn_ms, ffn_ms) =
+            run_mode_layer_forward_into(runner, layer_weights, &x_buf, &mut ws.x_next_buf);
         total_attn_ms += attn_ms;
         total_ffn_ms += ffn_ms;
         std::mem::swap(&mut ws.x_buf, &mut ws.x_next_buf);
     }
 
     let (logits, loss) = finalize_logits_and_loss(cfg, weights, ws, targets, softcap);
-    FullModelOutputs { logits, loss, total_attn_ms, total_ffn_ms }
+    FullModelOutputs {
+        logits,
+        loss,
+        total_attn_ms,
+        total_ffn_ms,
+    }
 }
 
-fn run_baseline_mode(cfg: &ModelConfig, weights: &ModelWeights, tokens: &[u32], targets: &[u32]) -> (ModeResult, Vec<f32>, f32) {
+fn run_baseline_mode(
+    cfg: &ModelConfig,
+    weights: &ModelWeights,
+    tokens: &[u32],
+    targets: &[u32],
+) -> (ModeResult, Vec<f32>, f32) {
     let softcap = TrainConfig::default().softcap;
     let baseline_spec = ModeSpec::baseline();
     let (mut runner, compile_s) = compile_mode_runner(cfg, &baseline_spec);
@@ -1110,7 +1383,8 @@ fn run_baseline_mode(cfg: &ModelConfig, weights: &ModelWeights, tokens: &[u32], 
     let mut peak_rss_mb = rss_mb().unwrap_or(0.0);
 
     let t0 = Instant::now();
-    let warmup = run_mode_full_forward_once(cfg, &mut runner, &mut ws, weights, tokens, targets, softcap);
+    let warmup =
+        run_mode_full_forward_once(cfg, &mut runner, &mut ws, weights, tokens, targets, softcap);
     let warmup_wall_ms = t0.elapsed().as_secs_f32() * 1000.0;
     let baseline_logits = warmup.logits.clone();
     let baseline_loss = warmup.loss;
@@ -1121,9 +1395,21 @@ fn run_baseline_mode(cfg: &ModelConfig, weights: &ModelWeights, tokens: &[u32], 
     let mut ffn_samples_ms = Vec::with_capacity(TIMED_RUNS);
     for _ in 0..TIMED_RUNS {
         let t0 = Instant::now();
-        let out = run_mode_full_forward_once(cfg, &mut runner, &mut ws, weights, tokens, targets, softcap);
+        let out = run_mode_full_forward_once(
+            cfg,
+            &mut runner,
+            &mut ws,
+            weights,
+            tokens,
+            targets,
+            softcap,
+        );
         let diff = compare_logits_and_loss(&out.logits, out.loss, &baseline_logits, baseline_loss);
-        assert!(diff.passes(), "baseline measured sample diverged from baseline warmup: {:?}", diff);
+        assert!(
+            diff.passes(),
+            "baseline measured sample diverged from baseline warmup: {:?}",
+            diff
+        );
         timed_samples_ms.push(t0.elapsed().as_secs_f32() * 1000.0);
         attn_samples_ms.push(out.total_attn_ms);
         ffn_samples_ms.push(out.total_ffn_ms);
@@ -1188,7 +1474,8 @@ fn run_candidate_mode(
     let mut peak_rss_mb = rss_mb().unwrap_or(0.0);
 
     let t0 = Instant::now();
-    let warmup = run_mode_full_forward_once(cfg, &mut runner, &mut ws, weights, tokens, targets, softcap);
+    let warmup =
+        run_mode_full_forward_once(cfg, &mut runner, &mut ws, weights, tokens, targets, softcap);
     let warmup_wall_ms = t0.elapsed().as_secs_f32() * 1000.0;
     let diff = compare_logits_and_loss(&warmup.logits, warmup.loss, baseline_logits, baseline_loss);
     peak_rss_mb = peak_rss_mb.max(rss_mb().unwrap_or(peak_rss_mb));
@@ -1198,8 +1485,17 @@ fn run_candidate_mode(
     let mut ffn_samples_ms = Vec::with_capacity(TIMED_RUNS);
     for _ in 0..TIMED_RUNS {
         let t0 = Instant::now();
-        let out = run_mode_full_forward_once(cfg, &mut runner, &mut ws, weights, tokens, targets, softcap);
-        let sample_diff = compare_logits_and_loss(&out.logits, out.loss, baseline_logits, baseline_loss);
+        let out = run_mode_full_forward_once(
+            cfg,
+            &mut runner,
+            &mut ws,
+            weights,
+            tokens,
+            targets,
+            softcap,
+        );
+        let sample_diff =
+            compare_logits_and_loss(&out.logits, out.loss, baseline_logits, baseline_loss);
         assert!(
             sample_diff.passes(),
             "measured sample diverged from baseline for mode {}: {:?}",
@@ -1227,7 +1523,8 @@ fn run_candidate_mode(
     } else {
         0.0
     };
-    let full_forward_win_pct_vs_baseline = (baseline_mean_ms - mean_full_forward_ms) / baseline_mean_ms * 100.0;
+    let full_forward_win_pct_vs_baseline =
+        (baseline_mean_ms - mean_full_forward_ms) / baseline_mean_ms * 100.0;
 
     ModeResult {
         mode: mode.name.clone(),
@@ -1253,14 +1550,19 @@ fn run_candidate_mode(
 
 fn best_mode_name<'a>(modes: impl Iterator<Item = &'a ModeResult>) -> Option<String> {
     modes
-        .min_by(|a, b| a.mean_full_forward_ms.partial_cmp(&b.mean_full_forward_ms).unwrap())
+        .min_by(|a, b| {
+            a.mean_full_forward_ms
+                .partial_cmp(&b.mean_full_forward_ms)
+                .unwrap()
+        })
         .map(|mode| mode.mode.clone())
 }
 
 fn run_experiment(cfg: &ModelConfig, config_name: &str) -> ExperimentResult {
     let weights = ModelWeights::random(cfg);
     let (tokens, targets) = deterministic_tokens(cfg);
-    let (baseline, baseline_logits, baseline_loss) = run_baseline_mode(cfg, &weights, &tokens, &targets);
+    let (baseline, baseline_logits, baseline_loss) =
+        run_baseline_mode(cfg, &weights, &tokens, &targets);
 
     let modes = mode_specs()
         .into_iter()
@@ -1284,9 +1586,21 @@ fn run_experiment(cfg: &ModelConfig, config_name: &str) -> ExperimentResult {
         .filter_map(|mode| mode.meets_perf_gate.then_some(mode.mode.clone()))
         .collect::<Vec<_>>();
 
-    let best_attention_only_mode = best_mode_name(modes.iter().filter(|mode| mode.attn_shards > 1 && mode.ffn_shards == 1));
-    let best_ffn_only_mode = best_mode_name(modes.iter().filter(|mode| mode.attn_shards == 1 && mode.ffn_shards > 1));
-    let best_combined_mode = best_mode_name(modes.iter().filter(|mode| mode.attn_shards > 1 && mode.ffn_shards > 1));
+    let best_attention_only_mode = best_mode_name(
+        modes
+            .iter()
+            .filter(|mode| mode.attn_shards > 1 && mode.ffn_shards == 1),
+    );
+    let best_ffn_only_mode = best_mode_name(
+        modes
+            .iter()
+            .filter(|mode| mode.attn_shards == 1 && mode.ffn_shards > 1),
+    );
+    let best_combined_mode = best_mode_name(
+        modes
+            .iter()
+            .filter(|mode| mode.attn_shards > 1 && mode.ffn_shards > 1),
+    );
 
     ExperimentResult {
         config_name: config_name.to_string(),
@@ -1375,10 +1689,17 @@ fn write_summary(result: &ExperimentResult, path: &Path) {
 
     summary.push_str(&format!(
         "Primary success: **{}**\n\n",
-        if result.primary_success { "PASS" } else { "FAIL" }
+        if result.primary_success {
+            "PASS"
+        } else {
+            "FAIL"
+        }
     ));
     if !result.winning_modes.is_empty() {
-        summary.push_str(&format!("Winning modes: `{}`\n\n", result.winning_modes.join("`, `")));
+        summary.push_str(&format!(
+            "Winning modes: `{}`\n\n",
+            result.winning_modes.join("`, `")
+        ));
     }
     summary.push_str("## Notes\n\n");
     summary.push_str("- Each mode runs 1 warmup plus 2 measured full-model passes.\n");
@@ -1394,9 +1715,16 @@ fn write_summary(result: &ExperimentResult, path: &Path) {
 fn attn_ffn_full_model_smoke_30bgeom_16l_matches_baseline() {
     let _guard = run_lock().lock().unwrap();
     let result = run_experiment(&cfg_30bgeom_16l(), "30Bgeom-16L");
-    assert!(result.baseline.correctness_pass, "baseline correctness failed");
+    assert!(
+        result.baseline.correctness_pass,
+        "baseline correctness failed"
+    );
     for mode in &result.modes {
-        assert!(mode.correctness_pass, "mode {} correctness failed: {:?}", mode.mode, mode.diff_vs_baseline);
+        assert!(
+            mode.correctness_pass,
+            "mode {} correctness failed: {:?}",
+            mode.mode, mode.diff_vs_baseline
+        );
     }
 }
 
@@ -1405,9 +1733,16 @@ fn attn_ffn_full_model_smoke_30bgeom_16l_matches_baseline() {
 fn bench_attn_ffn_full_model_30bgeom_16l_matrix() {
     let _guard = run_lock().lock().unwrap();
     let result = run_experiment(&cfg_30bgeom_16l(), "30Bgeom-16L");
-    assert!(result.baseline.correctness_pass, "baseline correctness failed");
+    assert!(
+        result.baseline.correctness_pass,
+        "baseline correctness failed"
+    );
     for mode in &result.modes {
-        assert!(mode.correctness_pass, "mode {} correctness failed", mode.mode);
+        assert!(
+            mode.correctness_pass,
+            "mode {} correctness failed",
+            mode.mode
+        );
     }
     write_json(&json_path("30bgeom_16l"), &result);
     write_summary(&result, &summary_path("30bgeom_16l"));
@@ -1418,9 +1753,16 @@ fn bench_attn_ffn_full_model_30bgeom_16l_matrix() {
 fn attn_ffn_full_model_smoke_30b_matches_baseline() {
     let _guard = run_lock().lock().unwrap();
     let result = run_experiment(&cfg_30b(), "30B");
-    assert!(result.baseline.correctness_pass, "baseline correctness failed");
+    assert!(
+        result.baseline.correctness_pass,
+        "baseline correctness failed"
+    );
     for mode in &result.modes {
-        assert!(mode.correctness_pass, "mode {} correctness failed: {:?}", mode.mode, mode.diff_vs_baseline);
+        assert!(
+            mode.correctness_pass,
+            "mode {} correctness failed: {:?}",
+            mode.mode, mode.diff_vs_baseline
+        );
     }
 }
 
@@ -1429,9 +1771,16 @@ fn attn_ffn_full_model_smoke_30b_matches_baseline() {
 fn bench_attn_ffn_full_model_30b_matrix() {
     let _guard = run_lock().lock().unwrap();
     let result = run_experiment(&cfg_30b(), "30B");
-    assert!(result.baseline.correctness_pass, "baseline correctness failed");
+    assert!(
+        result.baseline.correctness_pass,
+        "baseline correctness failed"
+    );
     for mode in &result.modes {
-        assert!(mode.correctness_pass, "mode {} correctness failed", mode.mode);
+        assert!(
+            mode.correctness_pass,
+            "mode {} correctness failed",
+            mode.mode
+        );
     }
     write_json(&json_path("30b"), &result);
     write_summary(&result, &summary_path("30b"));
@@ -1442,9 +1791,16 @@ fn bench_attn_ffn_full_model_30b_matrix() {
 fn attn_ffn_full_model_smoke_50b_matches_baseline() {
     let _guard = run_lock().lock().unwrap();
     let result = run_experiment(&cfg_50b(), "50B");
-    assert!(result.baseline.correctness_pass, "baseline correctness failed");
+    assert!(
+        result.baseline.correctness_pass,
+        "baseline correctness failed"
+    );
     for mode in &result.modes {
-        assert!(mode.correctness_pass, "mode {} correctness failed: {:?}", mode.mode, mode.diff_vs_baseline);
+        assert!(
+            mode.correctness_pass,
+            "mode {} correctness failed: {:?}",
+            mode.mode, mode.diff_vs_baseline
+        );
     }
 }
 
@@ -1453,9 +1809,16 @@ fn attn_ffn_full_model_smoke_50b_matches_baseline() {
 fn bench_attn_ffn_full_model_50b_matrix() {
     let _guard = run_lock().lock().unwrap();
     let result = run_experiment(&cfg_50b(), "50B");
-    assert!(result.baseline.correctness_pass, "baseline correctness failed");
+    assert!(
+        result.baseline.correctness_pass,
+        "baseline correctness failed"
+    );
     for mode in &result.modes {
-        assert!(mode.correctness_pass, "mode {} correctness failed", mode.mode);
+        assert!(
+            mode.correctness_pass,
+            "mode {} correctness failed",
+            mode.mode
+        );
     }
     write_json(&json_path("50b"), &result);
     write_summary(&result, &summary_path("50b"));
@@ -1466,9 +1829,16 @@ fn bench_attn_ffn_full_model_50b_matrix() {
 fn attn_ffn_full_model_smoke_80b_matches_baseline() {
     let _guard = run_lock().lock().unwrap();
     let result = run_experiment(&cfg_80b(), "80B");
-    assert!(result.baseline.correctness_pass, "baseline correctness failed");
+    assert!(
+        result.baseline.correctness_pass,
+        "baseline correctness failed"
+    );
     for mode in &result.modes {
-        assert!(mode.correctness_pass, "mode {} correctness failed: {:?}", mode.mode, mode.diff_vs_baseline);
+        assert!(
+            mode.correctness_pass,
+            "mode {} correctness failed: {:?}",
+            mode.mode, mode.diff_vs_baseline
+        );
     }
 }
 
@@ -1477,9 +1847,16 @@ fn attn_ffn_full_model_smoke_80b_matches_baseline() {
 fn bench_attn_ffn_full_model_80b_matrix() {
     let _guard = run_lock().lock().unwrap();
     let result = run_experiment(&cfg_80b(), "80B");
-    assert!(result.baseline.correctness_pass, "baseline correctness failed");
+    assert!(
+        result.baseline.correctness_pass,
+        "baseline correctness failed"
+    );
     for mode in &result.modes {
-        assert!(mode.correctness_pass, "mode {} correctness failed", mode.mode);
+        assert!(
+            mode.correctness_pass,
+            "mode {} correctness failed",
+            mode.mode
+        );
     }
     write_json(&json_path("80b"), &result);
     write_summary(&result, &summary_path("80b"));

@@ -14,7 +14,13 @@ fn install_abort_on_panic() {
     }));
 }
 
-fn custom_config(dim: usize, hidden: usize, heads: usize, nlayers: usize, seq: usize) -> ModelConfig {
+fn custom_config(
+    dim: usize,
+    hidden: usize,
+    heads: usize,
+    nlayers: usize,
+    seq: usize,
+) -> ModelConfig {
     ModelConfig {
         dim,
         hidden,
@@ -85,8 +91,12 @@ fn run_forward_probe(cfg: &ModelConfig, name: &str) {
     println!("{alloc_s:.1}s (lean={use_lean})");
 
     let tc = TrainConfig::default();
-    let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
-    let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
+    let tokens: Vec<u32> = (0..cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
+    let targets: Vec<u32> = (1..=cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
 
     print!("  [3/3] Forward pass (1 warmup + 3 timed)... ");
     let _warmup_loss = runner.forward_loss(&weights, &tokens, &targets, tc.softcap, &mut fwd_ws);

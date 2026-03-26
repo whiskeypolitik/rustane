@@ -39,7 +39,7 @@ help: ## Show this help
 	@echo "  make train-600m DATA=/path/to/train.bin"
 	@echo ""
 	@echo "  Leaderboard:"
-	@echo "  make submit               Submit last benchmark to bench.rustane.org"
+	@echo "  make submit               Submit queued benchmark results to bench.rustane.org"
 
 build: ## Build all crates
 	cargo build
@@ -108,42 +108,51 @@ train-600m: ## Train 600M on real data (needs climbmix-400B data file)
 
 LEADERBOARD_API ?= https://api.bench.rustane.org
 
-submit: ## Submit benchmark result to leaderboard
-	@if [ ! -f target/bench-result.json ]; then \
-		echo "No benchmark results found. Run a benchmark first:"; \
-		echo "  make sweep-600m"; \
-		echo "  make forward-7b"; \
-		exit 1; \
+submit: ## Submit queued benchmark results to leaderboard
+	@if [ -f target/bench-result.json ]; then \
+		echo "Note: target/bench-result.json is from the old single-file flow and is ignored."; \
+		echo "      Pending submissions now live in target/bench-results/."; \
+		echo ""; \
 	fi
-	@echo ""
-	@echo "Submit to rustane leaderboard (bench.rustane.org)"
-	@echo ""
-	@read -p "Your name: " NAME; \
-	read -p "X handle (optional, e.g. @danpacary): " XHANDLE; \
-	TMPFILE=$$(mktemp); \
-	jq --arg name "$$NAME" --arg x "$$XHANDLE" \
-		'.submitter = {name: $$name, x_handle: $$x}' \
-		target/bench-result.json > "$$TMPFILE"; \
+	@if [ -z "$$(ls target/bench-results/*.json 2>/dev/null)" ]; then \
+		echo "No pending results. Run a benchmark first."; exit 1; \
+	fi
+	@mkdir -p target/bench-results/submitted
+	@COUNT=$$(ls target/bench-results/*.json | wc -l | tr -d ' '); \
 	echo ""; \
-	echo "Submitting..."; \
-	RESPONSE=$$(curl -s -X POST $(LEADERBOARD_API)/api/submit \
-		-H "Content-Type: application/json" \
-		-d @"$$TMPFILE"); \
-	echo "$$RESPONSE" | jq .; \
-	RESULT_ID=$$(echo "$$RESPONSE" | jq -r '.id // empty'); \
-	if [ -n "$$RESULT_ID" ]; then \
-		echo ""; \
-		echo "View: https://bench.rustane.org/?id=$$RESULT_ID"; \
-		echo ""; \
-		read -p "Share on X? (y/n): " SHARE; \
-		if [ "$$SHARE" = "y" ]; then \
-			TOKS=$$(jq -r '.results.tok_per_s' target/bench-result.json); \
-			MS=$$(jq -r '.results.ms_per_step' target/bench-result.json); \
-			BENCH=$$(jq -r '.benchmark' target/bench-result.json); \
-			CHIP=$$(jq -r '.hardware.chip' target/bench-result.json); \
-			RAM=$$(jq -r '.hardware.ram_gb' target/bench-result.json); \
-			TEXT="Just ran rustane $$BENCH on $$CHIP $${RAM}GB%0A%0A$${TOKS} tok/s | $${MS}ms/step%0A%0Ahttps://bench.rustane.org/?id=$$RESULT_ID"; \
-			open "https://twitter.com/intent/tweet?text=$$TEXT"; \
+	echo "$$COUNT pending result(s) in target/bench-results/"; \
+	echo ""; \
+	read -p "Your name: " NAME; \
+	read -p "X handle (optional): " XHANDLE; \
+	echo ""; \
+	SUBMITTED=0; \
+	for f in $$(ls target/bench-results/*.json | sort); do \
+		BENCH=$$(jq -r '.benchmark' "$$f"); \
+		echo "Submitting $$BENCH ($$f)..."; \
+		TMPFILE=$$(mktemp); \
+		jq --arg name "$$NAME" --arg x "$$XHANDLE" \
+			'.submitter = {name: $$name, x_handle: $$x}' "$$f" > "$$TMPFILE"; \
+		RESPONSE=$$(curl -s -X POST $(LEADERBOARD_API)/api/submit \
+			-H "Content-Type: application/json" -d @"$$TMPFILE"); \
+		rm -f "$$TMPFILE"; \
+		RESULT_ID=$$(echo "$$RESPONSE" | jq -r '.id // empty'); \
+		if [ -n "$$RESULT_ID" ]; then \
+			PARAMS=$$(jq -r '.config.params_m' "$$f"); \
+			TOKS=$$(jq -r '.results.tok_per_s' "$$f"); \
+			MS=$$(jq -r '.results.ms_per_step' "$$f"); \
+			FWD=$$(jq -r '.results.ms_fwd' "$$f"); \
+			BWD=$$(jq -r '.results.ms_bwd' "$$f"); \
+			LOSS=$$(jq -r '"\(.results.loss_start) → \(.results.loss_end)"' "$$f"); \
+			echo "  ✅ $${PARAMS}M | $${TOKS} tok/s | $${MS}ms/step (fwd=$${FWD} bwd=$${BWD}) | loss $${LOSS}"; \
+			echo "     → https://bench.rustane.org/?id=$$RESULT_ID"; \
+			mv "$$f" target/bench-results/submitted/; \
+			SUBMITTED=$$((SUBMITTED + 1)); \
+		else \
+			echo "  ❌ $$BENCH failed:"; \
+			echo "$$RESPONSE" | jq .; \
+			echo "  Stopping. $$SUBMITTED submitted, remaining kept."; \
+			exit 1; \
 		fi; \
-	fi; \
-	rm -f "$$TMPFILE"
+	done; \
+	echo ""; \
+	echo "$$SUBMITTED result(s) submitted."

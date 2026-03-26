@@ -13,7 +13,11 @@ fn compare_logits_and_loss(
     expected_logits: &[f32],
     expected_loss: f32,
 ) {
-    assert_eq!(actual_logits.len(), expected_logits.len(), "logits length mismatch");
+    assert_eq!(
+        actual_logits.len(),
+        expected_logits.len(),
+        "logits length mismatch"
+    );
 
     let mut max_abs = 0.0f32;
     let mut sum_abs = 0.0f32;
@@ -38,7 +42,10 @@ fn compare_logits_and_loss(
     let mean_abs_diff = sum_abs / actual_logits.len() as f32;
     let loss_abs_diff = (actual_loss - expected_loss).abs();
 
-    assert!(max_abs <= MAX_ABS_DIFF_TOL, "max abs diff too large: {max_abs}");
+    assert!(
+        max_abs <= MAX_ABS_DIFF_TOL,
+        "max abs diff too large: {max_abs}"
+    );
     assert!(
         mean_abs_diff <= MEAN_ABS_DIFF_TOL,
         "mean abs diff too large: {mean_abs_diff}"
@@ -54,8 +61,12 @@ fn compare_logits_and_loss(
 }
 
 fn deterministic_tokens(cfg: &ModelConfig) -> (Vec<u32>, Vec<u32>) {
-    let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
-    let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
+    let tokens: Vec<u32> = (0..cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
+    let targets: Vec<u32> = (1..=cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
     (tokens, targets)
 }
 

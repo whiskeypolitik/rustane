@@ -12,7 +12,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-fn custom_config(dim: usize, hidden: usize, heads: usize, nlayers: usize, seq: usize) -> ModelConfig {
+fn custom_config(
+    dim: usize,
+    hidden: usize,
+    heads: usize,
+    nlayers: usize,
+    seq: usize,
+) -> ModelConfig {
     ModelConfig {
         dim,
         hidden,
@@ -119,7 +125,9 @@ fn write_results(results: &[SdpaCompileResult]) {
 
     let mut summary = String::new();
     summary.push_str("# Split SDPA Compile Smoke Matrix\n\n");
-    summary.push_str("| name | dim | hidden | heads | layers | seq | compile | compile_ms | error |\n");
+    summary.push_str(
+        "| name | dim | hidden | heads | layers | seq | compile | compile_ms | error |\n",
+    );
     summary.push_str("| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | --- |\n");
     for r in results {
         let _ = writeln!(

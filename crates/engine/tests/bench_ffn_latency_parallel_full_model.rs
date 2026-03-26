@@ -48,11 +48,17 @@ fn results_dir() -> PathBuf {
 }
 
 fn json_path(scale_name: &str) -> PathBuf {
-    results_dir().join(format!("full_model_{}_compare.json", scale_name.to_lowercase()))
+    results_dir().join(format!(
+        "full_model_{}_compare.json",
+        scale_name.to_lowercase()
+    ))
 }
 
 fn summary_path(scale_name: &str) -> PathBuf {
-    results_dir().join(format!("full_model_{}_summary.md", scale_name.to_lowercase()))
+    results_dir().join(format!(
+        "full_model_{}_summary.md",
+        scale_name.to_lowercase()
+    ))
 }
 
 fn ensure_results_dir() {
@@ -65,7 +71,13 @@ fn write_json<T: Serialize>(path: &Path, value: &T) {
     fs::write(path, json).expect("write json");
 }
 
-fn custom_config(dim: usize, hidden: usize, heads: usize, nlayers: usize, seq: usize) -> ModelConfig {
+fn custom_config(
+    dim: usize,
+    hidden: usize,
+    heads: usize,
+    nlayers: usize,
+    seq: usize,
+) -> ModelConfig {
     ModelConfig {
         dim,
         hidden,
@@ -94,8 +106,12 @@ fn cfg_80b() -> ModelConfig {
 }
 
 fn deterministic_tokens(cfg: &ModelConfig) -> (Vec<u32>, Vec<u32>) {
-    let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
-    let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
+    let tokens: Vec<u32> = (0..cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
+    let targets: Vec<u32> = (1..=cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
     (tokens, targets)
 }
 
@@ -116,11 +132,22 @@ fn rss_mb() -> Option<f32> {
     if !output.status.success() {
         return None;
     }
-    let kb: f32 = String::from_utf8(output.stdout).ok()?.trim().parse::<f32>().ok()?;
+    let kb: f32 = String::from_utf8(output.stdout)
+        .ok()?
+        .trim()
+        .parse::<f32>()
+        .ok()?;
     Some(kb / 1024.0)
 }
 
-fn stage_spatial(dst: &mut [f32], channels: usize, sp_width: usize, src: &[f32], src_width: usize, sp_offset: usize) {
+fn stage_spatial(
+    dst: &mut [f32],
+    channels: usize,
+    sp_width: usize,
+    src: &[f32],
+    src_width: usize,
+    sp_offset: usize,
+) {
     for c in 0..channels {
         let dst_row = c * sp_width;
         let src_row = c * src_width;
@@ -129,10 +156,21 @@ fn stage_spatial(dst: &mut [f32], channels: usize, sp_width: usize, src: &[f32],
     }
 }
 
-fn read_channels_into(src: &[f32], total_ch: usize, seq: usize, ch_start: usize, ch_count: usize, dst: &mut [f32]) {
+fn read_channels_into(
+    src: &[f32],
+    total_ch: usize,
+    seq: usize,
+    ch_start: usize,
+    ch_count: usize,
+    dst: &mut [f32],
+) {
     let start = ch_start * seq;
     let end = (ch_start + ch_count).min(total_ch) * seq;
-    assert_eq!(dst.len(), end - start, "destination length mismatch in read_channels_into");
+    assert_eq!(
+        dst.len(),
+        end - start,
+        "destination length mismatch in read_channels_into"
+    );
     dst.copy_from_slice(&src[start..end]);
 }
 
@@ -149,8 +187,7 @@ fn stage_weight_columns(
     for r in 0..rows {
         let src_row = r * total_cols + col_start;
         let dst_row = r * sp_width + sp_offset;
-        dst[dst_row..dst_row + col_count]
-            .copy_from_slice(&src[src_row..src_row + col_count]);
+        dst[dst_row..dst_row + col_count].copy_from_slice(&src[src_row..src_row + col_count]);
     }
 }
 
@@ -189,8 +226,17 @@ impl DiffMetrics {
     }
 }
 
-fn compare_logits_and_loss(actual_logits: &[f32], actual_loss: f32, expected_logits: &[f32], expected_loss: f32) -> DiffMetrics {
-    assert_eq!(actual_logits.len(), expected_logits.len(), "logits length mismatch");
+fn compare_logits_and_loss(
+    actual_logits: &[f32],
+    actual_loss: f32,
+    expected_logits: &[f32],
+    expected_loss: f32,
+) -> DiffMetrics {
+    assert_eq!(
+        actual_logits.len(),
+        expected_logits.len(),
+        "logits length mismatch"
+    );
 
     let mut max_abs = 0.0f32;
     let mut sum_abs = 0.0f32;
@@ -299,8 +345,12 @@ struct ExecOptions {
 }
 
 impl ExecOptions {
-    const DIRECT: Self = Self { collect_stats: false };
-    const STATS: Self = Self { collect_stats: true };
+    const DIRECT: Self = Self {
+        collect_stats: false,
+    };
+    const STATS: Self = Self {
+        collect_stats: true,
+    };
 }
 
 impl Default for AneSample {
@@ -431,8 +481,18 @@ fn compile_wo_runner(cfg: &ModelConfig) -> WoRunner {
     let sp = dyn_matmul::spatial_width(cfg.seq, cfg.dim);
     WoRunner {
         exe,
-        input: TensorData::new(ane_bridge::ane::Shape { batch: 1, channels: cfg.q_dim, height: 1, width: sp }),
-        output: TensorData::new(ane_bridge::ane::Shape { batch: 1, channels: cfg.dim, height: 1, width: cfg.seq }),
+        input: TensorData::new(ane_bridge::ane::Shape {
+            batch: 1,
+            channels: cfg.q_dim,
+            height: 1,
+            width: sp,
+        }),
+        output: TensorData::new(ane_bridge::ane::Shape {
+            batch: 1,
+            channels: cfg.dim,
+            height: 1,
+            width: cfg.seq,
+        }),
     }
 }
 
@@ -447,7 +507,10 @@ fn shard_layouts(cfg: &ModelConfig, shard_count: usize) -> Vec<ShardLayout> {
 }
 
 fn compile_sharded_runner(cfg: &ModelConfig, shard_count: usize) -> (ShardedFfnRunner, f32) {
-    assert!(cfg.hidden % shard_count == 0, "hidden must be divisible by shard count");
+    assert!(
+        cfg.hidden % shard_count == 0,
+        "hidden must be divisible by shard count"
+    );
     let shard_hidden = cfg.hidden / shard_count;
     let qos = NSQualityOfService::UserInteractive;
     let t0 = Instant::now();
@@ -466,10 +529,30 @@ fn compile_sharded_runner(cfg: &ModelConfig, shard_count: usize) -> (ShardedFfnR
         workers.push(ShardWorker {
             w13_exe,
             w2_exe,
-            w13_in: TensorData::new(ane_bridge::ane::Shape { batch: 1, channels: cfg.dim, height: 1, width: w13_sp }),
-            w13_out: TensorData::new(ane_bridge::ane::Shape { batch: 1, channels: 2 * shard_hidden, height: 1, width: cfg.seq }),
-            w2_in: TensorData::new(ane_bridge::ane::Shape { batch: 1, channels: shard_hidden, height: 1, width: w2_sp }),
-            w2_out: TensorData::new(ane_bridge::ane::Shape { batch: 1, channels: cfg.dim, height: 1, width: cfg.seq }),
+            w13_in: TensorData::new(ane_bridge::ane::Shape {
+                batch: 1,
+                channels: cfg.dim,
+                height: 1,
+                width: w13_sp,
+            }),
+            w13_out: TensorData::new(ane_bridge::ane::Shape {
+                batch: 1,
+                channels: 2 * shard_hidden,
+                height: 1,
+                width: cfg.seq,
+            }),
+            w2_in: TensorData::new(ane_bridge::ane::Shape {
+                batch: 1,
+                channels: shard_hidden,
+                height: 1,
+                width: w2_sp,
+            }),
+            w2_out: TensorData::new(ane_bridge::ane::Shape {
+                batch: 1,
+                channels: cfg.dim,
+                height: 1,
+                width: cfg.seq,
+            }),
             h1: vec![0.0; shard_hidden * cfg.seq],
             h3: vec![0.0; shard_hidden * cfg.seq],
             gate: vec![0.0; shard_hidden * cfg.seq],
@@ -510,7 +593,11 @@ fn compile_baseline_runner(cfg: &ModelConfig) -> (BaselineRunner, f32) {
     } else {
         dyn_matmul::spatial_width(cfg.seq, cfg.hidden)
     };
-    let w13_out_channels = if use_dual_w13 { 2 * cfg.hidden } else { cfg.hidden };
+    let w13_out_channels = if use_dual_w13 {
+        2 * cfg.hidden
+    } else {
+        cfg.hidden
+    };
     let w2_exe = dyn_matmul::build(cfg.hidden, cfg.dim, cfg.seq)
         .compile(qos)
         .expect("baseline w2 compile");
@@ -524,7 +611,12 @@ fn compile_baseline_runner(cfg: &ModelConfig) -> (BaselineRunner, f32) {
             sdpa,
             wo,
             w13_exe,
-            w13_in: TensorData::new(ane_bridge::ane::Shape { batch: 1, channels: cfg.dim, height: 1, width: w13_sp }),
+            w13_in: TensorData::new(ane_bridge::ane::Shape {
+                batch: 1,
+                channels: cfg.dim,
+                height: 1,
+                width: w13_sp,
+            }),
             w13_out: TensorData::new(ane_bridge::ane::Shape {
                 batch: 1,
                 channels: w13_out_channels,
@@ -532,8 +624,18 @@ fn compile_baseline_runner(cfg: &ModelConfig) -> (BaselineRunner, f32) {
                 width: cfg.seq,
             }),
             w2_exe,
-            w2_in: TensorData::new(ane_bridge::ane::Shape { batch: 1, channels: cfg.hidden, height: 1, width: w2_sp }),
-            w2_out: TensorData::new(ane_bridge::ane::Shape { batch: 1, channels: cfg.dim, height: 1, width: cfg.seq }),
+            w2_in: TensorData::new(ane_bridge::ane::Shape {
+                batch: 1,
+                channels: cfg.hidden,
+                height: 1,
+                width: w2_sp,
+            }),
+            w2_out: TensorData::new(ane_bridge::ane::Shape {
+                batch: 1,
+                channels: cfg.dim,
+                height: 1,
+                width: cfg.seq,
+            }),
             h1: vec![0.0; cfg.hidden * cfg.seq],
             h3: vec![0.0; cfg.hidden * cfg.seq],
             gate: vec![0.0; cfg.hidden * cfg.seq],
@@ -544,7 +646,13 @@ fn compile_baseline_runner(cfg: &ModelConfig) -> (BaselineRunner, f32) {
     )
 }
 
-fn run_sdpa(sdpa: &mut SdpaRunner, xnorm: &[f32], weights: &LayerWeights, attn_out: &mut [f32], options: ExecOptions) -> u64 {
+fn run_sdpa(
+    sdpa: &mut SdpaRunner,
+    xnorm: &[f32],
+    weights: &LayerWeights,
+    attn_out: &mut [f32],
+    options: ExecOptions,
+) -> u64 {
     sdpa.xnorm_in.copy_from_f32(xnorm);
     sdpa.wq_in.copy_from_f32(&weights.wq);
     sdpa.wk_in.copy_from_f32(&weights.wk);
@@ -553,14 +661,24 @@ fn run_sdpa(sdpa: &mut SdpaRunner, xnorm: &[f32], weights: &LayerWeights, attn_o
         sdpa.exe
             .run_cached_with_stats(
                 &[&sdpa.xnorm_in, &sdpa.wq_in, &sdpa.wk_in, &sdpa.wv_in],
-                &[&sdpa.attn_out, &sdpa.q_rope_out, &sdpa.k_rope_out, &sdpa.v_out],
+                &[
+                    &sdpa.attn_out,
+                    &sdpa.q_rope_out,
+                    &sdpa.k_rope_out,
+                    &sdpa.v_out,
+                ],
             )
             .expect("sdpa run")
     } else {
         sdpa.exe
             .run_cached_direct(
                 &[&sdpa.xnorm_in, &sdpa.wq_in, &sdpa.wk_in, &sdpa.wv_in],
-                &[&sdpa.attn_out, &sdpa.q_rope_out, &sdpa.k_rope_out, &sdpa.v_out],
+                &[
+                    &sdpa.attn_out,
+                    &sdpa.q_rope_out,
+                    &sdpa.k_rope_out,
+                    &sdpa.v_out,
+                ],
             )
             .expect("sdpa run");
         0
@@ -614,10 +732,30 @@ fn run_sharded_layer_forward_into(
     let alpha = 1.0 / (2.0 * cfg.nlayers as f32).sqrt();
     let scratch = &mut runner.layer_scratch;
 
-    rmsnorm::forward_channel_first(x, &layer_weights.gamma1, &mut scratch.xnorm, &mut scratch.rms_inv1, dim, seq);
+    rmsnorm::forward_channel_first(
+        x,
+        &layer_weights.gamma1,
+        &mut scratch.xnorm,
+        &mut scratch.rms_inv1,
+        dim,
+        seq,
+    );
     let mut total_hw_ns = 0u64;
-    total_hw_ns += run_sdpa(&mut runner.sdpa, &scratch.xnorm, layer_weights, &mut scratch.attn_out, ExecOptions::DIRECT);
-    total_hw_ns += run_wo(&mut runner.wo, cfg, &scratch.attn_out, layer_weights, &mut scratch.o_out, ExecOptions::DIRECT);
+    total_hw_ns += run_sdpa(
+        &mut runner.sdpa,
+        &scratch.xnorm,
+        layer_weights,
+        &mut scratch.attn_out,
+        ExecOptions::DIRECT,
+    );
+    total_hw_ns += run_wo(
+        &mut runner.wo,
+        cfg,
+        &scratch.attn_out,
+        layer_weights,
+        &mut scratch.o_out,
+        ExecOptions::DIRECT,
+    );
 
     vdsp::vsma(&scratch.o_out, alpha, x, &mut scratch.x2);
     rmsnorm::forward_channel_first(
@@ -648,7 +786,16 @@ fn run_sharded_layer_forward_into(
                     let mut locked = worker.w13_in.as_f32_slice_mut();
                     let buf = &mut *locked;
                     stage_spatial(buf, dim, w13_sp, x2norm_ref, seq, 0);
-                    stage_weight_columns(buf, dim, w13_sp, &layer_weights.w1, cfg.hidden, shard.col_start, shard_hidden, seq);
+                    stage_weight_columns(
+                        buf,
+                        dim,
+                        w13_sp,
+                        &layer_weights.w1,
+                        cfg.hidden,
+                        shard.col_start,
+                        shard_hidden,
+                        seq,
+                    );
                     stage_weight_columns(
                         buf,
                         dim,
@@ -660,13 +807,28 @@ fn run_sharded_layer_forward_into(
                         seq + shard_hidden,
                     );
                 }
-                worker.w13_exe
+                worker
+                    .w13_exe
                     .run_cached_direct(&[&worker.w13_in], &[&worker.w13_out])
                     .expect("w13 shard run");
                 {
                     let locked = worker.w13_out.as_f32_slice();
-                    read_channels_into(&locked, 2 * shard_hidden, seq, 0, shard_hidden, &mut worker.h1);
-                    read_channels_into(&locked, 2 * shard_hidden, seq, shard_hidden, shard_hidden, &mut worker.h3);
+                    read_channels_into(
+                        &locked,
+                        2 * shard_hidden,
+                        seq,
+                        0,
+                        shard_hidden,
+                        &mut worker.h1,
+                    );
+                    read_channels_into(
+                        &locked,
+                        2 * shard_hidden,
+                        seq,
+                        shard_hidden,
+                        shard_hidden,
+                        &mut worker.h3,
+                    );
                 }
 
                 silu::silu_gate(&worker.h1, &worker.h3, &mut worker.gate);
@@ -686,7 +848,8 @@ fn run_sharded_layer_forward_into(
                         seq,
                     );
                 }
-                worker.w2_exe
+                worker
+                    .w2_exe
                     .run_cached_direct(&[&worker.w2_in], &[&worker.w2_out])
                     .expect("w2 shard run");
             }));
@@ -701,7 +864,11 @@ fn run_sharded_layer_forward_into(
     scratch.ffn_out.fill(0.0);
     for worker in &runner.workers {
         let locked = worker.w2_out.as_f32_slice();
-        vdsp::vadd(&scratch.ffn_out, &locked[..scratch.ffn_out.len()], &mut scratch.merge_tmp);
+        vdsp::vadd(
+            &scratch.ffn_out,
+            &locked[..scratch.ffn_out.len()],
+            &mut scratch.merge_tmp,
+        );
         scratch.ffn_out.copy_from_slice(&scratch.merge_tmp);
     }
     vdsp::vsma(&scratch.ffn_out, alpha, &scratch.x2, x_next);
@@ -721,10 +888,30 @@ fn run_sharded_layer_forward_into_stats(
     let alpha = 1.0 / (2.0 * cfg.nlayers as f32).sqrt();
     let scratch = &mut runner.layer_scratch;
 
-    rmsnorm::forward_channel_first(x, &layer_weights.gamma1, &mut scratch.xnorm, &mut scratch.rms_inv1, dim, seq);
+    rmsnorm::forward_channel_first(
+        x,
+        &layer_weights.gamma1,
+        &mut scratch.xnorm,
+        &mut scratch.rms_inv1,
+        dim,
+        seq,
+    );
     let mut total_hw_ns = 0u64;
-    total_hw_ns += run_sdpa(&mut runner.sdpa, &scratch.xnorm, layer_weights, &mut scratch.attn_out, ExecOptions::STATS);
-    total_hw_ns += run_wo(&mut runner.wo, cfg, &scratch.attn_out, layer_weights, &mut scratch.o_out, ExecOptions::STATS);
+    total_hw_ns += run_sdpa(
+        &mut runner.sdpa,
+        &scratch.xnorm,
+        layer_weights,
+        &mut scratch.attn_out,
+        ExecOptions::STATS,
+    );
+    total_hw_ns += run_wo(
+        &mut runner.wo,
+        cfg,
+        &scratch.attn_out,
+        layer_weights,
+        &mut scratch.o_out,
+        ExecOptions::STATS,
+    );
 
     vdsp::vsma(&scratch.o_out, alpha, x, &mut scratch.x2);
     rmsnorm::forward_channel_first(
@@ -755,7 +942,16 @@ fn run_sharded_layer_forward_into_stats(
                     let mut locked = worker.w13_in.as_f32_slice_mut();
                     let buf = &mut *locked;
                     stage_spatial(buf, dim, w13_sp, x2norm_ref, seq, 0);
-                    stage_weight_columns(buf, dim, w13_sp, &layer_weights.w1, cfg.hidden, shard.col_start, shard_hidden, seq);
+                    stage_weight_columns(
+                        buf,
+                        dim,
+                        w13_sp,
+                        &layer_weights.w1,
+                        cfg.hidden,
+                        shard.col_start,
+                        shard_hidden,
+                        seq,
+                    );
                     stage_weight_columns(
                         buf,
                         dim,
@@ -773,8 +969,22 @@ fn run_sharded_layer_forward_into_stats(
                     .expect("w13 shard stats run");
                 {
                     let locked = worker.w13_out.as_f32_slice();
-                    read_channels_into(&locked, 2 * shard_hidden, seq, 0, shard_hidden, &mut worker.h1);
-                    read_channels_into(&locked, 2 * shard_hidden, seq, shard_hidden, shard_hidden, &mut worker.h3);
+                    read_channels_into(
+                        &locked,
+                        2 * shard_hidden,
+                        seq,
+                        0,
+                        shard_hidden,
+                        &mut worker.h1,
+                    );
+                    read_channels_into(
+                        &locked,
+                        2 * shard_hidden,
+                        seq,
+                        shard_hidden,
+                        shard_hidden,
+                        &mut worker.h3,
+                    );
                 }
 
                 silu::silu_gate(&worker.h1, &worker.h3, &mut worker.gate);
@@ -811,7 +1021,11 @@ fn run_sharded_layer_forward_into_stats(
     scratch.ffn_out.fill(0.0);
     for worker in &runner.workers {
         let locked = worker.w2_out.as_f32_slice();
-        vdsp::vadd(&scratch.ffn_out, &locked[..scratch.ffn_out.len()], &mut scratch.merge_tmp);
+        vdsp::vadd(
+            &scratch.ffn_out,
+            &locked[..scratch.ffn_out.len()],
+            &mut scratch.merge_tmp,
+        );
         scratch.ffn_out.copy_from_slice(&scratch.merge_tmp);
     }
     vdsp::vsma(&scratch.ffn_out, alpha, &scratch.x2, x_next);
@@ -831,10 +1045,30 @@ fn run_baseline_layer_forward_into(
     let alpha = 1.0 / (2.0 * cfg.nlayers as f32).sqrt();
     let scratch = &mut runner.layer_scratch;
 
-    rmsnorm::forward_channel_first(x, &layer_weights.gamma1, &mut scratch.xnorm, &mut scratch.rms_inv1, dim, seq);
+    rmsnorm::forward_channel_first(
+        x,
+        &layer_weights.gamma1,
+        &mut scratch.xnorm,
+        &mut scratch.rms_inv1,
+        dim,
+        seq,
+    );
     let mut total_hw_ns = 0u64;
-    total_hw_ns += run_sdpa(&mut runner.sdpa, &scratch.xnorm, layer_weights, &mut scratch.attn_out, options);
-    total_hw_ns += run_wo(&mut runner.wo, cfg, &scratch.attn_out, layer_weights, &mut scratch.o_out, options);
+    total_hw_ns += run_sdpa(
+        &mut runner.sdpa,
+        &scratch.xnorm,
+        layer_weights,
+        &mut scratch.attn_out,
+        options,
+    );
+    total_hw_ns += run_wo(
+        &mut runner.wo,
+        cfg,
+        &scratch.attn_out,
+        layer_weights,
+        &mut scratch.o_out,
+        options,
+    );
 
     vdsp::vsma(&scratch.o_out, alpha, x, &mut scratch.x2);
     rmsnorm::forward_channel_first(
@@ -860,7 +1094,14 @@ fn run_baseline_layer_forward_into(
         stage_spatial(buf, dim, w13_sp, &scratch.x2norm, seq, 0);
         stage_spatial(buf, dim, w13_sp, &layer_weights.w1, cfg.hidden, seq);
         if runner.use_dual_w13 {
-            stage_spatial(buf, dim, w13_sp, &layer_weights.w3, cfg.hidden, seq + cfg.hidden);
+            stage_spatial(
+                buf,
+                dim,
+                w13_sp,
+                &layer_weights.w3,
+                cfg.hidden,
+                seq + cfg.hidden,
+            );
         }
     }
 
@@ -880,7 +1121,14 @@ fn run_baseline_layer_forward_into(
         {
             let locked = runner.w13_out.as_f32_slice();
             read_channels_into(&locked, 2 * cfg.hidden, seq, 0, cfg.hidden, &mut runner.h1);
-            read_channels_into(&locked, 2 * cfg.hidden, seq, cfg.hidden, cfg.hidden, &mut runner.h3);
+            read_channels_into(
+                &locked,
+                2 * cfg.hidden,
+                seq,
+                cfg.hidden,
+                cfg.hidden,
+                &mut runner.h3,
+            );
         }
     } else {
         total_hw_ns += if options.collect_stats {
@@ -924,7 +1172,14 @@ fn run_baseline_layer_forward_into(
     }
 
     silu::silu_gate(&runner.h1, &runner.h3, &mut runner.gate);
-    vdsp::mtrans(&layer_weights.w2, cfg.hidden, &mut runner.w2t, dim, dim, cfg.hidden);
+    vdsp::mtrans(
+        &layer_weights.w2,
+        cfg.hidden,
+        &mut runner.w2t,
+        dim,
+        dim,
+        cfg.hidden,
+    );
     {
         let mut locked = runner.w2_in.as_f32_slice_mut();
         let buf = &mut *locked;
@@ -953,16 +1208,36 @@ fn run_baseline_layer_forward_into(
     (ffn_t0.elapsed().as_secs_f32() * 1000.0, total_hw_ns)
 }
 
-fn finalize_logits_and_loss(cfg: &ModelConfig, weights: &ModelWeights, ws: &mut ModelForwardWorkspace, targets: &[u32], softcap: f32) -> (Vec<f32>, f32) {
+fn finalize_logits_and_loss(
+    cfg: &ModelConfig,
+    weights: &ModelWeights,
+    ws: &mut ModelForwardWorkspace,
+    targets: &[u32],
+    softcap: f32,
+) -> (Vec<f32>, f32) {
     let dim = cfg.dim;
     let seq = cfg.seq;
     let vocab = cfg.vocab;
 
     ws.x_prenorm.copy_from_slice(&ws.x_buf);
-    rmsnorm::forward_channel_first(&ws.x_prenorm, &weights.gamma_final, &mut ws.x_final, &mut ws.rms_inv_final, dim, seq);
+    rmsnorm::forward_channel_first(
+        &ws.x_prenorm,
+        &weights.gamma_final,
+        &mut ws.x_final,
+        &mut ws.rms_inv_final,
+        dim,
+        seq,
+    );
     vdsp::mtrans(&ws.x_final, seq, &mut ws.x_final_row, dim, dim, seq);
     ws.logits.fill(0.0);
-    vdsp::sgemm_at(&ws.x_final_row, seq, dim, &weights.embed, vocab, &mut ws.logits);
+    vdsp::sgemm_at(
+        &ws.x_final_row,
+        seq,
+        dim,
+        &weights.embed,
+        vocab,
+        &mut ws.logits,
+    );
 
     if softcap > 0.0 {
         vdsp::sscal(&mut ws.logits, 1.0 / softcap);
@@ -1008,7 +1283,11 @@ fn run_baseline_reference_once(
     let mut ws = ModelForwardWorkspace::new_lean(cfg);
     ws.x_buf.copy_from_slice(&x_buf);
     let (logits, loss) = finalize_logits_and_loss(cfg, weights, &mut ws, targets, softcap);
-    FullModelOutputs { logits, loss, total_ffn_ms }
+    FullModelOutputs {
+        logits,
+        loss,
+        total_ffn_ms,
+    }
 }
 
 #[allow(dead_code)]
@@ -1043,7 +1322,11 @@ fn run_sharded_full_forward_once(
     }
 
     let (logits, loss) = finalize_logits_and_loss(&cfg, weights, ws, targets, softcap);
-    FullModelOutputs { logits, loss, total_ffn_ms }
+    FullModelOutputs {
+        logits,
+        loss,
+        total_ffn_ms,
+    }
 }
 
 fn run_sharded_full_forward_once_with_stats(
@@ -1079,7 +1362,14 @@ fn run_sharded_full_forward_once_with_stats(
     }
 
     let (logits, loss) = finalize_logits_and_loss(&cfg, weights, ws, targets, softcap);
-    (FullModelOutputs { logits, loss, total_ffn_ms }, total_hw_ns)
+    (
+        FullModelOutputs {
+            logits,
+            loss,
+            total_ffn_ms,
+        },
+        total_hw_ns,
+    )
 }
 
 fn run_baseline_full_forward_once(
@@ -1115,7 +1405,14 @@ fn run_baseline_full_forward_once(
     }
 
     let (logits, loss) = finalize_logits_and_loss(&cfg, weights, ws, targets, softcap);
-    (FullModelOutputs { logits, loss, total_ffn_ms }, total_hw_ns)
+    (
+        FullModelOutputs {
+            logits,
+            loss,
+            total_ffn_ms,
+        },
+        total_hw_ns,
+    )
 }
 
 #[allow(dead_code)]
@@ -1141,7 +1438,11 @@ fn measure_baseline_ane_stats(
         ExecOptions::STATS,
     );
     let diff = compare_logits_and_loss(&warmup.logits, warmup.loss, baseline_logits, baseline_loss);
-    assert!(diff.passes(), "baseline stats pass diverged from baseline: {:?}", diff);
+    assert!(
+        diff.passes(),
+        "baseline stats pass diverged from baseline: {:?}",
+        diff
+    );
 
     let mut hw_samples_ms = Vec::with_capacity(ANE_STATS_RUNS);
     for _ in 0..ANE_STATS_RUNS {
@@ -1156,7 +1457,11 @@ fn measure_baseline_ane_stats(
             ExecOptions::STATS,
         );
         let diff = compare_logits_and_loss(&out.logits, out.loss, baseline_logits, baseline_loss);
-        assert!(diff.passes(), "baseline stats sample diverged from baseline: {:?}", diff);
+        assert!(
+            diff.passes(),
+            "baseline stats sample diverged from baseline: {:?}",
+            diff
+        );
         let _wall_ms = t0.elapsed().as_secs_f32() * 1000.0;
         hw_samples_ms.push(hw_ns as f32 / 1_000_000.0);
     }
@@ -1232,7 +1537,12 @@ fn zero_diff_metrics() -> DiffMetrics {
     }
 }
 
-fn run_baseline_mode(cfg: &ModelConfig, weights: &ModelWeights, tokens: &[u32], targets: &[u32]) -> (ModeResult, Vec<f32>, f32) {
+fn run_baseline_mode(
+    cfg: &ModelConfig,
+    weights: &ModelWeights,
+    tokens: &[u32],
+    targets: &[u32],
+) -> (ModeResult, Vec<f32>, f32) {
     let softcap = TrainConfig::default().softcap;
     let (mut runner, compile_s) = compile_baseline_runner(cfg);
 
@@ -1269,7 +1579,11 @@ fn run_baseline_mode(cfg: &ModelConfig, weights: &ModelWeights, tokens: &[u32], 
             ExecOptions::STATS,
         );
         let diff = compare_logits_and_loss(&out.logits, out.loss, &baseline_logits, baseline_loss);
-        assert!(diff.passes(), "baseline measured sample diverged from warmup baseline: {:?}", diff);
+        assert!(
+            diff.passes(),
+            "baseline measured sample diverged from warmup baseline: {:?}",
+            diff
+        );
         timed_samples_ms.push(t0.elapsed().as_secs_f32() * 1000.0);
         total_ffn_samples_ms.push(out.total_ffn_ms);
         hw_samples_ms.push(hw_ns as f32 / 1_000_000.0);
@@ -1278,7 +1592,9 @@ fn run_baseline_mode(cfg: &ModelConfig, weights: &ModelWeights, tokens: &[u32], 
 
     let mean_full_forward_ms = mean(&timed_samples_ms);
     let total_ffn_ms = mean(&total_ffn_samples_ms);
-    let ane_sample = AneSample { hw_ms: mean(&hw_samples_ms) };
+    let ane_sample = AneSample {
+        hw_ms: mean(&hw_samples_ms),
+    };
     let tok_per_s = cfg.seq as f32 * 1000.0 / mean_full_forward_ms;
     let total_non_ffn_ms = (mean_full_forward_ms - total_ffn_ms).max(0.0);
     let ane_busy_pct = if mean_full_forward_ms > 0.0 {
@@ -1335,7 +1651,14 @@ fn run_sharded_mode(
     let mut peak_rss_mb = rss_mb().unwrap_or(0.0);
 
     let t0 = Instant::now();
-    let (warmup, _) = run_sharded_full_forward_once_with_stats(&mut runner, &mut ws, weights, tokens, targets, softcap);
+    let (warmup, _) = run_sharded_full_forward_once_with_stats(
+        &mut runner,
+        &mut ws,
+        weights,
+        tokens,
+        targets,
+        softcap,
+    );
     let warmup_wall_ms = t0.elapsed().as_secs_f32() * 1000.0;
     let diff = compare_logits_and_loss(&warmup.logits, warmup.loss, baseline_logits, baseline_loss);
     peak_rss_mb = peak_rss_mb.max(rss_mb().unwrap_or(peak_rss_mb));
@@ -1345,8 +1668,16 @@ fn run_sharded_mode(
     let mut hw_samples_ms = Vec::with_capacity(TIMED_RUNS);
     for _ in 0..TIMED_RUNS {
         let t0 = Instant::now();
-        let (out, hw_ns) = run_sharded_full_forward_once_with_stats(&mut runner, &mut ws, weights, tokens, targets, softcap);
-        let sample_diff = compare_logits_and_loss(&out.logits, out.loss, baseline_logits, baseline_loss);
+        let (out, hw_ns) = run_sharded_full_forward_once_with_stats(
+            &mut runner,
+            &mut ws,
+            weights,
+            tokens,
+            targets,
+            softcap,
+        );
+        let sample_diff =
+            compare_logits_and_loss(&out.logits, out.loss, baseline_logits, baseline_loss);
         assert!(
             sample_diff.passes(),
             "sharded measured sample diverged from baseline for shard{}: {:?}",
@@ -1364,7 +1695,9 @@ fn run_sharded_mode(
     let total_ffn_ms = mean(&total_ffn_samples_ms);
     let total_non_ffn_ms = (mean_full_forward_ms - total_ffn_ms).max(0.0);
     let tok_per_s = cfg.seq as f32 * 1000.0 / mean_full_forward_ms;
-    let ane_sample = AneSample { hw_ms: mean(&hw_samples_ms) };
+    let ane_sample = AneSample {
+        hw_ms: mean(&hw_samples_ms),
+    };
     let ane_busy_pct = if mean_full_forward_ms > 0.0 {
         ane_sample.hw_ms / mean_full_forward_ms * 100.0
     } else {
@@ -1457,13 +1790,21 @@ fn write_summary(result: &ExperimentResult, path: &Path) {
 
     summary.push_str(&format!(
         "Primary success: **{}**\n\n",
-        if result.primary_success { "PASS" } else { "FAIL" }
+        if result.primary_success {
+            "PASS"
+        } else {
+            "FAIL"
+        }
     ));
     if !result.winning_modes.is_empty() {
-        summary.push_str(&format!("Winning modes: `{}`\n\n", result.winning_modes.join("`, `")));
+        summary.push_str(&format!(
+            "Winning modes: `{}`\n\n",
+            result.winning_modes.join("`, `")
+        ));
     }
     summary.push_str("## Notes\n\n");
-    summary.push_str("- Each mode runs 1 warmup plus 2 measured stats-enabled full-model passes.\n");
+    summary
+        .push_str("- Each mode runs 1 warmup plus 2 measured stats-enabled full-model passes.\n");
     summary.push_str("- Reported wall time, FFN totals, RSS, and ANE utilization all come from the same measured samples.\n");
     summary.push_str("- This harness uses the mirrored stats-enabled path, not `full_model::forward_only_ws(...)`.\n");
 
@@ -1542,13 +1883,21 @@ fn write_selected_summary(result: &SelectedExperimentResult, path: &Path) {
 
     summary.push_str(&format!(
         "Primary success: **{}**\n\n",
-        if result.primary_success { "PASS" } else { "FAIL" }
+        if result.primary_success {
+            "PASS"
+        } else {
+            "FAIL"
+        }
     ));
     if !result.winning_modes.is_empty() {
-        summary.push_str(&format!("Winning modes: `{}`\n\n", result.winning_modes.join("`, `")));
+        summary.push_str(&format!(
+            "Winning modes: `{}`\n\n",
+            result.winning_modes.join("`, `")
+        ));
     }
     summary.push_str("## Notes\n\n");
-    summary.push_str("- Each mode runs 1 warmup plus 2 measured stats-enabled full-model passes.\n");
+    summary
+        .push_str("- Each mode runs 1 warmup plus 2 measured stats-enabled full-model passes.\n");
     summary.push_str("- Reported wall time, FFN totals, RSS, and ANE utilization all come from the same measured samples.\n");
     summary.push_str("- This harness uses the mirrored stats-enabled path, not `full_model::forward_only_ws(...)`.\n");
 
@@ -1559,14 +1908,69 @@ fn write_selected_summary(result: &SelectedExperimentResult, path: &Path) {
 fn run_experiment(cfg: &ModelConfig, name: &str) -> ExperimentResult {
     let weights = ModelWeights::random(cfg);
     let (tokens, targets) = deterministic_tokens(cfg);
-    let (baseline, baseline_logits, baseline_loss) = run_baseline_mode(cfg, &weights, &tokens, &targets);
+    let (baseline, baseline_logits, baseline_loss) =
+        run_baseline_mode(cfg, &weights, &tokens, &targets);
 
-    let shard2 = run_sharded_mode(cfg, &weights, &tokens, &targets, 2, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard4 = run_sharded_mode(cfg, &weights, &tokens, &targets, 4, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard6 = run_sharded_mode(cfg, &weights, &tokens, &targets, 6, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard8 = run_sharded_mode(cfg, &weights, &tokens, &targets, 8, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard12 = run_sharded_mode(cfg, &weights, &tokens, &targets, 12, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard16 = run_sharded_mode(cfg, &weights, &tokens, &targets, 16, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
+    let shard2 = run_sharded_mode(
+        cfg,
+        &weights,
+        &tokens,
+        &targets,
+        2,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard4 = run_sharded_mode(
+        cfg,
+        &weights,
+        &tokens,
+        &targets,
+        4,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard6 = run_sharded_mode(
+        cfg,
+        &weights,
+        &tokens,
+        &targets,
+        6,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard8 = run_sharded_mode(
+        cfg,
+        &weights,
+        &tokens,
+        &targets,
+        8,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard12 = run_sharded_mode(
+        cfg,
+        &weights,
+        &tokens,
+        &targets,
+        12,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard16 = run_sharded_mode(
+        cfg,
+        &weights,
+        &tokens,
+        &targets,
+        16,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
 
     let winning_modes = [
         (&shard2, "shard2"),
@@ -1613,21 +2017,100 @@ fn ffn_shard_full_model_smoke_30b_matches_baseline() {
     let cfg = cfg_30b();
     let weights = ModelWeights::random(&cfg);
     let (tokens, targets) = deterministic_tokens(&cfg);
-    let (baseline, baseline_logits, baseline_loss) = run_baseline_mode(&cfg, &weights, &tokens, &targets);
+    let (baseline, baseline_logits, baseline_loss) =
+        run_baseline_mode(&cfg, &weights, &tokens, &targets);
 
-    let shard2 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 2, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard4 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 4, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard6 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 6, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard8 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 8, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard12 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 12, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard16 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 16, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
+    let shard2 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        2,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard4 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        4,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard6 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        6,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard8 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        8,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard12 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        12,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard16 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        16,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
 
-    assert!(shard2.correctness_pass, "30B shard2 correctness failed: {:?}", shard2.diff_vs_baseline);
-    assert!(shard4.correctness_pass, "30B shard4 correctness failed: {:?}", shard4.diff_vs_baseline);
-    assert!(shard6.correctness_pass, "30B shard6 correctness failed: {:?}", shard6.diff_vs_baseline);
-    assert!(shard8.correctness_pass, "30B shard8 correctness failed: {:?}", shard8.diff_vs_baseline);
-    assert!(shard12.correctness_pass, "30B shard12 correctness failed: {:?}", shard12.diff_vs_baseline);
-    assert!(shard16.correctness_pass, "30B shard16 correctness failed: {:?}", shard16.diff_vs_baseline);
+    assert!(
+        shard2.correctness_pass,
+        "30B shard2 correctness failed: {:?}",
+        shard2.diff_vs_baseline
+    );
+    assert!(
+        shard4.correctness_pass,
+        "30B shard4 correctness failed: {:?}",
+        shard4.diff_vs_baseline
+    );
+    assert!(
+        shard6.correctness_pass,
+        "30B shard6 correctness failed: {:?}",
+        shard6.diff_vs_baseline
+    );
+    assert!(
+        shard8.correctness_pass,
+        "30B shard8 correctness failed: {:?}",
+        shard8.diff_vs_baseline
+    );
+    assert!(
+        shard12.correctness_pass,
+        "30B shard12 correctness failed: {:?}",
+        shard12.diff_vs_baseline
+    );
+    assert!(
+        shard16.correctness_pass,
+        "30B shard16 correctness failed: {:?}",
+        shard16.diff_vs_baseline
+    );
 }
 
 #[test]
@@ -1635,12 +2118,30 @@ fn ffn_shard_full_model_smoke_30b_matches_baseline() {
 fn bench_ffn_shard_full_model_30b() {
     let _guard = run_lock().lock().unwrap();
     let result = run_experiment(&cfg_30b(), "30B");
-    assert!(result.shard2.correctness_pass, "30B shard2 correctness failed");
-    assert!(result.shard4.correctness_pass, "30B shard4 correctness failed");
-    assert!(result.shard6.correctness_pass, "30B shard6 correctness failed");
-    assert!(result.shard8.correctness_pass, "30B shard8 correctness failed");
-    assert!(result.shard12.correctness_pass, "30B shard12 correctness failed");
-    assert!(result.shard16.correctness_pass, "30B shard16 correctness failed");
+    assert!(
+        result.shard2.correctness_pass,
+        "30B shard2 correctness failed"
+    );
+    assert!(
+        result.shard4.correctness_pass,
+        "30B shard4 correctness failed"
+    );
+    assert!(
+        result.shard6.correctness_pass,
+        "30B shard6 correctness failed"
+    );
+    assert!(
+        result.shard8.correctness_pass,
+        "30B shard8 correctness failed"
+    );
+    assert!(
+        result.shard12.correctness_pass,
+        "30B shard12 correctness failed"
+    );
+    assert!(
+        result.shard16.correctness_pass,
+        "30B shard16 correctness failed"
+    );
     write_json(&json_path("30b"), &result);
     write_summary(&result, &summary_path("30b"));
 }
@@ -1652,21 +2153,100 @@ fn ffn_shard_full_model_smoke_50b_matches_baseline() {
     let cfg = cfg_50b();
     let weights = ModelWeights::random(&cfg);
     let (tokens, targets) = deterministic_tokens(&cfg);
-    let (baseline, baseline_logits, baseline_loss) = run_baseline_mode(&cfg, &weights, &tokens, &targets);
+    let (baseline, baseline_logits, baseline_loss) =
+        run_baseline_mode(&cfg, &weights, &tokens, &targets);
 
-    let shard2 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 2, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard4 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 4, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard6 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 6, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard8 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 8, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard12 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 12, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard16 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 16, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
+    let shard2 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        2,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard4 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        4,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard6 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        6,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard8 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        8,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard12 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        12,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard16 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        16,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
 
-    assert!(shard2.correctness_pass, "50B shard2 correctness failed: {:?}", shard2.diff_vs_baseline);
-    assert!(shard4.correctness_pass, "50B shard4 correctness failed: {:?}", shard4.diff_vs_baseline);
-    assert!(shard6.correctness_pass, "50B shard6 correctness failed: {:?}", shard6.diff_vs_baseline);
-    assert!(shard8.correctness_pass, "50B shard8 correctness failed: {:?}", shard8.diff_vs_baseline);
-    assert!(shard12.correctness_pass, "50B shard12 correctness failed: {:?}", shard12.diff_vs_baseline);
-    assert!(shard16.correctness_pass, "50B shard16 correctness failed: {:?}", shard16.diff_vs_baseline);
+    assert!(
+        shard2.correctness_pass,
+        "50B shard2 correctness failed: {:?}",
+        shard2.diff_vs_baseline
+    );
+    assert!(
+        shard4.correctness_pass,
+        "50B shard4 correctness failed: {:?}",
+        shard4.diff_vs_baseline
+    );
+    assert!(
+        shard6.correctness_pass,
+        "50B shard6 correctness failed: {:?}",
+        shard6.diff_vs_baseline
+    );
+    assert!(
+        shard8.correctness_pass,
+        "50B shard8 correctness failed: {:?}",
+        shard8.diff_vs_baseline
+    );
+    assert!(
+        shard12.correctness_pass,
+        "50B shard12 correctness failed: {:?}",
+        shard12.diff_vs_baseline
+    );
+    assert!(
+        shard16.correctness_pass,
+        "50B shard16 correctness failed: {:?}",
+        shard16.diff_vs_baseline
+    );
 }
 
 #[test]
@@ -1676,14 +2256,69 @@ fn bench_ffn_shard_full_model_50b_equal() {
     let cfg = cfg_50b();
     let weights = ModelWeights::random(&cfg);
     let (tokens, targets) = deterministic_tokens(&cfg);
-    let (baseline, baseline_logits, baseline_loss) = run_baseline_mode(&cfg, &weights, &tokens, &targets);
+    let (baseline, baseline_logits, baseline_loss) =
+        run_baseline_mode(&cfg, &weights, &tokens, &targets);
 
-    let shard2 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 2, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard4 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 4, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard6 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 6, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard8 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 8, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard12 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 12, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard16 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 16, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
+    let shard2 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        2,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard4 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        4,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard6 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        6,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard8 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        8,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard12 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        12,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard16 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        16,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
 
     assert!(shard2.correctness_pass, "50B shard2 correctness failed");
     assert!(shard4.correctness_pass, "50B shard4 correctness failed");
@@ -1729,25 +2364,130 @@ fn ffn_shard_full_model_smoke_80b_matches_baseline() {
     let cfg = cfg_80b();
     let weights = ModelWeights::random(&cfg);
     let (tokens, targets) = deterministic_tokens(&cfg);
-    let (baseline, baseline_logits, baseline_loss) = run_baseline_mode(&cfg, &weights, &tokens, &targets);
+    let (baseline, baseline_logits, baseline_loss) =
+        run_baseline_mode(&cfg, &weights, &tokens, &targets);
 
-    let shard2 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 2, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard4 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 4, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard6 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 6, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard8 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 8, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard12 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 12, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard16 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 16, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard24 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 24, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard32 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 32, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
+    let shard2 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        2,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard4 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        4,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard6 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        6,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard8 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        8,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard12 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        12,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard16 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        16,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard24 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        24,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard32 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        32,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
 
-    assert!(shard2.correctness_pass, "80B shard2 correctness failed: {:?}", shard2.diff_vs_baseline);
-    assert!(shard4.correctness_pass, "80B shard4 correctness failed: {:?}", shard4.diff_vs_baseline);
-    assert!(shard6.correctness_pass, "80B shard6 correctness failed: {:?}", shard6.diff_vs_baseline);
-    assert!(shard8.correctness_pass, "80B shard8 correctness failed: {:?}", shard8.diff_vs_baseline);
-    assert!(shard12.correctness_pass, "80B shard12 correctness failed: {:?}", shard12.diff_vs_baseline);
-    assert!(shard16.correctness_pass, "80B shard16 correctness failed: {:?}", shard16.diff_vs_baseline);
-    assert!(shard24.correctness_pass, "80B shard24 correctness failed: {:?}", shard24.diff_vs_baseline);
-    assert!(shard32.correctness_pass, "80B shard32 correctness failed: {:?}", shard32.diff_vs_baseline);
+    assert!(
+        shard2.correctness_pass,
+        "80B shard2 correctness failed: {:?}",
+        shard2.diff_vs_baseline
+    );
+    assert!(
+        shard4.correctness_pass,
+        "80B shard4 correctness failed: {:?}",
+        shard4.diff_vs_baseline
+    );
+    assert!(
+        shard6.correctness_pass,
+        "80B shard6 correctness failed: {:?}",
+        shard6.diff_vs_baseline
+    );
+    assert!(
+        shard8.correctness_pass,
+        "80B shard8 correctness failed: {:?}",
+        shard8.diff_vs_baseline
+    );
+    assert!(
+        shard12.correctness_pass,
+        "80B shard12 correctness failed: {:?}",
+        shard12.diff_vs_baseline
+    );
+    assert!(
+        shard16.correctness_pass,
+        "80B shard16 correctness failed: {:?}",
+        shard16.diff_vs_baseline
+    );
+    assert!(
+        shard24.correctness_pass,
+        "80B shard24 correctness failed: {:?}",
+        shard24.diff_vs_baseline
+    );
+    assert!(
+        shard32.correctness_pass,
+        "80B shard32 correctness failed: {:?}",
+        shard32.diff_vs_baseline
+    );
 }
 
 #[test]
@@ -1757,16 +2497,89 @@ fn bench_ffn_shard_full_model_80b_equal() {
     let cfg = cfg_80b();
     let weights = ModelWeights::random(&cfg);
     let (tokens, targets) = deterministic_tokens(&cfg);
-    let (baseline, baseline_logits, baseline_loss) = run_baseline_mode(&cfg, &weights, &tokens, &targets);
+    let (baseline, baseline_logits, baseline_loss) =
+        run_baseline_mode(&cfg, &weights, &tokens, &targets);
 
-    let shard2 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 2, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard4 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 4, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard6 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 6, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard8 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 8, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard12 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 12, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard16 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 16, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard24 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 24, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
-    let shard32 = run_sharded_mode(&cfg, &weights, &tokens, &targets, 32, &baseline_logits, baseline_loss, baseline.mean_full_forward_ms);
+    let shard2 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        2,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard4 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        4,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard6 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        6,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard8 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        8,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard12 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        12,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard16 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        16,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard24 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        24,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
+    let shard32 = run_sharded_mode(
+        &cfg,
+        &weights,
+        &tokens,
+        &targets,
+        32,
+        &baseline_logits,
+        baseline_loss,
+        baseline.mean_full_forward_ms,
+    );
 
     assert!(shard2.correctness_pass, "80B shard2 correctness failed");
     assert!(shard4.correctness_pass, "80B shard4 correctness failed");
@@ -1777,7 +2590,9 @@ fn bench_ffn_shard_full_model_80b_equal() {
     assert!(shard24.correctness_pass, "80B shard24 correctness failed");
     assert!(shard32.correctness_pass, "80B shard32 correctness failed");
 
-    let modes = vec![shard2, shard4, shard6, shard8, shard12, shard16, shard24, shard32];
+    let modes = vec![
+        shard2, shard4, shard6, shard8, shard12, shard16, shard24, shard32,
+    ];
     let winning_modes = modes
         .iter()
         .filter_map(|m| m.meets_perf_gate.then_some(m.mode.clone()))

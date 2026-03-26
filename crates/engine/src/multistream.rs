@@ -1,4 +1,4 @@
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
@@ -57,10 +57,7 @@ pub struct ForwardScheduler {
 }
 
 impl ForwardScheduler {
-    pub fn new(
-        cfg: ModelConfig,
-        scheduler_cfg: ForwardSchedulerConfig,
-    ) -> Self {
+    pub fn new(cfg: ModelConfig, scheduler_cfg: ForwardSchedulerConfig) -> Self {
         let (tx, rx) = mpsc::sync_channel::<Job>(scheduler_cfg.queue_capacity);
         let rx = Arc::new(Mutex::new(rx));
         let tc = TrainConfig::default();
@@ -87,7 +84,12 @@ impl ForwardScheduler {
                         guard.recv()
                     };
                     match job {
-                        Ok(Job::Run { weights, request, submitted_at, response }) => {
+                        Ok(Job::Run {
+                            weights,
+                            request,
+                            submitted_at,
+                            response,
+                        }) => {
                             let queue_wait_ms = submitted_at.elapsed().as_secs_f32() * 1000.0;
                             let t0 = Instant::now();
                             let loss = if scheduler_cfg.use_lean_workspace {
@@ -130,7 +132,11 @@ impl ForwardScheduler {
         Self { tx, handles }
     }
 
-    pub fn run_batch(&self, weights: Arc<ModelWeights>, requests: Vec<ForwardBenchRequest>) -> Vec<ForwardBenchResult> {
+    pub fn run_batch(
+        &self,
+        weights: Arc<ModelWeights>,
+        requests: Vec<ForwardBenchRequest>,
+    ) -> Vec<ForwardBenchResult> {
         let (response_tx, response_rx) = mpsc::channel();
         let count = requests.len();
         for request in requests {

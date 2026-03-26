@@ -18,7 +18,13 @@ fn run_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn custom_config(dim: usize, hidden: usize, heads: usize, nlayers: usize, seq: usize) -> ModelConfig {
+fn custom_config(
+    dim: usize,
+    hidden: usize,
+    heads: usize,
+    nlayers: usize,
+    seq: usize,
+) -> ModelConfig {
     ModelConfig {
         dim,
         hidden,
@@ -87,22 +93,30 @@ fn rss_mb() -> Option<f32> {
     if !output.status.success() {
         return None;
     }
-    let kb: f32 = String::from_utf8(output.stdout).ok()?.trim().parse::<f32>().ok()?;
+    let kb: f32 = String::from_utf8(output.stdout)
+        .ok()?
+        .trim()
+        .parse::<f32>()
+        .ok()?;
     Some(kb / 1024.0)
 }
 
 fn mem_estimate_gb(cfg: &ModelConfig) -> f64 {
     let params_b = cfg.param_count() as f64 / 1e9;
-    let per_layer_cache_mb =
-        (cfg.dim * cfg.seq * 4 * 5 + cfg.hidden * cfg.seq * 4 * 3 + cfg.heads * cfg.seq * cfg.seq * 4)
-            as f64
-            / 1e6;
+    let per_layer_cache_mb = (cfg.dim * cfg.seq * 4 * 5
+        + cfg.hidden * cfg.seq * 4 * 3
+        + cfg.heads * cfg.seq * cfg.seq * 4) as f64
+        / 1e6;
     params_b * 4.0 + 2.0 * per_layer_cache_mb / 1000.0 + 0.5
 }
 
 fn deterministic_tokens(cfg: &ModelConfig) -> (Vec<u32>, Vec<u32>) {
-    let tokens: Vec<u32> = (0..cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
-    let targets: Vec<u32> = (1..=cfg.seq).map(|i| ((i * 31 + 7) % cfg.vocab) as u32).collect();
+    let tokens: Vec<u32> = (0..cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
+    let targets: Vec<u32> = (1..=cfg.seq)
+        .map(|i| ((i * 31 + 7) % cfg.vocab) as u32)
+        .collect();
     (tokens, targets)
 }
 
@@ -199,8 +213,15 @@ fn run_probe(cfg: &ModelConfig, name: &str, physical_gb: Option<f64>) -> LeanSca
         let alloc_s = t0.elapsed().as_secs_f32();
         let rss_after_alloc = rss_mb().unwrap_or(0.0);
 
-        let warmup_loss =
-            full_model::forward_only_ws(cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
+        let warmup_loss = full_model::forward_only_ws(
+            cfg,
+            &kernels,
+            &weights,
+            &tokens,
+            &targets,
+            tc.softcap,
+            &mut fwd_ws,
+        );
         assert!(warmup_loss.is_finite(), "warmup loss is not finite");
         let rss_after_warmup = rss_mb().unwrap_or(0.0);
 
@@ -209,8 +230,15 @@ fn run_probe(cfg: &ModelConfig, name: &str, physical_gb: Option<f64>) -> LeanSca
         let mut rss_peak = rss_after_warmup;
         for _ in 0..5 {
             let t0 = Instant::now();
-            loss =
-                full_model::forward_only_ws(cfg, &kernels, &weights, &tokens, &targets, tc.softcap, &mut fwd_ws);
+            loss = full_model::forward_only_ws(
+                cfg,
+                &kernels,
+                &weights,
+                &tokens,
+                &targets,
+                tc.softcap,
+                &mut fwd_ws,
+            );
             let ms = t0.elapsed().as_secs_f32() * 1000.0;
             assert!(loss.is_finite(), "timed loss is not finite");
             times.push(ms);
@@ -218,11 +246,29 @@ fn run_probe(cfg: &ModelConfig, name: &str, physical_gb: Option<f64>) -> LeanSca
         }
         times.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-        (compile_s, alloc_s, rss_after_compile, rss_after_alloc, rss_after_warmup, rss_peak, times, loss)
+        (
+            compile_s,
+            alloc_s,
+            rss_after_compile,
+            rss_after_alloc,
+            rss_after_warmup,
+            rss_peak,
+            times,
+            loss,
+        )
     });
 
     match run {
-        Ok((compile_s, alloc_s, rss_after_compile, rss_after_alloc, rss_after_warmup, rss_peak, times, loss)) => {
+        Ok((
+            compile_s,
+            alloc_s,
+            rss_after_compile,
+            rss_after_alloc,
+            rss_after_warmup,
+            rss_peak,
+            times,
+            loss,
+        )) => {
             result.compile_s = compile_s;
             result.alloc_s = alloc_s;
             result.rss_mb_after_compile = rss_after_compile;
@@ -258,7 +304,14 @@ fn write_summary(results: &[LeanScaleResult]) {
             let _ = writeln!(
                 summary,
                 "| {} | {:.2} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.0} |",
-                r.name, r.params_b, r.compile_s, r.alloc_s, r.median_fwd_ms, r.tok_per_s, r.est_ram_gb, r.rss_mb_peak_timed
+                r.name,
+                r.params_b,
+                r.compile_s,
+                r.alloc_s,
+                r.median_fwd_ms,
+                r.tok_per_s,
+                r.est_ram_gb,
+                r.rss_mb_peak_timed
             );
         } else {
             let _ = writeln!(

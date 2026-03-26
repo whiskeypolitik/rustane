@@ -57,7 +57,13 @@ fn write_json<T: Serialize>(path: &Path, value: &T) {
     fs::write(path, json).expect("write json");
 }
 
-fn custom_config(dim: usize, hidden: usize, heads: usize, nlayers: usize, seq: usize) -> ModelConfig {
+fn custom_config(
+    dim: usize,
+    hidden: usize,
+    heads: usize,
+    nlayers: usize,
+    seq: usize,
+) -> ModelConfig {
     ModelConfig {
         dim,
         hidden,
@@ -131,11 +137,22 @@ fn rss_mb() -> Option<f32> {
     if !output.status.success() {
         return None;
     }
-    let kb: f32 = String::from_utf8(output.stdout).ok()?.trim().parse::<f32>().ok()?;
+    let kb: f32 = String::from_utf8(output.stdout)
+        .ok()?
+        .trim()
+        .parse::<f32>()
+        .ok()?;
     Some(kb / 1024.0)
 }
 
-fn stage_spatial(dst: &mut [f32], channels: usize, sp_width: usize, src: &[f32], src_width: usize, sp_offset: usize) {
+fn stage_spatial(
+    dst: &mut [f32],
+    channels: usize,
+    sp_width: usize,
+    src: &[f32],
+    src_width: usize,
+    sp_offset: usize,
+) {
     for c in 0..channels {
         let dst_row = c * sp_width;
         let src_row = c * src_width;
@@ -144,14 +161,31 @@ fn stage_spatial(dst: &mut [f32], channels: usize, sp_width: usize, src: &[f32],
     }
 }
 
-fn read_channels_into(src: &[f32], total_ch: usize, seq: usize, ch_start: usize, ch_count: usize, dst: &mut [f32]) {
+fn read_channels_into(
+    src: &[f32],
+    total_ch: usize,
+    seq: usize,
+    ch_start: usize,
+    ch_count: usize,
+    dst: &mut [f32],
+) {
     let start = ch_start * seq;
     let end = (ch_start + ch_count).min(total_ch) * seq;
-    assert_eq!(dst.len(), end - start, "destination length mismatch in read_channels_into");
+    assert_eq!(
+        dst.len(),
+        end - start,
+        "destination length mismatch in read_channels_into"
+    );
     dst.copy_from_slice(&src[start..end]);
 }
 
-fn slice_weight_columns(src: &[f32], rows: usize, cols: usize, col_start: usize, col_count: usize) -> Vec<f32> {
+fn slice_weight_columns(
+    src: &[f32],
+    rows: usize,
+    cols: usize,
+    col_start: usize,
+    col_count: usize,
+) -> Vec<f32> {
     let mut out = vec![0.0f32; rows * col_count];
     for r in 0..rows {
         let src_row = r * cols + col_start;
@@ -338,13 +372,26 @@ fn compile_wo_runner(cfg: &ModelConfig) -> WoRunner {
     let sp = dyn_matmul::spatial_width(cfg.seq, cfg.dim);
     WoRunner {
         exe,
-        input: TensorData::new(ane_bridge::ane::Shape { batch: 1, channels: cfg.q_dim, height: 1, width: sp }),
-        output: TensorData::new(ane_bridge::ane::Shape { batch: 1, channels: cfg.dim, height: 1, width: cfg.seq }),
+        input: TensorData::new(ane_bridge::ane::Shape {
+            batch: 1,
+            channels: cfg.q_dim,
+            height: 1,
+            width: sp,
+        }),
+        output: TensorData::new(ane_bridge::ane::Shape {
+            batch: 1,
+            channels: cfg.dim,
+            height: 1,
+            width: cfg.seq,
+        }),
     }
 }
 
 fn compile_sharded_runner(cfg: &ModelConfig, shard_count: usize) -> (ShardedFfnRunner, f32) {
-    assert!(cfg.hidden % shard_count == 0, "hidden must be divisible by shard count");
+    assert!(
+        cfg.hidden % shard_count == 0,
+        "hidden must be divisible by shard count"
+    );
     let shard_hidden = cfg.hidden / shard_count;
     let qos = NSQualityOfService::UserInteractive;
     let t0 = Instant::now();
@@ -363,10 +410,30 @@ fn compile_sharded_runner(cfg: &ModelConfig, shard_count: usize) -> (ShardedFfnR
         workers.push(ShardWorker {
             w13_exe,
             w2_exe,
-            w13_in: TensorData::new(ane_bridge::ane::Shape { batch: 1, channels: cfg.dim, height: 1, width: w13_sp }),
-            w13_out: TensorData::new(ane_bridge::ane::Shape { batch: 1, channels: 2 * shard_hidden, height: 1, width: cfg.seq }),
-            w2_in: TensorData::new(ane_bridge::ane::Shape { batch: 1, channels: shard_hidden, height: 1, width: w2_sp }),
-            w2_out: TensorData::new(ane_bridge::ane::Shape { batch: 1, channels: cfg.dim, height: 1, width: cfg.seq }),
+            w13_in: TensorData::new(ane_bridge::ane::Shape {
+                batch: 1,
+                channels: cfg.dim,
+                height: 1,
+                width: w13_sp,
+            }),
+            w13_out: TensorData::new(ane_bridge::ane::Shape {
+                batch: 1,
+                channels: 2 * shard_hidden,
+                height: 1,
+                width: cfg.seq,
+            }),
+            w2_in: TensorData::new(ane_bridge::ane::Shape {
+                batch: 1,
+                channels: shard_hidden,
+                height: 1,
+                width: w2_sp,
+            }),
+            w2_out: TensorData::new(ane_bridge::ane::Shape {
+                batch: 1,
+                channels: cfg.dim,
+                height: 1,
+                width: cfg.seq,
+            }),
             h1: vec![0.0; shard_hidden * cfg.seq],
             h3: vec![0.0; shard_hidden * cfg.seq],
             gate: vec![0.0; shard_hidden * cfg.seq],
@@ -387,7 +454,11 @@ fn compile_sharded_runner(cfg: &ModelConfig, shard_count: usize) -> (ShardedFfnR
     )
 }
 
-fn shard_weights(weights: &LayerWeights, cfg: &ModelConfig, shard_count: usize) -> Vec<ShardWeights> {
+fn shard_weights(
+    weights: &LayerWeights,
+    cfg: &ModelConfig,
+    shard_count: usize,
+) -> Vec<ShardWeights> {
     let shard_hidden = cfg.hidden / shard_count;
     (0..shard_count)
         .map(|i| {
@@ -409,14 +480,25 @@ fn run_sdpa(sdpa: &mut SdpaRunner, xnorm: &[f32], weights: &LayerWeights, attn_o
     sdpa.exe
         .run_cached_direct(
             &[&sdpa.xnorm_in, &sdpa.wq_in, &sdpa.wk_in, &sdpa.wv_in],
-            &[&sdpa.attn_out, &sdpa.q_rope_out, &sdpa.k_rope_out, &sdpa.v_out],
+            &[
+                &sdpa.attn_out,
+                &sdpa.q_rope_out,
+                &sdpa.k_rope_out,
+                &sdpa.v_out,
+            ],
         )
         .expect("sdpa run");
     let locked = sdpa.attn_out.as_f32_slice();
     attn_out.copy_from_slice(&locked[..attn_out.len()]);
 }
 
-fn run_wo(wo: &mut WoRunner, cfg: &ModelConfig, attn_out: &[f32], weights: &LayerWeights, o_out: &mut [f32]) {
+fn run_wo(
+    wo: &mut WoRunner,
+    cfg: &ModelConfig,
+    attn_out: &[f32],
+    weights: &LayerWeights,
+    o_out: &mut [f32],
+) {
     let sp = dyn_matmul::spatial_width(cfg.seq, cfg.dim);
     {
         let mut locked = wo.input.as_f32_slice_mut();
@@ -482,12 +564,20 @@ fn run_sharded_layer_forward(
                     let buf = &mut *locked;
                     stage_spatial(buf, dim, w13_sp, x2norm_ref, seq, 0);
                     stage_spatial(buf, dim, w13_sp, &shard_w.w1, shard_hidden, seq);
-                    stage_spatial(buf, dim, w13_sp, &shard_w.w3, shard_hidden, seq + shard_hidden);
+                    stage_spatial(
+                        buf,
+                        dim,
+                        w13_sp,
+                        &shard_w.w3,
+                        shard_hidden,
+                        seq + shard_hidden,
+                    );
                 }
                 let w13_stage_ms = t.elapsed().as_secs_f32() * 1000.0;
 
                 let t = Instant::now();
-                worker.w13_exe
+                worker
+                    .w13_exe
                     .run_cached_direct(&[&worker.w13_in], &[&worker.w13_out])
                     .expect("w13 shard run");
                 let w13_ane_ms = t.elapsed().as_secs_f32() * 1000.0;
@@ -495,8 +585,22 @@ fn run_sharded_layer_forward(
                 let t = Instant::now();
                 {
                     let locked = worker.w13_out.as_f32_slice();
-                    read_channels_into(&locked, 2 * shard_hidden, seq, 0, shard_hidden, &mut worker.h1);
-                    read_channels_into(&locked, 2 * shard_hidden, seq, shard_hidden, shard_hidden, &mut worker.h3);
+                    read_channels_into(
+                        &locked,
+                        2 * shard_hidden,
+                        seq,
+                        0,
+                        shard_hidden,
+                        &mut worker.h1,
+                    );
+                    read_channels_into(
+                        &locked,
+                        2 * shard_hidden,
+                        seq,
+                        shard_hidden,
+                        shard_hidden,
+                        &mut worker.h3,
+                    );
                 }
                 let w13_read_ms = t.elapsed().as_secs_f32() * 1000.0;
 
@@ -505,7 +609,14 @@ fn run_sharded_layer_forward(
                 let gate_cpu_ms = t.elapsed().as_secs_f32() * 1000.0;
 
                 let t = Instant::now();
-                vdsp::mtrans(&shard_w.w2, shard_hidden, &mut worker.w2t, dim, dim, shard_hidden);
+                vdsp::mtrans(
+                    &shard_w.w2,
+                    shard_hidden,
+                    &mut worker.w2t,
+                    dim,
+                    dim,
+                    shard_hidden,
+                );
                 {
                     let mut locked = worker.w2_in.as_f32_slice_mut();
                     let buf = &mut *locked;
@@ -515,7 +626,8 @@ fn run_sharded_layer_forward(
                 let w2_stage_ms = t.elapsed().as_secs_f32() * 1000.0;
 
                 let t = Instant::now();
-                worker.w2_exe
+                worker
+                    .w2_exe
                     .run_cached_direct(&[&worker.w2_in], &[&worker.w2_out])
                     .expect("w2 shard run");
                 let w2_ane_ms = t.elapsed().as_secs_f32() * 1000.0;
@@ -586,7 +698,11 @@ fn run_sharded_layer_forward(
     )
 }
 
-fn run_baseline_mode(cfg: &ModelConfig, weights: &LayerWeights, x: &[f32]) -> (ModeResult, Vec<f32>) {
+fn run_baseline_mode(
+    cfg: &ModelConfig,
+    weights: &LayerWeights,
+    x: &[f32],
+) -> (ModeResult, Vec<f32>) {
     let t0 = Instant::now();
     let kernels = CompiledKernels::compile(cfg);
     let compile_s = t0.elapsed().as_secs_f32();
@@ -720,10 +836,19 @@ fn write_summary(suite: &ExperimentSuiteResult) {
     summary.push_str("| scale | baseline(ms) | best mode | best full-layer(ms) | win vs baseline | primary success |\n");
     summary.push_str("| --- | ---: | --- | ---: | ---: | --- |\n");
     for result in &suite.experiments {
-        let candidates = [&result.shard2, &result.shard4, &result.shard6, &result.shard8];
+        let candidates = [
+            &result.shard2,
+            &result.shard4,
+            &result.shard6,
+            &result.shard8,
+        ];
         let best = candidates
             .iter()
-            .min_by(|a, b| a.median_full_layer_ms.partial_cmp(&b.median_full_layer_ms).unwrap())
+            .min_by(|a, b| {
+                a.median_full_layer_ms
+                    .partial_cmp(&b.median_full_layer_ms)
+                    .unwrap()
+            })
             .unwrap();
         let _ = writeln!(
             summary,
@@ -733,7 +858,11 @@ fn write_summary(suite: &ExperimentSuiteResult) {
             best.mode,
             best.median_full_layer_ms,
             best.full_layer_win_pct_vs_baseline.unwrap_or(0.0),
-            if result.primary_success { "PASS" } else { "FAIL" }
+            if result.primary_success {
+                "PASS"
+            } else {
+                "FAIL"
+            }
         );
     }
 
@@ -744,7 +873,13 @@ fn write_summary(suite: &ExperimentSuiteResult) {
         ));
         summary.push_str("| mode | compile(s) | median full-layer(ms) | median ffn(ms) | peak RSS(MB) | max abs diff | mean abs diff | cosine | win vs baseline |\n");
         summary.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
-        for mode in [&result.baseline, &result.shard2, &result.shard4, &result.shard6, &result.shard8] {
+        for mode in [
+            &result.baseline,
+            &result.shard2,
+            &result.shard4,
+            &result.shard6,
+            &result.shard8,
+        ] {
             let diff = mode.diff_vs_baseline.as_ref().unwrap();
             let win = mode.full_layer_win_pct_vs_baseline.unwrap_or(0.0);
             let _ = writeln!(
@@ -764,11 +899,18 @@ fn write_summary(suite: &ExperimentSuiteResult) {
 
         summary.push_str(&format!(
             "\nPrimary success: **{}**\n\n",
-            if result.primary_success { "PASS" } else { "FAIL" }
+            if result.primary_success {
+                "PASS"
+            } else {
+                "FAIL"
+            }
         ));
 
         if !result.winning_modes.is_empty() {
-            summary.push_str(&format!("Winning modes: `{}`\n\n", result.winning_modes.join("`, `")));
+            summary.push_str(&format!(
+                "Winning modes: `{}`\n\n",
+                result.winning_modes.join("`, `")
+            ));
         }
     }
 
@@ -824,9 +966,9 @@ fn run_experiment(cfg: &ModelConfig, config_name: &str) -> ExperimentResult {
         (&shard6, "shard6"),
         (&shard8, "shard8"),
     ]
-        .into_iter()
-        .filter_map(|(mode, name)| mode.meets_perf_gate.then_some(name.to_string()))
-        .collect::<Vec<_>>();
+    .into_iter()
+    .filter_map(|(mode, name)| mode.meets_perf_gate.then_some(name.to_string()))
+    .collect::<Vec<_>>();
 
     ExperimentResult {
         config_name: config_name.to_string(),
@@ -864,9 +1006,21 @@ fn ffn_shard_smoke_5b_matches_baseline() {
     let shard4 = run_sharded_mode(&cfg, &weights, &x, 4, &baseline_x_next, 1.0);
     let shard8 = run_sharded_mode(&cfg, &weights, &x, 8, &baseline_x_next, 1.0);
 
-    assert!(shard2.correctness_pass, "5B shard2 correctness failed: {:?}", shard2.diff_vs_baseline);
-    assert!(shard4.correctness_pass, "5B shard4 correctness failed: {:?}", shard4.diff_vs_baseline);
-    assert!(shard8.correctness_pass, "5B shard8 correctness failed: {:?}", shard8.diff_vs_baseline);
+    assert!(
+        shard2.correctness_pass,
+        "5B shard2 correctness failed: {:?}",
+        shard2.diff_vs_baseline
+    );
+    assert!(
+        shard4.correctness_pass,
+        "5B shard4 correctness failed: {:?}",
+        shard4.diff_vs_baseline
+    );
+    assert!(
+        shard8.correctness_pass,
+        "5B shard8 correctness failed: {:?}",
+        shard8.diff_vs_baseline
+    );
 }
 
 #[test]
@@ -877,10 +1031,26 @@ fn bench_ffn_shard_latency_scales() {
         .into_iter()
         .map(|(cfg, name)| {
             let result = run_experiment(&cfg, name);
-            assert!(result.shard2.correctness_pass, "{} shard2 correctness failed", name);
-            assert!(result.shard4.correctness_pass, "{} shard4 correctness failed", name);
-            assert!(result.shard6.correctness_pass, "{} shard6 correctness failed", name);
-            assert!(result.shard8.correctness_pass, "{} shard8 correctness failed", name);
+            assert!(
+                result.shard2.correctness_pass,
+                "{} shard2 correctness failed",
+                name
+            );
+            assert!(
+                result.shard4.correctness_pass,
+                "{} shard4 correctness failed",
+                name
+            );
+            assert!(
+                result.shard6.correctness_pass,
+                "{} shard6 correctness failed",
+                name
+            );
+            assert!(
+                result.shard8.correctness_pass,
+                "{} shard8 correctness failed",
+                name
+            );
             result
         })
         .collect::<Vec<_>>();
