@@ -8,7 +8,7 @@
 use crate::cpu::{rmsnorm, silu, vdsp};
 use crate::kernels::{dyn_matmul, ffn_fused, sdpa_bwd, sdpa_fwd};
 use crate::model::ModelConfig;
-use ane_bridge::ane::{Executable, Shape, TensorData};
+use ane_bridge::ane::{Error as AneError, Executable, Shape, TensorData};
 use objc2_foundation::NSQualityOfService;
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -685,75 +685,43 @@ pub struct CompiledKernels {
 
 impl CompiledKernels {
     /// Compile all 10 kernels for the given model config.
-    pub fn compile(cfg: &ModelConfig) -> Self {
+    pub fn try_compile(cfg: &ModelConfig) -> Result<Self, AneError> {
         let qos = NSQualityOfService::UserInteractive;
 
         // Forward kernels
-        let sdpa_fwd = sdpa_fwd::build(cfg).compile(qos).expect("sdpaFwd compile");
-        let wo_fwd = dyn_matmul::build(cfg.q_dim, cfg.dim, cfg.seq)
-            .compile(qos)
-            .expect("woFwd compile");
+        let sdpa_fwd = sdpa_fwd::build(cfg).compile(qos)?;
+        let wo_fwd = dyn_matmul::build(cfg.q_dim, cfg.dim, cfg.seq).compile(qos)?;
 
         let decomposed = ffn_fused::needs_decomposition(cfg);
         let ffn_fused_exe = if decomposed {
             None
         } else {
-            Some(
-                ffn_fused::build(cfg)
-                    .compile(qos)
-                    .expect("ffnFused compile"),
-            )
+            Some(ffn_fused::build(cfg).compile(qos)?)
         };
         let use_dual_w13 = decomposed && ffn_fused::can_use_dual_w13(cfg);
         let ffn_w13_fwd = if decomposed {
             if use_dual_w13 {
-                Some(
-                    dyn_matmul::build_dual_separate(cfg.dim, cfg.hidden, cfg.seq)
-                        .compile(qos)
-                        .expect("ffnW13DualFwd compile"),
-                )
+                Some(dyn_matmul::build_dual_separate(cfg.dim, cfg.hidden, cfg.seq).compile(qos)?)
             } else {
-                Some(
-                    dyn_matmul::build(cfg.dim, cfg.hidden, cfg.seq)
-                        .compile(qos)
-                        .expect("ffnW13Fwd compile"),
-                )
+                Some(dyn_matmul::build(cfg.dim, cfg.hidden, cfg.seq).compile(qos)?)
             }
         } else {
             None
         };
         let ffn_w2_fwd = if decomposed {
-            Some(
-                dyn_matmul::build(cfg.hidden, cfg.dim, cfg.seq)
-                    .compile(qos)
-                    .expect("ffnW2Fwd compile"),
-            )
+            Some(dyn_matmul::build(cfg.hidden, cfg.dim, cfg.seq).compile(qos)?)
         } else {
             None
         };
 
         // Backward kernels
-        let ffn_bwd_w2t = dyn_matmul::build(cfg.dim, cfg.hidden, cfg.seq)
-            .compile(qos)
-            .expect("ffnBwdW2t compile");
-        let ffn_bwd_w13t = dyn_matmul::build_dual(cfg.hidden, cfg.dim, cfg.seq)
-            .compile(qos)
-            .expect("ffnBwdW13t compile");
-        let wot_bwd = dyn_matmul::build(cfg.dim, cfg.q_dim, cfg.seq)
-            .compile(qos)
-            .expect("wotBwd compile");
-        let sdpa_bwd1 = sdpa_bwd::build_bwd1(cfg)
-            .compile(qos)
-            .expect("sdpaBwd1 compile");
-        let sdpa_bwd2 = sdpa_bwd::build_bwd2(cfg)
-            .compile(qos)
-            .expect("sdpaBwd2 compile");
-        let q_bwd = dyn_matmul::build(cfg.q_dim, cfg.dim, cfg.seq)
-            .compile(qos)
-            .expect("qBwd compile");
-        let kv_bwd = dyn_matmul::build_dual(cfg.kv_dim, cfg.dim, cfg.seq)
-            .compile(qos)
-            .expect("kvBwd compile");
+        let ffn_bwd_w2t = dyn_matmul::build(cfg.dim, cfg.hidden, cfg.seq).compile(qos)?;
+        let ffn_bwd_w13t = dyn_matmul::build_dual(cfg.hidden, cfg.dim, cfg.seq).compile(qos)?;
+        let wot_bwd = dyn_matmul::build(cfg.dim, cfg.q_dim, cfg.seq).compile(qos)?;
+        let sdpa_bwd1 = sdpa_bwd::build_bwd1(cfg).compile(qos)?;
+        let sdpa_bwd2 = sdpa_bwd::build_bwd2(cfg).compile(qos)?;
+        let q_bwd = dyn_matmul::build(cfg.q_dim, cfg.dim, cfg.seq).compile(qos)?;
+        let kv_bwd = dyn_matmul::build_dual(cfg.kv_dim, cfg.dim, cfg.seq).compile(qos)?;
 
         // Pre-allocate IOSurface buffers for all kernels
         let bufs = KernelBuffers::allocate(cfg);
@@ -761,7 +729,7 @@ impl CompiledKernels {
         // Pre-compute RoPE tables (deterministic, reused 12× per step)
         let rope = RopeTable::compute(cfg.hd, cfg.seq);
 
-        Self {
+        Ok(Self {
             sdpa_fwd,
             wo_fwd,
             ffn_fused: ffn_fused_exe,
@@ -778,13 +746,69 @@ impl CompiledKernels {
             kv_bwd,
             bufs,
             rope,
-        }
+        })
+    }
+
+    pub fn compile(cfg: &ModelConfig) -> Self {
+        Self::try_compile(cfg).expect("compiled kernels")
     }
 
     /// Compile kernels for forward-only workloads.
     /// Reuses the real forward executables but shrinks backward IOSurface state.
+    pub fn try_compile_forward_only(cfg: &ModelConfig) -> Result<Self, AneError> {
+        let qos = NSQualityOfService::UserInteractive;
+
+        let sdpa_fwd = sdpa_fwd::build(cfg).compile(qos)?;
+        let wo_fwd = dyn_matmul::build(cfg.q_dim, cfg.dim, cfg.seq).compile(qos)?;
+
+        let decomposed = ffn_fused::needs_decomposition(cfg);
+        let ffn_fused_exe = if decomposed {
+            None
+        } else {
+            Some(ffn_fused::build(cfg).compile(qos)?)
+        };
+        let use_dual_w13 = decomposed && ffn_fused::can_use_dual_w13(cfg);
+        let ffn_w13_fwd = if decomposed {
+            if use_dual_w13 {
+                Some(dyn_matmul::build_dual_separate(cfg.dim, cfg.hidden, cfg.seq).compile(qos)?)
+            } else {
+                Some(dyn_matmul::build(cfg.dim, cfg.hidden, cfg.seq).compile(qos)?)
+            }
+        } else {
+            None
+        };
+        let ffn_w2_fwd = if decomposed {
+            Some(dyn_matmul::build(cfg.hidden, cfg.dim, cfg.seq).compile(qos)?)
+        } else {
+            None
+        };
+
+        let compile_placeholder = || dyn_matmul::build(1, 1, 64).compile(qos);
+        let bufs = KernelBuffers::allocate_forward_only(cfg);
+        let rope = RopeTable::compute(cfg.hd, cfg.seq);
+
+        Ok(Self {
+            sdpa_fwd,
+            wo_fwd,
+            ffn_fused: ffn_fused_exe,
+            ffn_w13_fwd,
+            ffn_w2_fwd,
+            use_decomposed_ffn: decomposed,
+            use_dual_w13,
+            ffn_bwd_w2t: compile_placeholder()?,
+            ffn_bwd_w13t: compile_placeholder()?,
+            wot_bwd: compile_placeholder()?,
+            sdpa_bwd1: compile_placeholder()?,
+            sdpa_bwd2: compile_placeholder()?,
+            q_bwd: compile_placeholder()?,
+            kv_bwd: compile_placeholder()?,
+            bufs,
+            rope,
+        })
+    }
+
     pub fn compile_forward_only(cfg: &ModelConfig) -> Self {
-        Self::compile(cfg)
+        Self::try_compile_forward_only(cfg).expect("forward-only kernels")
     }
 }
 

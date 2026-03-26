@@ -3,12 +3,12 @@ use crate::full_model::{self, ModelForwardWorkspace, ModelWeights};
 use crate::kernels::{dyn_matmul, ffn_fused, sdpa_fwd};
 use crate::layer::{tensor_data_new_logged, CompiledKernels, LayerWeights};
 use crate::model::ModelConfig;
-use ane_bridge::ane::{Executable, TensorData};
+use ane_bridge::ane::{Error as AneError, Executable, TensorData};
 use objc2_foundation::NSQualityOfService;
 use std::fmt;
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub const ATTN_ALLOWED_REQUESTS: &[usize] = &[1, 2, 4, 8, 10];
 pub const FFN_ALLOWED_REQUESTS: &[usize] = &[2, 4, 6, 8, 10, 12, 16];
@@ -110,6 +110,37 @@ enum ParallelBenchRunnerKind {
     Mode { runner: ModeRunner },
 }
 
+/// Retry a closure when the local ane path reports an IOSurface allocation
+/// failure during compile-time model setup. Any other error is returned
+/// immediately.
+fn compile_with_iosurface_retry<T>(
+    label: &str,
+    max_attempts: usize,
+    f: impl Fn() -> Result<T, AneError>,
+) -> Result<T, AneError> {
+    for attempt in 1..=max_attempts {
+        match f() {
+            Ok(result) => return Ok(result),
+            Err(err) => match err {
+                AneError::IOSurfaceAlloc { .. } => {
+                if attempt == max_attempts {
+                    eprintln!(
+                        "      ✗ {label} failed after {max_attempts} attempts, giving up"
+                    );
+                        return Err(err);
+                }
+                eprintln!(
+                    "      ⚠ {label}: IOSurface allocation failed (attempt {attempt}/{max_attempts}), retrying in 2s..."
+                );
+                thread::sleep(Duration::from_secs(2));
+                }
+                _ => return Err(err),
+            }
+        }
+    }
+    unreachable!()
+}
+
 impl ParallelBenchRunner {
     pub fn compile(
         cfg: &ModelConfig,
@@ -120,18 +151,33 @@ impl ParallelBenchRunner {
         let (kind, compile_s) = match resolved.mode {
             ParallelMode::Baseline => {
                 let t0 = Instant::now();
-                let kernels = if use_lean_workspace {
-                    CompiledKernels::compile_forward_only(cfg)
-                } else {
-                    CompiledKernels::compile(cfg)
-                };
+                let cfg_clone = cfg.clone();
+                let kernels = compile_with_iosurface_retry(
+                    "ANE kernel compilation",
+                    3,
+                    move || {
+                        if use_lean_workspace {
+                            CompiledKernels::try_compile_forward_only(&cfg_clone)
+                        } else {
+                            CompiledKernels::try_compile(&cfg_clone)
+                        }
+                    },
+                )
+                .map_err(|err| ParallelBenchError::new(format!("ANE kernel compilation: {err}")))?;
                 (
                     ParallelBenchRunnerKind::Baseline { kernels },
                     t0.elapsed().as_secs_f32(),
                 )
             }
             _ => {
-                let (runner, compile_s) = compile_mode_runner(cfg, &resolved.mode);
+                let cfg_clone = cfg.clone();
+                let mode_clone = resolved.mode.clone();
+                let (runner, compile_s) = compile_with_iosurface_retry(
+                    "ANE sharded kernel compilation",
+                    3,
+                    move || compile_mode_runner(&cfg_clone, &mode_clone),
+                )
+                .map_err(|err| ParallelBenchError::new(format!("ANE sharded kernel compilation: {err}")))?;
                 (ParallelBenchRunnerKind::Mode { runner }, compile_s)
             }
         };
@@ -512,10 +558,10 @@ fn ffn_shard_layouts(cfg: &ModelConfig, shard_count: usize) -> Vec<FfnShardLayou
         .collect()
 }
 
-fn compile_sdpa_runner(cfg: &ModelConfig) -> SdpaRunner {
+fn compile_sdpa_runner(cfg: &ModelConfig) -> Result<SdpaRunner, AneError> {
     let qos = NSQualityOfService::UserInteractive;
-    let exe = sdpa_fwd::build(cfg).compile(qos).expect("sdpa_fwd compile");
-    SdpaRunner {
+    let exe = sdpa_fwd::build(cfg).compile(qos)?;
+    Ok(SdpaRunner {
         exe,
         xnorm_in: tensor_data_new_logged("parallel_sdpa_xnorm_in", sdpa_fwd::xnorm_shape(cfg)),
         wq_in: tensor_data_new_logged("parallel_sdpa_wq_in", sdpa_fwd::wq_shape(cfg)),
@@ -525,16 +571,14 @@ fn compile_sdpa_runner(cfg: &ModelConfig) -> SdpaRunner {
         q_rope_out: tensor_data_new_logged("parallel_sdpa_q_rope_out", sdpa_fwd::q_rope_shape(cfg)),
         k_rope_out: tensor_data_new_logged("parallel_sdpa_k_rope_out", sdpa_fwd::k_rope_shape(cfg)),
         v_out: tensor_data_new_logged("parallel_sdpa_v_out", sdpa_fwd::v_shape(cfg)),
-    }
+    })
 }
 
-fn compile_wo_runner(cfg: &ModelConfig) -> WoRunner {
+fn compile_wo_runner(cfg: &ModelConfig) -> Result<WoRunner, AneError> {
     let qos = NSQualityOfService::UserInteractive;
-    let exe = dyn_matmul::build(cfg.q_dim, cfg.dim, cfg.seq)
-        .compile(qos)
-        .expect("wo_fwd compile");
+    let exe = dyn_matmul::build(cfg.q_dim, cfg.dim, cfg.seq).compile(qos)?;
     let sp = dyn_matmul::spatial_width(cfg.seq, cfg.dim);
-    WoRunner {
+    Ok(WoRunner {
         exe,
         input: tensor_data_new_logged("parallel_wo_input", ane_bridge::ane::Shape {
             batch: 1,
@@ -548,50 +592,46 @@ fn compile_wo_runner(cfg: &ModelConfig) -> WoRunner {
             height: 1,
             width: cfg.seq,
         }),
-    }
+    })
 }
 
-fn compile_baseline_attention_runner(cfg: &ModelConfig) -> BaselineAttentionRunner {
-    BaselineAttentionRunner {
+fn compile_baseline_attention_runner(cfg: &ModelConfig) -> Result<BaselineAttentionRunner, AneError> {
+    Ok(BaselineAttentionRunner {
         cfg: cfg.clone(),
-        sdpa: compile_sdpa_runner(cfg),
-        wo: compile_wo_runner(cfg),
-    }
+        sdpa: compile_sdpa_runner(cfg)?,
+        wo: compile_wo_runner(cfg)?,
+    })
 }
 
 fn compile_sharded_attention_runner(
     cfg: &ModelConfig,
     shard_count: usize,
-) -> ShardedAttentionRunner {
+) -> Result<ShardedAttentionRunner, AneError> {
     let workers = attention_shard_layouts(cfg, shard_count)
         .into_iter()
         .map(|layout| {
             let worker_cfg = attention_group_cfg(cfg, layout.q_head_count, layout.kv_head_count);
-            AttentionShardWorker {
+            Ok(AttentionShardWorker {
                 layout,
                 cfg: worker_cfg.clone(),
-                sdpa: compile_sdpa_runner(&worker_cfg),
-                wo: compile_wo_runner(&worker_cfg),
-            }
+                sdpa: compile_sdpa_runner(&worker_cfg)?,
+                wo: compile_wo_runner(&worker_cfg)?,
+            })
         })
-        .collect();
-    ShardedAttentionRunner {
+        .collect::<Result<Vec<_>, AneError>>()?;
+    Ok(ShardedAttentionRunner {
         cfg: cfg.clone(),
         workers,
-    }
+    })
 }
 
-fn compile_baseline_ffn_runner(cfg: &ModelConfig) -> BaselineFfnRunner {
+fn compile_baseline_ffn_runner(cfg: &ModelConfig) -> Result<BaselineFfnRunner, AneError> {
     let qos = NSQualityOfService::UserInteractive;
     let use_dual_w13 = ffn_fused::can_use_dual_w13(cfg);
     let w13_exe = if use_dual_w13 {
-        dyn_matmul::build_dual_separate(cfg.dim, cfg.hidden, cfg.seq)
-            .compile(qos)
-            .expect("baseline w13 dual compile")
+        dyn_matmul::build_dual_separate(cfg.dim, cfg.hidden, cfg.seq).compile(qos)?
     } else {
-        dyn_matmul::build(cfg.dim, cfg.hidden, cfg.seq)
-            .compile(qos)
-            .expect("baseline w13 compile")
+        dyn_matmul::build(cfg.dim, cfg.hidden, cfg.seq).compile(qos)?
     };
     let w13_sp = if use_dual_w13 {
         dyn_matmul::dual_separate_spatial_width(cfg.seq, cfg.hidden)
@@ -603,11 +643,9 @@ fn compile_baseline_ffn_runner(cfg: &ModelConfig) -> BaselineFfnRunner {
     } else {
         cfg.hidden
     };
-    let w2_exe = dyn_matmul::build(cfg.hidden, cfg.dim, cfg.seq)
-        .compile(qos)
-        .expect("baseline w2 compile");
+    let w2_exe = dyn_matmul::build(cfg.hidden, cfg.dim, cfg.seq).compile(qos)?;
     let w2_sp = dyn_matmul::spatial_width(cfg.seq, cfg.dim);
-    BaselineFfnRunner {
+    Ok(BaselineFfnRunner {
         cfg: cfg.clone(),
         use_dual_w13,
         w13_exe,
@@ -639,24 +677,20 @@ fn compile_baseline_ffn_runner(cfg: &ModelConfig) -> BaselineFfnRunner {
         h1: vec![0.0; cfg.hidden * cfg.seq],
         h3: vec![0.0; cfg.hidden * cfg.seq],
         gate: vec![0.0; cfg.hidden * cfg.seq],
-    }
+    })
 }
 
-fn compile_sharded_ffn_runner(cfg: &ModelConfig, shard_count: usize) -> ShardedFfnRunner {
+fn compile_sharded_ffn_runner(cfg: &ModelConfig, shard_count: usize) -> Result<ShardedFfnRunner, AneError> {
     let qos = NSQualityOfService::UserInteractive;
     let workers = ffn_shard_layouts(cfg, shard_count)
         .into_iter()
         .map(|layout| {
             let shard_hidden = layout.col_count;
-            let w13_exe = dyn_matmul::build_dual_separate(cfg.dim, shard_hidden, cfg.seq)
-                .compile(qos)
-                .expect("sharded w13 compile");
-            let w2_exe = dyn_matmul::build(shard_hidden, cfg.dim, cfg.seq)
-                .compile(qos)
-                .expect("sharded w2 compile");
+            let w13_exe = dyn_matmul::build_dual_separate(cfg.dim, shard_hidden, cfg.seq).compile(qos)?;
+            let w2_exe = dyn_matmul::build(shard_hidden, cfg.dim, cfg.seq).compile(qos)?;
             let w13_sp = dyn_matmul::dual_separate_spatial_width(cfg.seq, shard_hidden);
             let w2_sp = dyn_matmul::spatial_width(cfg.seq, cfg.dim);
-            FfnShardWorker {
+            Ok(FfnShardWorker {
                 layout,
                 w13_exe,
                 w2_exe,
@@ -687,37 +721,37 @@ fn compile_sharded_ffn_runner(cfg: &ModelConfig, shard_count: usize) -> ShardedF
                 h1: vec![0.0; shard_hidden * cfg.seq],
                 h3: vec![0.0; shard_hidden * cfg.seq],
                 gate: vec![0.0; shard_hidden * cfg.seq],
-            }
+            })
         })
-        .collect();
-    ShardedFfnRunner {
+        .collect::<Result<Vec<_>, AneError>>()?;
+    Ok(ShardedFfnRunner {
         cfg: cfg.clone(),
         workers,
-    }
+    })
 }
 
-fn compile_mode_runner(cfg: &ModelConfig, mode: &ParallelMode) -> (ModeRunner, f32) {
+fn compile_mode_runner(cfg: &ModelConfig, mode: &ParallelMode) -> Result<(ModeRunner, f32), AneError> {
     let t0 = Instant::now();
     let attn = match mode {
         ParallelMode::Attention { shards } | ParallelMode::AttentionFfn { attn_shards: shards, .. } => {
-            AttentionRunner::Sharded(compile_sharded_attention_runner(cfg, *shards))
+            AttentionRunner::Sharded(compile_sharded_attention_runner(cfg, *shards)?)
         }
-        _ => AttentionRunner::Baseline(compile_baseline_attention_runner(cfg)),
+        _ => AttentionRunner::Baseline(compile_baseline_attention_runner(cfg)?),
     };
     let ffn = match mode {
         ParallelMode::Ffn { shards } | ParallelMode::AttentionFfn { ffn_shards: shards, .. } => {
-            FfnRunner::Sharded(compile_sharded_ffn_runner(cfg, *shards))
+            FfnRunner::Sharded(compile_sharded_ffn_runner(cfg, *shards)?)
         }
-        _ => FfnRunner::Baseline(compile_baseline_ffn_runner(cfg)),
+        _ => FfnRunner::Baseline(compile_baseline_ffn_runner(cfg)?),
     };
-    (
+    Ok((
         ModeRunner {
             attn,
             ffn,
             scratch: LayerScratch::new(cfg),
         },
         t0.elapsed().as_secs_f32(),
-    )
+    ))
 }
 
 fn layer_alpha(cfg: &ModelConfig) -> f32 {
