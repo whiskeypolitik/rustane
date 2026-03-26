@@ -59,7 +59,8 @@ fn run_sweep(cfg: &ModelConfig, name: &str) -> SweepResult {
 fn run_sweep_with_tc(cfg: &ModelConfig, name: &str, tc: TrainConfig) -> SweepResult {
     let params_m = cfg.param_count() as f64 / 1e6;
     let hd_ratio = cfg.hidden as f64 / cfg.dim as f64;
-    let training_parallel = TrainingParallelOptions::disabled();
+    let training_parallel = TrainingParallelOptions::from_env_for_cfg(cfg)
+        .expect("parse training parallel options from env");
 
     println!("\n{}", "=".repeat(60));
     println!("  {name} — {d}d/{h}h/{nl}L/seq{s} — ~{p:.0}M params — h/d={r:.2}x",

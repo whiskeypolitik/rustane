@@ -35,7 +35,9 @@ fn iosurface_alloc_logging_enabled() -> bool {
 pub(crate) fn tensor_data_new_logged(label: &'static str, shape: Shape) -> TensorData {
     if iosurface_alloc_logging_enabled() {
         let elements = shape_elements(&shape);
-        let bytes = elements * std::mem::size_of::<f32>();
+        // Diagnostic-only estimate: ane::TensorData allocates fp16-backed
+        // IOSurfaces, so use 2 bytes per element rather than f32 staging size.
+        let bytes = elements * 2;
         eprintln!(
             "IOSurface alloc {label}: batch={} channels={} height={} width={} elems={} bytes={}",
             shape.batch, shape.channels, shape.height, shape.width, elements, bytes
@@ -683,6 +685,32 @@ pub struct CompiledKernels {
     pub rope: RopeTable,
 }
 
+#[derive(Clone, Copy)]
+struct ShardedFfnLayout {
+    col_start: usize,
+    col_count: usize,
+}
+
+pub struct ShardedFfnForwardWorker {
+    w13_exe: Executable,
+    w2_exe: Executable,
+    w13_in: TensorData,
+    w13_out: TensorData,
+    w2_in: TensorData,
+    w2_out: TensorData,
+    h1: Vec<f32>,
+    h3: Vec<f32>,
+    gate: Vec<f32>,
+}
+
+pub struct ShardedFfnForwardRuntime {
+    shard_count: usize,
+    layouts: Vec<ShardedFfnLayout>,
+    workers: Vec<ShardedFfnForwardWorker>,
+    ffn_out: Vec<f32>,
+    merge_tmp: Vec<f32>,
+}
+
 impl CompiledKernels {
     /// Compile all 10 kernels for the given model config.
     pub fn try_compile(cfg: &ModelConfig) -> Result<Self, AneError> {
@@ -809,6 +837,91 @@ impl CompiledKernels {
 
     pub fn compile_forward_only(cfg: &ModelConfig) -> Self {
         Self::try_compile_forward_only(cfg).expect("forward-only kernels")
+    }
+}
+
+fn sharded_ffn_layouts(cfg: &ModelConfig, shard_count: usize) -> Vec<ShardedFfnLayout> {
+    assert!(
+        cfg.hidden % shard_count == 0,
+        "hidden must be divisible by FFN shard count"
+    );
+    let col_count = cfg.hidden / shard_count;
+    (0..shard_count)
+        .map(|i| ShardedFfnLayout {
+            col_start: i * col_count,
+            col_count,
+        })
+        .collect()
+}
+
+impl ShardedFfnForwardRuntime {
+    pub fn compile(cfg: &ModelConfig, shard_count: usize) -> Result<Self, AneError> {
+        let qos = NSQualityOfService::UserInteractive;
+        let layouts = sharded_ffn_layouts(cfg, shard_count);
+        let workers = layouts
+            .iter()
+            .map(|layout| {
+                let shard_hidden = layout.col_count;
+                let w13_sp = dyn_matmul::dual_separate_spatial_width(cfg.seq, shard_hidden);
+                let w2_sp = dyn_matmul::spatial_width(cfg.seq, cfg.dim);
+                Ok(ShardedFfnForwardWorker {
+                    w13_exe: dyn_matmul::build_dual_separate(cfg.dim, shard_hidden, cfg.seq)
+                        .compile(qos)?,
+                    w2_exe: dyn_matmul::build(shard_hidden, cfg.dim, cfg.seq).compile(qos)?,
+                    w13_in: tensor_data_new_logged(
+                        "training_sharded_w13_in",
+                        Shape {
+                            batch: 1,
+                            channels: cfg.dim,
+                            height: 1,
+                            width: w13_sp,
+                        },
+                    ),
+                    w13_out: tensor_data_new_logged(
+                        "training_sharded_w13_out",
+                        Shape {
+                            batch: 1,
+                            channels: 2 * shard_hidden,
+                            height: 1,
+                            width: cfg.seq,
+                        },
+                    ),
+                    w2_in: tensor_data_new_logged(
+                        "training_sharded_w2_in",
+                        Shape {
+                            batch: 1,
+                            channels: shard_hidden,
+                            height: 1,
+                            width: w2_sp,
+                        },
+                    ),
+                    w2_out: tensor_data_new_logged(
+                        "training_sharded_w2_out",
+                        Shape {
+                            batch: 1,
+                            channels: cfg.dim,
+                            height: 1,
+                            width: cfg.seq,
+                        },
+                    ),
+                    h1: vec![0.0; shard_hidden * cfg.seq],
+                    h3: vec![0.0; shard_hidden * cfg.seq],
+                    gate: vec![0.0; shard_hidden * cfg.seq],
+                })
+            })
+            .collect::<Result<Vec<_>, AneError>>()?;
+
+        Ok(Self {
+            shard_count,
+            layouts,
+            workers,
+            ffn_out: vec![0.0; cfg.dim * cfg.seq],
+            merge_tmp: vec![0.0; cfg.dim * cfg.seq],
+        })
+    }
+
+    pub fn shard_count(&self) -> usize {
+        self.shard_count
     }
 }
 
@@ -974,6 +1087,42 @@ fn stage_spatial(
     }
 }
 
+fn stage_weight_columns(
+    dst: &mut [f32],
+    rows: usize,
+    sp_width: usize,
+    src: &[f32],
+    total_cols: usize,
+    col_start: usize,
+    col_count: usize,
+    sp_offset: usize,
+) {
+    for r in 0..rows {
+        let src_row = r * total_cols + col_start;
+        let dst_row = r * sp_width + sp_offset;
+        dst[dst_row..dst_row + col_count]
+            .copy_from_slice(&src[src_row..src_row + col_count]);
+    }
+}
+
+fn stage_transposed_weight_columns(
+    dst: &mut [f32],
+    src: &[f32],
+    rows: usize,
+    total_cols: usize,
+    col_start: usize,
+    col_count: usize,
+    sp_width: usize,
+    sp_offset: usize,
+) {
+    for c in 0..col_count {
+        let dst_row = c * sp_width + sp_offset;
+        for r in 0..rows {
+            dst[dst_row + r] = src[r * total_cols + col_start + c];
+        }
+    }
+}
+
 /// Read a slice of channels from ANE output buffer into a pre-allocated destination.
 /// No-alloc version of the former `read_channels`.
 /// Uses copy_from_slice for vectorized memcpy on inner dimension.
@@ -1053,6 +1202,146 @@ fn read_sdpa_fwd_outputs(
         let locked = bufs.sdpa_fwd_v_out.as_f32_slice();
         v.copy_from_slice(&locked[..v.len()]);
     }
+}
+
+fn store_shard_channels(
+    dst: &mut [f32],
+    total_ch: usize,
+    seq: usize,
+    ch_offset: usize,
+    src: &[f32],
+    src_ch: usize,
+) {
+    let _ = total_ch;
+    for c in 0..src_ch {
+        let d = (ch_offset + c) * seq;
+        let s = c * seq;
+        dst[d..d + seq].copy_from_slice(&src[s..s + seq]);
+    }
+}
+
+fn run_sharded_ffn_forward_into(
+    cfg: &ModelConfig,
+    weights: &LayerWeights,
+    cache: &mut ForwardCache,
+    x_next: &mut [f32],
+    runtime: &mut ShardedFfnForwardRuntime,
+) {
+    let dim = cfg.dim;
+    let seq = cfg.seq;
+    let hidden = cfg.hidden;
+    let alpha = 1.0 / (2.0 * cfg.nlayers as f32).sqrt();
+
+    cache.h1.fill(0.0);
+    cache.h3.fill(0.0);
+    cache.gate.fill(0.0);
+    runtime.ffn_out.fill(0.0);
+
+    for (worker, layout) in runtime.workers.iter_mut().zip(runtime.layouts.iter()) {
+        let shard_hidden = layout.col_count;
+        let w13_sp = dyn_matmul::dual_separate_spatial_width(seq, shard_hidden);
+        let w2_sp = dyn_matmul::spatial_width(seq, dim);
+
+        {
+            let mut locked = worker.w13_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            stage_spatial(buf, dim, w13_sp, &cache.x2norm, seq, 0);
+            stage_weight_columns(
+                buf,
+                dim,
+                w13_sp,
+                &weights.w1,
+                hidden,
+                layout.col_start,
+                shard_hidden,
+                seq,
+            );
+            stage_weight_columns(
+                buf,
+                dim,
+                w13_sp,
+                &weights.w3,
+                hidden,
+                layout.col_start,
+                shard_hidden,
+                seq + shard_hidden,
+            );
+        }
+        worker
+            .w13_exe
+            .run_cached_direct(&[&worker.w13_in], &[&worker.w13_out])
+            .expect("ANE sharded FFN w13 failed");
+        {
+            let locked = worker.w13_out.as_f32_slice();
+            read_channels_into(&locked, 2 * shard_hidden, seq, 0, shard_hidden, &mut worker.h1);
+            read_channels_into(
+                &locked,
+                2 * shard_hidden,
+                seq,
+                shard_hidden,
+                shard_hidden,
+                &mut worker.h3,
+            );
+        }
+        silu::silu_gate(&worker.h1, &worker.h3, &mut worker.gate);
+
+        {
+            let mut locked = worker.w2_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            stage_spatial(buf, shard_hidden, w2_sp, &worker.gate, seq, 0);
+            stage_transposed_weight_columns(
+                buf,
+                &weights.w2,
+                dim,
+                hidden,
+                layout.col_start,
+                shard_hidden,
+                w2_sp,
+                seq,
+            );
+        }
+        worker
+            .w2_exe
+            .run_cached_direct(&[&worker.w2_in], &[&worker.w2_out])
+            .expect("ANE sharded FFN w2 failed");
+
+        {
+            let locked = worker.w2_out.as_f32_slice();
+            vdsp::vadd(
+                &runtime.ffn_out,
+                &locked[..runtime.ffn_out.len()],
+                &mut runtime.merge_tmp,
+            );
+            runtime.ffn_out.copy_from_slice(&runtime.merge_tmp);
+        }
+
+        store_shard_channels(
+            &mut cache.h1,
+            hidden,
+            seq,
+            layout.col_start,
+            &worker.h1,
+            shard_hidden,
+        );
+        store_shard_channels(
+            &mut cache.h3,
+            hidden,
+            seq,
+            layout.col_start,
+            &worker.h3,
+            shard_hidden,
+        );
+        store_shard_channels(
+            &mut cache.gate,
+            hidden,
+            seq,
+            layout.col_start,
+            &worker.gate,
+            shard_hidden,
+        );
+    }
+
+    vdsp::vsma(&runtime.ffn_out, alpha, &cache.x2, x_next);
 }
 
 // ── Forward pass ──
@@ -1488,6 +1777,239 @@ pub fn forward_into(
         let ffn_out = kernels.bufs.ffn_fused_out.as_ref().unwrap();
 
         // Stage activations only (weights already staged in step 3)
+        {
+            let mut locked = ffn_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            for c in 0..dim {
+                let row = c * ffn_sp;
+                buf[row..row + seq].copy_from_slice(&cache.x2norm[c * seq..c * seq + seq]);
+                buf[row + seq..row + 2 * seq].copy_from_slice(&cache.x2[c * seq..c * seq + seq]);
+            }
+        }
+        kernels
+            .ffn_fused
+            .as_ref()
+            .unwrap()
+            .run_cached_direct(&[ffn_in], &[ffn_out])
+            .expect("ANE eval failed");
+        {
+            let locked = ffn_out.as_f32_slice();
+            read_channels_into(&locked, ffn_out_ch, seq, 0, dim, x_next);
+            read_channels_into(&locked, ffn_out_ch, seq, dim, hidden, &mut cache.h1);
+            read_channels_into(
+                &locked,
+                ffn_out_ch,
+                seq,
+                dim + hidden,
+                hidden,
+                &mut cache.h3,
+            );
+            read_channels_into(
+                &locked,
+                ffn_out_ch,
+                seq,
+                dim + 2 * hidden,
+                hidden,
+                &mut cache.gate,
+            );
+        }
+    }
+}
+
+/// Forward pass variant for the Phase 4 training path.
+/// Attention remains baseline. When `sharded_ffn` is provided, the FFN section
+/// runs through the sharded FFN runtime but still fills `cache.h1/h3/gate` in
+/// the full hidden layout expected by the existing backward path.
+pub fn forward_into_with_training_ffn(
+    cfg: &ModelConfig,
+    kernels: &CompiledKernels,
+    weights: &LayerWeights,
+    x: &[f32],
+    cache: &mut ForwardCache,
+    x_next: &mut [f32],
+    sharded_ffn: Option<&mut ShardedFfnForwardRuntime>,
+) {
+    let dim = cfg.dim;
+    let seq = cfg.seq;
+    let q_dim = cfg.q_dim;
+    let kv_dim = cfg.kv_dim;
+    let hidden = cfg.hidden;
+    let alpha = 1.0 / (2.0 * cfg.nlayers as f32).sqrt();
+
+    cache.x.copy_from_slice(x);
+    rmsnorm::forward_channel_first(
+        x,
+        &weights.gamma1,
+        &mut cache.xnorm,
+        &mut cache.rms_inv1,
+        dim,
+        seq,
+    );
+
+    stage_sdpa_fwd_inputs(
+        &kernels.bufs,
+        &cache.xnorm,
+        &weights.wq,
+        &weights.wk,
+        &weights.wv,
+    );
+    let wo_sp = dyn_matmul::spatial_width(seq, dim);
+    std::thread::scope(|s| {
+        let ane_handle = s.spawn(|| {
+            run_sdpa_fwd(kernels);
+        });
+        {
+            let mut locked = kernels.bufs.wo_fwd_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            stage_spatial(buf, q_dim, wo_sp, &weights.wo, dim, seq);
+        }
+        if sharded_ffn.is_none() {
+            if kernels.use_decomposed_ffn {
+                let w13_sp = if kernels.use_dual_w13 {
+                    dyn_matmul::dual_separate_spatial_width(seq, hidden)
+                } else {
+                    dyn_matmul::spatial_width(seq, hidden)
+                };
+                let w13_in = kernels.bufs.ffn_w13_in.as_ref().unwrap();
+                let mut locked = w13_in.as_f32_slice_mut();
+                let buf = &mut *locked;
+                stage_spatial(buf, dim, w13_sp, &weights.w1, hidden, seq);
+                if kernels.use_dual_w13 {
+                    stage_spatial(buf, dim, w13_sp, &weights.w3, hidden, seq + hidden);
+                }
+            } else {
+                let ffn_sp = ffn_fused::input_spatial_width(cfg);
+                let ffn_in = kernels.bufs.ffn_fused_in.as_ref().unwrap();
+                let mut locked = ffn_in.as_f32_slice_mut();
+                let buf = &mut *locked;
+                let w_off = 2 * seq;
+                for c in 0..dim {
+                    let row = c * ffn_sp;
+                    buf[row + w_off..row + w_off + hidden]
+                        .copy_from_slice(&weights.w1[c * hidden..c * hidden + hidden]);
+                    buf[row + w_off + hidden..row + w_off + 2 * hidden]
+                        .copy_from_slice(&weights.w3[c * hidden..c * hidden + hidden]);
+                    buf[row + w_off + 2 * hidden..row + w_off + 3 * hidden]
+                        .copy_from_slice(&weights.w2[c * hidden..c * hidden + hidden]);
+                }
+            }
+        }
+        ane_handle.join().expect("ANE thread panicked");
+    });
+
+    read_sdpa_fwd_outputs(
+        &kernels.bufs,
+        &mut cache.attn_out,
+        &mut cache.q_rope,
+        &mut cache.k_rope,
+        &mut cache.v,
+    );
+    {
+        let mut locked = kernels.bufs.wo_fwd_in.as_f32_slice_mut();
+        let buf = &mut *locked;
+        stage_spatial(buf, q_dim, wo_sp, &cache.attn_out, seq, 0);
+    }
+    kernels
+        .wo_fwd
+        .run_cached_direct(&[&kernels.bufs.wo_fwd_in], &[&kernels.bufs.wo_fwd_out])
+        .expect("ANE eval failed");
+    {
+        let locked = kernels.bufs.wo_fwd_out.as_f32_slice();
+        cache.o_out.copy_from_slice(&locked[..dim * seq]);
+    }
+
+    vdsp::vsma(&cache.o_out, alpha, x, &mut cache.x2);
+    rmsnorm::forward_channel_first(
+        &cache.x2,
+        &weights.gamma2,
+        &mut cache.x2norm,
+        &mut cache.rms_inv2,
+        dim,
+        seq,
+    );
+
+    if let Some(runtime) = sharded_ffn {
+        run_sharded_ffn_forward_into(cfg, weights, cache, x_next, runtime);
+    } else if kernels.use_decomposed_ffn {
+        let w13_sp = if kernels.use_dual_w13 {
+            dyn_matmul::dual_separate_spatial_width(seq, hidden)
+        } else {
+            dyn_matmul::spatial_width(seq, hidden)
+        };
+        let w2_sp = dyn_matmul::spatial_width(seq, dim);
+        let w13_exe = kernels.ffn_w13_fwd.as_ref().unwrap();
+        let w2_exe = kernels.ffn_w2_fwd.as_ref().unwrap();
+        let w13_in = kernels.bufs.ffn_w13_in.as_ref().unwrap();
+        let w13_out = kernels.bufs.ffn_w13_out.as_ref().unwrap();
+        let w2_in = kernels.bufs.ffn_w2_in.as_ref().unwrap();
+        let w2_out = kernels.bufs.ffn_w2_out.as_ref().unwrap();
+
+        {
+            let mut locked = w13_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            stage_spatial(buf, dim, w13_sp, &cache.x2norm, seq, 0);
+        }
+        if kernels.use_dual_w13 {
+            w13_exe
+                .run_cached_direct(&[w13_in], &[w13_out])
+                .expect("ANE w13 dual failed");
+            let locked = w13_out.as_f32_slice();
+            read_channels_into(&locked, 2 * hidden, seq, 0, hidden, &mut cache.h1);
+            read_channels_into(&locked, 2 * hidden, seq, hidden, hidden, &mut cache.h3);
+        } else {
+            w13_exe
+                .run_cached_direct(&[w13_in], &[w13_out])
+                .expect("ANE w13 W1 failed");
+            {
+                let locked = w13_out.as_f32_slice();
+                cache.h1.copy_from_slice(&locked[..hidden * seq]);
+            }
+            {
+                let mut locked = w13_in.as_f32_slice_mut();
+                stage_spatial(&mut locked, dim, w13_sp, &weights.w3, hidden, seq);
+            }
+            w13_exe
+                .run_cached_direct(&[w13_in], &[w13_out])
+                .expect("ANE w13 W3 failed");
+            {
+                let locked = w13_out.as_f32_slice();
+                cache.h3.copy_from_slice(&locked[..hidden * seq]);
+            }
+        }
+
+        silu::silu_gate(&cache.h1, &cache.h3, &mut cache.gate);
+
+        if cache.w2t_generation != weights.w2_generation {
+            vdsp::mtrans(
+                &weights.w2,
+                hidden,
+                &mut cache.w2t_scratch,
+                dim,
+                dim,
+                hidden,
+            );
+            cache.w2t_generation = weights.w2_generation;
+        }
+        {
+            let mut locked = w2_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            stage_spatial(buf, hidden, w2_sp, &cache.gate, seq, 0);
+            stage_spatial(buf, hidden, w2_sp, &cache.w2t_scratch, dim, seq);
+        }
+        w2_exe
+            .run_cached_direct(&[w2_in], &[w2_out])
+            .expect("ANE ffnW2Fwd failed");
+        {
+            let locked = w2_out.as_f32_slice();
+            x_next.copy_from_slice(&locked[..dim * seq]);
+        }
+        let ffn_tmp: Vec<f32> = x_next.to_vec();
+        vdsp::vsma(&ffn_tmp, alpha, &cache.x2, x_next);
+    } else {
+        let ffn_sp = ffn_fused::input_spatial_width(cfg);
+        let ffn_out_ch = ffn_fused::output_channels(cfg);
+        let ffn_in = kernels.bufs.ffn_fused_in.as_ref().unwrap();
+        let ffn_out = kernels.bufs.ffn_fused_out.as_ref().unwrap();
         {
             let mut locked = ffn_in.as_f32_slice_mut();
             let buf = &mut *locked;

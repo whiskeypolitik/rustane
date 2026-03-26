@@ -50,19 +50,19 @@ test: ## Run all unit + integration tests
 # ── Training validation ─────────────────────────────────────────────
 
 sweep-600m: ## Validate training pipeline at 600M (~17s)
-	cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_600m_a
+	$(if $(ATTN_SHARDS),ATTN_SHARDS=$(ATTN_SHARDS) )$(if $(FFN_SHARDS),FFN_SHARDS=$(FFN_SHARDS) )cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_600m_a
 
 sweep-1b: ## Validate training pipeline at 1B (~35s)
-	cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_1b_a
+	$(if $(ATTN_SHARDS),ATTN_SHARDS=$(ATTN_SHARDS) )$(if $(FFN_SHARDS),FFN_SHARDS=$(FFN_SHARDS) )cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_1b_a
 
 sweep-3b: ## Validate training pipeline at 3B (~80s, needs 55GB)
-	cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_3b_a
+	$(if $(ATTN_SHARDS),ATTN_SHARDS=$(ATTN_SHARDS) )$(if $(FFN_SHARDS),FFN_SHARDS=$(FFN_SHARDS) )cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_3b_a
 
 sweep-5b: ## Validate training pipeline at 5B (~150s, needs 85GB)
-	cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_5b_a
+	$(if $(ATTN_SHARDS),ATTN_SHARDS=$(ATTN_SHARDS) )$(if $(FFN_SHARDS),FFN_SHARDS=$(FFN_SHARDS) )cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_5b_a
 
 sweep-full: ## Full parameter sweep, 25 configs, 600M-5B (~60 min, needs 85GB)
-	cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_full
+	$(if $(ATTN_SHARDS),ATTN_SHARDS=$(ATTN_SHARDS) )$(if $(FFN_SHARDS),FFN_SHARDS=$(FFN_SHARDS) )cargo test -p engine --test bench_param_sweep --release -- --ignored --nocapture sweep_full
 
 # ── Forward-only scale probes ────────────────────────────────────────
 

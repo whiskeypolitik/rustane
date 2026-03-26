@@ -330,7 +330,11 @@ fn main() {
     let mut bwd_ws = ModelBackwardWorkspace::new(&cfg);
 
     let mut tc = TrainConfig::default();
-    let training_parallel = TrainingParallelOptions::disabled();
+    let training_parallel = TrainingParallelOptions::from_env_for_cfg(&cfg)
+        .unwrap_or_else(|message| {
+            eprintln!("{message}");
+            std::process::exit(1);
+        });
     tc.total_steps = args.total_steps;
     tc.warmup_steps = args.warmup_steps;
     tc.max_lr = args.max_lr;
@@ -352,6 +356,9 @@ fn main() {
     println!("  embed_lr_scale: {}, matrix_lr_scale: {}", tc.embed_lr_scale, tc.matrix_lr_scale);
     println!("  softcap: {}", tc.softcap);
     println!("  total steps: {}", tc.total_steps);
+    if training_parallel.forward_enabled() || training_parallel.backward_enabled() {
+        println!("  training parallel: {:?}", training_parallel);
+    }
     println!();
 
     // Initial validation

@@ -95,6 +95,44 @@ impl TrainingParallelOptions {
     pub fn backward_enabled(&self) -> bool {
         self.backward_attn_request.is_some() || self.backward_ffn_request.is_some()
     }
+
+    pub fn from_env_for_cfg(cfg: &ModelConfig) -> Result<Self, String> {
+        let attn_request = std::env::var("ATTN_SHARDS")
+            .ok()
+            .map(|raw| raw.parse::<usize>().map_err(|_| format!("ATTN_SHARDS must be an integer, got '{raw}'")))
+            .transpose()?;
+        let ffn_request = std::env::var("FFN_SHARDS")
+            .ok()
+            .map(|raw| raw.parse::<usize>().map_err(|_| format!("FFN_SHARDS must be an integer, got '{raw}'")))
+            .transpose()?;
+
+        if let Some(attn) = attn_request {
+            if attn > 1 {
+                return Err(
+                    "ATTN_SHARDS training path is deferred for Phase 4; omit it or set it to 1"
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(ffn) = ffn_request {
+            if ffn == 1 {
+                return Err("FFN_SHARDS=1 is invalid; omit FFN_SHARDS to run baseline".to_string());
+            }
+            if cfg.hidden % ffn != 0 {
+                return Err(format!(
+                    "FFN_SHARDS={ffn} is invalid for hidden={} in the Phase 4 training path",
+                    cfg.hidden
+                ));
+            }
+        }
+
+        Ok(Self {
+            forward_attn_request: attn_request.filter(|&v| v > 1),
+            forward_ffn_request: ffn_request,
+            backward_attn_request: None,
+            backward_ffn_request: None,
+        })
+    }
 }
 
 /// Everything needed from forward pass for backward.
@@ -187,6 +225,7 @@ pub struct ModelForwardWorkspace {
     pub logits: Vec<f32>,       // [SEQ * VOCAB]
     pub logits_capped: Vec<f32>,// [SEQ * VOCAB] (for softcap backward)
     pub dlogits: Vec<f32>,      // [SEQ * VOCAB]
+    pub training_ffn_sharded: Option<layer::ShardedFfnForwardRuntime>,
 }
 
 impl ModelForwardWorkspace {
@@ -206,6 +245,7 @@ impl ModelForwardWorkspace {
             logits: vec![0.0; seq * vocab],
             logits_capped: vec![0.0; seq * vocab],
             dlogits: vec![0.0; seq * vocab],
+            training_ffn_sharded: None,
         }
     }
 
@@ -228,6 +268,7 @@ impl ModelForwardWorkspace {
             logits: vec![0.0; seq * vocab],
             logits_capped: vec![0.0; seq * vocab],
             dlogits: vec![0.0; seq * vocab],
+            training_ffn_sharded: None,
         }
     }
 }
@@ -454,8 +495,60 @@ pub fn forward_ws_with_options(
     ws: &mut ModelForwardWorkspace,
     options: &TrainingParallelOptions,
 ) -> f32 {
-    let _ = options;
-    forward_ws(cfg, kernels, weights, tokens, targets, softcap, ws)
+    if let Some(ffn_shards) = options.forward_ffn_request {
+        if ws
+            .training_ffn_sharded
+            .as_ref()
+            .map(|runtime| runtime.shard_count())
+            != Some(ffn_shards)
+        {
+            ws.training_ffn_sharded = Some(
+                layer::ShardedFfnForwardRuntime::compile(cfg, ffn_shards)
+                    .expect("compile training sharded FFN runtime"),
+            );
+        }
+
+        let dim = cfg.dim;
+        let seq = cfg.seq;
+        let vocab = cfg.vocab;
+        embedding::forward(&weights.embed, dim, tokens, &mut ws.x_row);
+        vdsp::mtrans(&ws.x_row, dim, &mut ws.x_buf, seq, seq, dim);
+
+        let runtime = ws
+            .training_ffn_sharded
+            .as_mut()
+            .expect("training sharded FFN runtime present");
+        for l in 0..cfg.nlayers {
+            let x_buf = ws.x_buf.clone();
+            layer::forward_into_with_training_ffn(
+                cfg,
+                kernels,
+                &weights.layers[l],
+                &x_buf,
+                &mut ws.caches[l],
+                &mut ws.x_next_buf,
+                Some(runtime),
+            );
+            std::mem::swap(&mut ws.x_buf, &mut ws.x_next_buf);
+        }
+
+        ws.x_prenorm.copy_from_slice(&ws.x_buf);
+        rmsnorm::forward_channel_first(&ws.x_prenorm, &weights.gamma_final, &mut ws.x_final, &mut ws.rms_inv_final, dim, seq);
+        vdsp::mtrans(&ws.x_final, seq, &mut ws.x_final_row, dim, dim, seq);
+        ws.logits.fill(0.0);
+        vdsp::sgemm_at(&ws.x_final_row, seq, dim, &weights.embed, vocab, &mut ws.logits);
+        if softcap > 0.0 {
+            vdsp::sscal(&mut ws.logits, 1.0 / softcap);
+            vdsp::tanhf(&ws.logits, &mut ws.logits_capped);
+            vdsp::vsmul(&ws.logits_capped, softcap, &mut ws.logits);
+        }
+        let total_loss = cross_entropy::forward_backward_batch(
+            &ws.logits, targets, vocab, &mut ws.dlogits, 1.0 / seq as f32,
+        );
+        total_loss / seq as f32
+    } else {
+        forward_ws(cfg, kernels, weights, tokens, targets, softcap, ws)
+    }
 }
 
 pub fn backward_ws_with_options(

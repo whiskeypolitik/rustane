@@ -507,6 +507,40 @@ struct ModeRunner {
     scratch: LayerScratch,
 }
 
+struct CompiledAttentionShard {
+    layout: AttentionShardLayout,
+    cfg: ModelConfig,
+    sdpa_exe: Executable,
+    wo_exe: Executable,
+}
+
+struct CompiledFfnShard {
+    layout: FfnShardLayout,
+    w13_exe: Executable,
+    w2_exe: Executable,
+}
+
+enum CompiledAttentionArtifacts {
+    Baseline {
+        sdpa_exe: Executable,
+        wo_exe: Executable,
+    },
+    Sharded {
+        workers: Vec<CompiledAttentionShard>,
+    },
+}
+
+enum CompiledFfnArtifacts {
+    Baseline {
+        w13_exe: Executable,
+        w2_exe: Executable,
+        use_dual_w13: bool,
+    },
+    Sharded {
+        workers: Vec<CompiledFfnShard>,
+    },
+}
+
 fn attention_group_cfg(cfg: &ModelConfig, q_heads: usize, kv_heads: usize) -> ModelConfig {
     ModelConfig {
         dim: cfg.dim,
@@ -558,10 +592,13 @@ fn ffn_shard_layouts(cfg: &ModelConfig, shard_count: usize) -> Vec<FfnShardLayou
         .collect()
 }
 
-fn compile_sdpa_runner(cfg: &ModelConfig) -> Result<SdpaRunner, AneError> {
+fn compile_sdpa_exe(cfg: &ModelConfig) -> Result<Executable, AneError> {
     let qos = NSQualityOfService::UserInteractive;
-    let exe = sdpa_fwd::build(cfg).compile(qos)?;
-    Ok(SdpaRunner {
+    sdpa_fwd::build(cfg).compile(qos)
+}
+
+fn allocate_sdpa_buffers(exe: Executable, cfg: &ModelConfig) -> SdpaRunner {
+    SdpaRunner {
         exe,
         xnorm_in: tensor_data_new_logged("parallel_sdpa_xnorm_in", sdpa_fwd::xnorm_shape(cfg)),
         wq_in: tensor_data_new_logged("parallel_sdpa_wq_in", sdpa_fwd::wq_shape(cfg)),
@@ -571,14 +608,17 @@ fn compile_sdpa_runner(cfg: &ModelConfig) -> Result<SdpaRunner, AneError> {
         q_rope_out: tensor_data_new_logged("parallel_sdpa_q_rope_out", sdpa_fwd::q_rope_shape(cfg)),
         k_rope_out: tensor_data_new_logged("parallel_sdpa_k_rope_out", sdpa_fwd::k_rope_shape(cfg)),
         v_out: tensor_data_new_logged("parallel_sdpa_v_out", sdpa_fwd::v_shape(cfg)),
-    })
+    }
 }
 
-fn compile_wo_runner(cfg: &ModelConfig) -> Result<WoRunner, AneError> {
+fn compile_wo_exe(cfg: &ModelConfig) -> Result<Executable, AneError> {
     let qos = NSQualityOfService::UserInteractive;
-    let exe = dyn_matmul::build(cfg.q_dim, cfg.dim, cfg.seq).compile(qos)?;
+    dyn_matmul::build(cfg.q_dim, cfg.dim, cfg.seq).compile(qos)
+}
+
+fn allocate_wo_buffers(exe: Executable, cfg: &ModelConfig) -> WoRunner {
     let sp = dyn_matmul::spatial_width(cfg.seq, cfg.dim);
-    Ok(WoRunner {
+    WoRunner {
         exe,
         input: tensor_data_new_logged("parallel_wo_input", ane_bridge::ane::Shape {
             batch: 1,
@@ -592,40 +632,67 @@ fn compile_wo_runner(cfg: &ModelConfig) -> Result<WoRunner, AneError> {
             height: 1,
             width: cfg.seq,
         }),
+    }
+}
+
+fn compile_baseline_attention_exes(cfg: &ModelConfig) -> Result<CompiledAttentionArtifacts, AneError> {
+    Ok(CompiledAttentionArtifacts::Baseline {
+        sdpa_exe: compile_sdpa_exe(cfg)?,
+        wo_exe: compile_wo_exe(cfg)?,
     })
 }
 
-fn compile_baseline_attention_runner(cfg: &ModelConfig) -> Result<BaselineAttentionRunner, AneError> {
-    Ok(BaselineAttentionRunner {
+fn allocate_baseline_attention_runner(
+    cfg: &ModelConfig,
+    sdpa_exe: Executable,
+    wo_exe: Executable,
+) -> BaselineAttentionRunner {
+    BaselineAttentionRunner {
         cfg: cfg.clone(),
-        sdpa: compile_sdpa_runner(cfg)?,
-        wo: compile_wo_runner(cfg)?,
-    })
+        sdpa: allocate_sdpa_buffers(sdpa_exe, cfg),
+        wo: allocate_wo_buffers(wo_exe, cfg),
+    }
 }
 
-fn compile_sharded_attention_runner(
+fn compile_sharded_attention_exes(
     cfg: &ModelConfig,
     shard_count: usize,
-) -> Result<ShardedAttentionRunner, AneError> {
+) -> Result<CompiledAttentionArtifacts, AneError> {
     let workers = attention_shard_layouts(cfg, shard_count)
         .into_iter()
         .map(|layout| {
             let worker_cfg = attention_group_cfg(cfg, layout.q_head_count, layout.kv_head_count);
-            Ok(AttentionShardWorker {
+            Ok(CompiledAttentionShard {
                 layout,
                 cfg: worker_cfg.clone(),
-                sdpa: compile_sdpa_runner(&worker_cfg)?,
-                wo: compile_wo_runner(&worker_cfg)?,
+                sdpa_exe: compile_sdpa_exe(&worker_cfg)?,
+                wo_exe: compile_wo_exe(&worker_cfg)?,
             })
         })
         .collect::<Result<Vec<_>, AneError>>()?;
-    Ok(ShardedAttentionRunner {
-        cfg: cfg.clone(),
-        workers,
-    })
+    Ok(CompiledAttentionArtifacts::Sharded { workers })
 }
 
-fn compile_baseline_ffn_runner(cfg: &ModelConfig) -> Result<BaselineFfnRunner, AneError> {
+fn allocate_sharded_attention_runner(
+    cfg: &ModelConfig,
+    workers: Vec<CompiledAttentionShard>,
+) -> ShardedAttentionRunner {
+    let workers = workers
+        .into_iter()
+        .map(|worker| AttentionShardWorker {
+            layout: worker.layout,
+            cfg: worker.cfg.clone(),
+            sdpa: allocate_sdpa_buffers(worker.sdpa_exe, &worker.cfg),
+            wo: allocate_wo_buffers(worker.wo_exe, &worker.cfg),
+        })
+        .collect();
+    ShardedAttentionRunner {
+        cfg: cfg.clone(),
+        workers,
+    }
+}
+
+fn compile_baseline_ffn_exes(cfg: &ModelConfig) -> Result<CompiledFfnArtifacts, AneError> {
     let qos = NSQualityOfService::UserInteractive;
     let use_dual_w13 = ffn_fused::can_use_dual_w13(cfg);
     let w13_exe = if use_dual_w13 {
@@ -643,9 +710,32 @@ fn compile_baseline_ffn_runner(cfg: &ModelConfig) -> Result<BaselineFfnRunner, A
     } else {
         cfg.hidden
     };
-    let w2_exe = dyn_matmul::build(cfg.hidden, cfg.dim, cfg.seq).compile(qos)?;
+    let _ = w13_out_channels;
+    Ok(CompiledFfnArtifacts::Baseline {
+        w13_exe,
+        w2_exe: dyn_matmul::build(cfg.hidden, cfg.dim, cfg.seq).compile(qos)?,
+        use_dual_w13,
+    })
+}
+
+fn allocate_baseline_ffn_buffers(
+    cfg: &ModelConfig,
+    w13_exe: Executable,
+    w2_exe: Executable,
+    use_dual_w13: bool,
+) -> BaselineFfnRunner {
+    let w13_sp = if use_dual_w13 {
+        dyn_matmul::dual_separate_spatial_width(cfg.seq, cfg.hidden)
+    } else {
+        dyn_matmul::spatial_width(cfg.seq, cfg.hidden)
+    };
+    let w13_out_channels = if use_dual_w13 {
+        2 * cfg.hidden
+    } else {
+        cfg.hidden
+    };
     let w2_sp = dyn_matmul::spatial_width(cfg.seq, cfg.dim);
-    Ok(BaselineFfnRunner {
+    BaselineFfnRunner {
         cfg: cfg.clone(),
         use_dual_w13,
         w13_exe,
@@ -677,23 +767,43 @@ fn compile_baseline_ffn_runner(cfg: &ModelConfig) -> Result<BaselineFfnRunner, A
         h1: vec![0.0; cfg.hidden * cfg.seq],
         h3: vec![0.0; cfg.hidden * cfg.seq],
         gate: vec![0.0; cfg.hidden * cfg.seq],
-    })
+    }
 }
 
-fn compile_sharded_ffn_runner(cfg: &ModelConfig, shard_count: usize) -> Result<ShardedFfnRunner, AneError> {
+fn compile_sharded_ffn_exes(
+    cfg: &ModelConfig,
+    shard_count: usize,
+) -> Result<CompiledFfnArtifacts, AneError> {
     let qos = NSQualityOfService::UserInteractive;
     let workers = ffn_shard_layouts(cfg, shard_count)
         .into_iter()
         .map(|layout| {
             let shard_hidden = layout.col_count;
-            let w13_exe = dyn_matmul::build_dual_separate(cfg.dim, shard_hidden, cfg.seq).compile(qos)?;
-            let w2_exe = dyn_matmul::build(shard_hidden, cfg.dim, cfg.seq).compile(qos)?;
+            Ok(CompiledFfnShard {
+                layout,
+                w13_exe: dyn_matmul::build_dual_separate(cfg.dim, shard_hidden, cfg.seq)
+                    .compile(qos)?,
+                w2_exe: dyn_matmul::build(shard_hidden, cfg.dim, cfg.seq).compile(qos)?,
+            })
+        })
+        .collect::<Result<Vec<_>, AneError>>()?;
+    Ok(CompiledFfnArtifacts::Sharded { workers })
+}
+
+fn allocate_sharded_ffn_runner(
+    cfg: &ModelConfig,
+    workers: Vec<CompiledFfnShard>,
+) -> ShardedFfnRunner {
+    let workers = workers
+        .into_iter()
+        .map(|worker| {
+            let shard_hidden = worker.layout.col_count;
             let w13_sp = dyn_matmul::dual_separate_spatial_width(cfg.seq, shard_hidden);
             let w2_sp = dyn_matmul::spatial_width(cfg.seq, cfg.dim);
-            Ok(FfnShardWorker {
-                layout,
-                w13_exe,
-                w2_exe,
+            FfnShardWorker {
+                layout: worker.layout,
+                w13_exe: worker.w13_exe,
+                w2_exe: worker.w2_exe,
                 w13_in: tensor_data_new_logged("parallel_sharded_w13_in", ane_bridge::ane::Shape {
                     batch: 1,
                     channels: cfg.dim,
@@ -721,28 +831,55 @@ fn compile_sharded_ffn_runner(cfg: &ModelConfig, shard_count: usize) -> Result<S
                 h1: vec![0.0; shard_hidden * cfg.seq],
                 h3: vec![0.0; shard_hidden * cfg.seq],
                 gate: vec![0.0; shard_hidden * cfg.seq],
-            })
+            }
         })
-        .collect::<Result<Vec<_>, AneError>>()?;
-    Ok(ShardedFfnRunner {
+        .collect();
+    ShardedFfnRunner {
         cfg: cfg.clone(),
         workers,
-    })
+    }
 }
 
+/// Keep this function purely compile-oriented. It is called inside the typed
+/// `compile_with_iosurface_retry` wrapper above, so it must preserve `Result`
+/// semantics and avoid `TensorData::new()` allocations in the compile phase.
 fn compile_mode_runner(cfg: &ModelConfig, mode: &ParallelMode) -> Result<(ModeRunner, f32), AneError> {
     let t0 = Instant::now();
-    let attn = match mode {
+    let compiled_attn = match mode {
         ParallelMode::Attention { shards } | ParallelMode::AttentionFfn { attn_shards: shards, .. } => {
-            AttentionRunner::Sharded(compile_sharded_attention_runner(cfg, *shards)?)
+            compile_sharded_attention_exes(cfg, *shards)?
         }
-        _ => AttentionRunner::Baseline(compile_baseline_attention_runner(cfg)?),
+        _ => compile_baseline_attention_exes(cfg)?,
     };
-    let ffn = match mode {
+    let compiled_ffn = match mode {
         ParallelMode::Ffn { shards } | ParallelMode::AttentionFfn { ffn_shards: shards, .. } => {
-            FfnRunner::Sharded(compile_sharded_ffn_runner(cfg, *shards)?)
+            compile_sharded_ffn_exes(cfg, *shards)?
         }
-        _ => FfnRunner::Baseline(compile_baseline_ffn_runner(cfg)?),
+        _ => compile_baseline_ffn_exes(cfg)?,
+    };
+
+    let attn = match compiled_attn {
+        CompiledAttentionArtifacts::Baseline { sdpa_exe, wo_exe } => {
+            AttentionRunner::Baseline(allocate_baseline_attention_runner(cfg, sdpa_exe, wo_exe))
+        }
+        CompiledAttentionArtifacts::Sharded { workers } => {
+            AttentionRunner::Sharded(allocate_sharded_attention_runner(cfg, workers))
+        }
+    };
+    let ffn = match compiled_ffn {
+        CompiledFfnArtifacts::Baseline {
+            w13_exe,
+            w2_exe,
+            use_dual_w13,
+        } => FfnRunner::Baseline(allocate_baseline_ffn_buffers(
+            cfg,
+            w13_exe,
+            w2_exe,
+            use_dual_w13,
+        )),
+        CompiledFfnArtifacts::Sharded { workers } => {
+            FfnRunner::Sharded(allocate_sharded_ffn_runner(cfg, workers))
+        }
     };
     Ok((
         ModeRunner {
