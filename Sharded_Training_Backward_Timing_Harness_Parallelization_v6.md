@@ -20,9 +20,9 @@ Sharding regressions from `sweep-600m` show backward time ballooning from 710ms 
 
 ### Timing structs
 
-#### [MODIFY] [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs)
+#### [MODIFY] [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs)
 
-All timing structs derive `Serialize, Deserialize` (following [bench_ffn_latency_parallel_full_model.rs L175](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/tests/bench_ffn_latency_parallel_full_model.rs#L175) pattern) for JSON output:
+All timing structs derive `Serialize, Deserialize` (following [bench_ffn_latency_parallel_full_model.rs L175](file:///Users/USER/RustRover-Projects/rustane/crates/engine/tests/bench_ffn_latency_parallel_full_model.rs#L175) pattern) for JSON output:
 
 ```rust
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -83,7 +83,7 @@ pub fn backward_into_sharded_timed(
 
 ### Benchmark test
 
-#### [NEW] [bench_sharded_backward_timing.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/tests/bench_sharded_backward_timing.rs)
+#### [NEW] [bench_sharded_backward_timing.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/tests/bench_sharded_backward_timing.rs)
 
 `#[ignore]`d. 600M config. Explicit runtime construction (no env vars). 2 warmup + 5 timed.
 
@@ -100,7 +100,7 @@ cargo test -p engine --test bench_sharded_backward_timing --release -- --ignored
 
 ## Phase 2 — Parallelize FFN backward shard loop
 
-#### [MODIFY] [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs)
+#### [MODIFY] [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs)
 
 **`ShardedFfnBackwardWorker` additions (L724):**
 
@@ -137,7 +137,7 @@ The serial loop body (current L1655–1768) is extracted into a private `run_sha
 
 ### Phase 2 verification
 
-#### [NEW] [test_sharded_ffn_backward_correctness.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/tests/test_sharded_ffn_backward_correctness.rs)
+#### [NEW] [test_sharded_ffn_backward_correctness.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/tests/test_sharded_ffn_backward_correctness.rs)
 
 Non-`#[ignore]`d. Explicit runtime construction (no env vars).
 
@@ -148,7 +148,7 @@ Non-`#[ignore]`d. Explicit runtime construction (no env vars).
 **Test 3 — Bit-exact idempotency.** Two runs of parallel path, fresh `LayerGrads` each → `to_bits()` identical.
 
 > [!NOTE]
-> No accumulation test. `scatter_dw_columns` ([L1499](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1499)) is `copy_from_slice` (overwrites, not additive). Multi-call accumulation for sharded training is out of scope.
+> No accumulation test. `scatter_dw_columns` ([L1499](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1499)) is `copy_from_slice` (overwrites, not additive). Multi-call accumulation for sharded training is out of scope.
 
 Sweep gate: `make sweep-600m FFN_SHARDS=4` + `make sweep-600m`.
 

@@ -2,7 +2,7 @@
 
 ## Problem
 
-The ane debrief ([debrief-round-2.md](file:///Users/andrewgordon/other-projects/ane/debrief-round-2.md)) confirmed that compile-payload IOSurface allocation works fine in isolation. The failure requires **compile-payload surfaces and runtime TensorData surfaces to be alive simultaneously** — which is exactly what `parallel_bench.rs` does.
+The ane debrief ([debrief-round-2.md](file:///Users/USER/other-projects/ane/debrief-round-2.md)) confirmed that compile-payload IOSurface allocation works fine in isolation. The failure requires **compile-payload surfaces and runtime TensorData surfaces to be alive simultaneously** — which is exactly what `parallel_bench.rs` does.
 
 Current flow in `compile_mode_runner`:
 1. `compile_sdpa_runner` → compile sdpa_fwd exe → allocate **8 TensorData surfaces** → return
@@ -11,7 +11,7 @@ Current flow in `compile_mode_runner`:
 
 By step 3, the FFN compilation's MIL payload IOSurface competes with ~10 already-live TensorData IOSurfaces for shared kernel resources.
 
-Target flow (following `CompiledKernels::compile` pattern in [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L688)):
+Target flow (following `CompiledKernels::compile` pattern in [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L688)):
 1. Compile **all** executables (sdpa, wo, w13, w2) — compile payloads live only during each `.compile()` call
 2. Allocate **all** TensorData surfaces after all compilation finishes
 
@@ -21,7 +21,7 @@ Target flow (following `CompiledKernels::compile` pattern in [layer.rs](file:///
 
 ---
 
-#### [MODIFY] [parallel_bench.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs)
+#### [MODIFY] [parallel_bench.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs)
 
 Split each `compile_*_runner` function into two phases:
 
@@ -49,7 +49,7 @@ Phase 2: allocate all TensorData buffers, assemble runners
 
 ---
 
-#### [MODIFY] [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs)
+#### [MODIFY] [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs)
 
 Fix `tensor_data_new_logged` byte logging: currently computes `elements * size_of::<f32>()` (4 bytes) but `TensorData` surfaces are fp16-sized (2 bytes). Change to `elements * 2`.
 

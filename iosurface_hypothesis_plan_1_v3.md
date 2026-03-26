@@ -5,7 +5,7 @@
 > [!IMPORTANT]
 > This is the **leading hypothesis**, not a confirmed root cause. Success criteria are empirical.
 
-The ane debrief ([debrief-round-2.md](file:///Users/andrewgordon/other-projects/ane/debrief-round-2.md)) proved compile-payload IOSurface allocation works fine in isolation. The original failure is a **small compile-time MIL surface** (~11,865 bytes) inside `ane::client::compile_network` for `sdpaFwd`.
+The ane debrief ([debrief-round-2.md](file:///Users/USER/other-projects/ane/debrief-round-2.md)) proved compile-payload IOSurface allocation works fine in isolation. The original failure is a **small compile-time MIL surface** (~11,865 bytes) inside `ane::client::compile_network` for `sdpaFwd`.
 
 The hypothesis: `parallel_bench.rs` interleaves compilation and TensorData allocation, so later kernel compilations attempt their MIL payload IOSurface while earlier kernels' runtime TensorData IOSurfaces are already live. This overlap may exhaust a shared kernel resource.
 
@@ -22,15 +22,15 @@ The hypothesis: `parallel_bench.rs` interleaves compilation and TensorData alloc
 
 ## Status of Prior Work
 
-- [x] `compile_forward_only()` is **truly forward-only** — compiles only forward kernels and uses `allocate_forward_only()` with tiny backward placeholders ([layer.rs L756–812](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L756)). Part of the surface-count reduction is already in place.
-- [x] Retry wrapper — landed in [parallel_bench.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs#L112)
+- [x] `compile_forward_only()` is **truly forward-only** — compiles only forward kernels and uses `allocate_forward_only()` with tiny backward placeholders ([layer.rs L756–812](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L756)). Part of the surface-count reduction is already in place.
+- [x] Retry wrapper — landed in [parallel_bench.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs#L112)
 - [x] ane-side `Result`-based `IOSurfaceAlloc` error — landed in ane `compile-fixed` branch
 - [ ] **Split compile/allocate phases in `parallel_bench.rs`** — this experiment
 - [ ] Fix `tensor_data_new_logged` byte count (fp32 → fp16)
 
 ## Proposed Changes
 
-### [MODIFY] [parallel_bench.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs)
+### [MODIFY] [parallel_bench.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs)
 
 Split each `compile_*_runner` into compile-only and allocate-only functions.
 
@@ -86,7 +86,7 @@ fn compile_mode_runner(cfg: &ModelConfig, mode: &ParallelMode) -> Result<(ModeRu
 
 The key constraint: **no `TensorData::new()` / `tensor_data_new_logged()` calls may appear in phase 1.** All executables must be compiled into temporary tuples/vectors before any runtime surface is allocated.
 
-### [MODIFY] [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs)
+### [MODIFY] [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs)
 
 Fix `tensor_data_new_logged` (L35): change `elements * size_of::<f32>()` to `elements * 2`. This function is **env-var gated** (`RUSTANE_LOG_IOSURFACE_ALLOC`), not `cfg(debug_assertions)`, so the fix affects diagnostic output only when explicitly enabled.
 

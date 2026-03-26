@@ -8,7 +8,7 @@ Replace single-file overwrite (`target/bench-result.json`) with directory queue 
 
 ## Changes
 
-### [MODIFY] [bench_result.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/bench_result.rs)
+### [MODIFY] [bench_result.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/bench_result.rs)
 
 Change `write_result` (L96):
 - Write to `target/bench-results/<timestamp>_<benchmark>.json` instead of `target/bench-result.json`
@@ -21,7 +21,7 @@ No changes to `BenchResult` struct, callers, fingerprint, or any other function.
 
 ---
 
-### [MODIFY] [Makefile](file:///Users/andrewgordon/RustRover-Projects/rustane/Makefile) — `submit` target (L111–149)
+### [MODIFY] [Makefile](file:///Users/USER/RustRover-Projects/rustane/Makefile) — `submit` target (L111–149)
 
 Replace the current single-file submit with a loop:
 

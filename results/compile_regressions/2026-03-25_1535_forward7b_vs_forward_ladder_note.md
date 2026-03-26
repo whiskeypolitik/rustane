@@ -2,7 +2,7 @@
 
 - Timestamp: `2026-03-25 15:35`
 - Branch: `codex/latency-parallel-research`
-- Context: local `ane` path dependency on `/Users/andrewgordon/other-projects/ane/crates/ane`
+- Context: local `ane` path dependency on `/Users/USER/other-projects/ane/crates/ane`
 
 ## Observation
 

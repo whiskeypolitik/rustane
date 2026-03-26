@@ -20,7 +20,7 @@ Sharding regressions from `sweep-600m` show backward time ballooning from 710ms 
 
 ### Timing structs
 
-#### [MODIFY] [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs)
+#### [MODIFY] [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs)
 
 ```rust
 #[derive(Debug, Clone, Default)]
@@ -99,7 +99,7 @@ pub fn backward_into_sharded_timed(
 
 ### Benchmark test
 
-#### [NEW] [bench_sharded_backward_timing.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/tests/bench_sharded_backward_timing.rs)
+#### [NEW] [bench_sharded_backward_timing.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/tests/bench_sharded_backward_timing.rs)
 
 `#[ignore]`d. 600M config. Construct runtimes explicitly (no env vars). 2 warmup + 5 timed, calling wrapper twice per step (`WallOnly` + `WallAndHw`). JSON to `results/sharded_backward_timing/`.
 
@@ -111,7 +111,7 @@ cargo test -p engine --test bench_sharded_backward_timing --release -- --ignored
 
 ## Phase 2 — Parallelize FFN backward shard loop
 
-#### [MODIFY] [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs)
+#### [MODIFY] [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs)
 
 **`ShardedFfnBackwardWorker` additions (L724):**
 
@@ -168,7 +168,7 @@ pub fn backward_into_sharded_serial(
 
 ### Phase 2 verification
 
-#### [NEW] [test_sharded_ffn_backward_correctness.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/tests/test_sharded_ffn_backward_correctness.rs)
+#### [NEW] [test_sharded_ffn_backward_correctness.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/tests/test_sharded_ffn_backward_correctness.rs)
 
 Non-`#[ignore]`d. Construct runtimes explicitly (no env vars).
 
@@ -182,7 +182,7 @@ Calls `backward_into_with_training_ffn(sharded_ffn=Some(...))` vs `backward_into
 Two runs of the parallel path with fresh `LayerGrads` produce `to_bits()` identical output. Catches races and non-deterministic merge.
 
 > [!IMPORTANT]
-> **Tier 3 accumulation test is removed.** The post-loop `scatter_dw_columns` ([L1499](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1499)) uses `copy_from_slice` — it **overwrites**, not adds. This means calling `backward_into_with_training_ffn` twice into the same `grads` overwrites the sharded columns rather than doubling them. This is the same behavior as the existing serial sharded path, so it's not a bug — but it means a multi-call accumulation test would fail for the wrong reason. If multi-microbatch accumulation is needed for sharded training in the future, `scatter_dw_columns` must be changed to additive, but that is out of scope for this plan.
+> **Tier 3 accumulation test is removed.** The post-loop `scatter_dw_columns` ([L1499](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1499)) uses `copy_from_slice` — it **overwrites**, not adds. This means calling `backward_into_with_training_ffn` twice into the same `grads` overwrites the sharded columns rather than doubling them. This is the same behavior as the existing serial sharded path, so it's not a bug — but it means a multi-call accumulation test would fail for the wrong reason. If multi-microbatch accumulation is needed for sharded training in the future, `scatter_dw_columns` must be changed to additive, but that is out of scope for this plan.
 
 Sweep gate:
 ```bash

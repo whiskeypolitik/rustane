@@ -8,8 +8,8 @@
 - **`w2` staging: 7.5–8.3ms per shard** — the dominant cost
 
 Root cause has two parts:
-1. The shard loop at [L1559](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1559) is serial
-2. `stage_transposed_weight_columns` ([L1393](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1393)) does element-by-element gather with stride-`hidden` reads from `weights.w2` (24MB at 600M) — cache-hostile, ~8ms per call
+1. The shard loop at [L1559](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1559) is serial
+2. `stage_transposed_weight_columns` ([L1393](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1393)) does element-by-element gather with stride-`hidden` reads from `weights.w2` (24MB at 600M) — cache-hostile, ~8ms per call
 
 ## Phased approach
 
@@ -32,13 +32,13 @@ Root cause has two parts:
 
 ### Analysis
 
-The non-sharded forward path already has this optimization at [L4152–4163](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L4152): it transposes `weights.w2` into `cache.w2t_scratch` once per generation, then stages from contiguous rows via `stage_spatial`. The sharded path at [L1611](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1611) skips this and calls `stage_transposed_weight_columns` every forward call — the entire cost is redundant.
+The non-sharded forward path already has this optimization at [L4152–4163](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L4152): it transposes `weights.w2` into `cache.w2t_scratch` once per generation, then stages from contiguous rows via `stage_spatial`. The sharded path at [L1611](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1611) skips this and calls `stage_transposed_weight_columns` every forward call — the entire cost is redundant.
 
 The fix: each worker pre-packs its shard's W2 weight region into a contiguous CPU buffer. The prepack runs once when `w2_generation` changes. Subsequent forward calls stage from the prepacked buffer via `stage_spatial` (memcpy-speed).
 
 ### Changes
 
-#### [MODIFY] [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs)
+#### [MODIFY] [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs)
 
 **`ShardedFfnForwardWorker` (L703):**
 
@@ -111,7 +111,7 @@ Worth parallelizing now with minimal cache contention.
 
 ### Changes
 
-#### [MODIFY] [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs)
+#### [MODIFY] [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs)
 
 **Preserve serial reference (same pattern as backward):**
 
@@ -122,7 +122,7 @@ pub fn run_sharded_ffn_forward_into_serial(...) { /* current serial body */ }
 
 **New parallel implementation at `run_sharded_ffn_forward_into`:**
 
-Following the existing parallel bench pattern at [bench_ffn_latency_parallel_full_model.rs L743](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/tests/bench_ffn_latency_parallel_full_model.rs#L743):
+Following the existing parallel bench pattern at [bench_ffn_latency_parallel_full_model.rs L743](file:///Users/USER/RustRover-Projects/rustane/crates/engine/tests/bench_ffn_latency_parallel_full_model.rs#L743):
 
 ```rust
 fn run_sharded_ffn_forward_into(

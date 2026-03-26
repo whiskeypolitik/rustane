@@ -20,7 +20,7 @@ Sharding regressions from `sweep-600m` show backward time ballooning from 710ms 
 
 ### Timing structs
 
-#### [MODIFY] [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs)
+#### [MODIFY] [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs)
 
 Add two new public structs alongside the existing `ForwardTimings` (L3304) and `BackwardTimings` (L3640):
 
@@ -68,11 +68,11 @@ These variants mirror the existing dispatch code but add `Instant::now()` guards
 
 ### Benchmark test
 
-#### [NEW] [bench_sharded_backward_timing.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/tests/bench_sharded_backward_timing.rs)
+#### [NEW] [bench_sharded_backward_timing.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/tests/bench_sharded_backward_timing.rs)
 
-An `#[ignore]`d test following the pattern of [bench_hw_execution_time.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/tests/bench_hw_execution_time.rs):
+An `#[ignore]`d test following the pattern of [bench_hw_execution_time.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/tests/bench_hw_execution_time.rs):
 
-1. Use the 600M config matching `sweep-600m` (`custom:1536,4096,20,512` → dim=1536, hidden=4096, heads=20, seq=512, inferred from [Makefile L101](file:///Users/andrewgordon/RustRover-Projects/rustane/Makefile#L101))
+1. Use the 600M config matching `sweep-600m` (`custom:1536,4096,20,512` → dim=1536, hidden=4096, heads=20, seq=512, inferred from [Makefile L101](file:///Users/USER/RustRover-Projects/rustane/Makefile#L101))
 2. Compile baseline kernels + sharded runtimes for FFN_SHARDS ∈ {1,2,4} and ATTN_SHARDS ∈ {1,2}
 3. For each config, run 2 warmup + 5 timed steps calling the `_with_stats` variants
 4. Collect and print:
@@ -104,7 +104,7 @@ cargo test -p engine --test bench_sharded_backward_timing --release -- --ignored
 > [!WARNING]
 > The current serial loop at L1655 writes into shared `grads.dw1/dw2/dw3` via `accumulate_dw` + `scatter_dw_columns` inside the per-shard iteration. Parallelizing requires worker-local gradient temporaries and a post-loop reduction step, otherwise there will be write races and nondeterministic gradients.
 
-#### [MODIFY] [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs)
+#### [MODIFY] [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs)
 
 **Changes to `ShardedFfnBackwardWorker` (L724):**
 - The existing `dw_tmp: Vec<f32>` field (L737) already serves as a worker-local scratch buffer of size `dim × shard_hidden`
@@ -191,7 +191,7 @@ make sweep-600m FFN_SHARDS=4
 
 Same pattern as Phase 2, applied to `run_sharded_attention_backward_into` (L1771):
 
-#### [MODIFY] [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs)
+#### [MODIFY] [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs)
 
 **Changes to `ShardedAttentionBackwardWorker` (L748):**
 - Add worker-local gradient buffers for `dwq_local`, `dwk_local`, `dwv_local`, `dwo_local`

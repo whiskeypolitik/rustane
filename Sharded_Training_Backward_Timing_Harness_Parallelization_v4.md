@@ -20,7 +20,7 @@ Sharding regressions from `sweep-600m` show backward time ballooning from 710ms 
 
 ### Timing structs
 
-#### [MODIFY] [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs)
+#### [MODIFY] [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs)
 
 Per-dispatch timing captures each individual ANE round-trip within a shard. FFN backward has 2 dispatches per shard (W2, W13t); attention backward has 5 (wot, bwd1, bwd2, q_bwd, kv_bwd):
 
@@ -78,9 +78,9 @@ pub struct ShardedBackwardTimings {
 
 ### Dual-mode timing API
 
-#### [MODIFY] [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs)
+#### [MODIFY] [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs)
 
-`run_cached_with_stats` has measurable overhead vs `run_cached_direct` (see [bench_hw_execution_time.rs L47–66](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/tests/bench_hw_execution_time.rs#L47-L66)). The public wrapper takes an explicit mode:
+`run_cached_with_stats` has measurable overhead vs `run_cached_direct` (see [bench_hw_execution_time.rs L47–66](file:///Users/USER/RustRover-Projects/rustane/crates/engine/tests/bench_hw_execution_time.rs#L47-L66)). The public wrapper takes an explicit mode:
 
 ```rust
 /// Controls whether the timing harness uses run_cached_direct or run_cached_with_stats.
@@ -113,7 +113,7 @@ In `WallOnly` mode, `DispatchTiming.ane_hw_ns` is `None` and `ane_wall_ms` refle
 
 ### Benchmark test
 
-#### [NEW] [bench_sharded_backward_timing.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/tests/bench_sharded_backward_timing.rs)
+#### [NEW] [bench_sharded_backward_timing.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/tests/bench_sharded_backward_timing.rs)
 
 An `#[ignore]`d test:
 
@@ -134,7 +134,7 @@ cargo test -p engine --test bench_sharded_backward_timing --release -- --ignored
 > [!WARNING]
 > The current serial loop at L1655 writes into shared `grads.dw1/dw2/dw3` via `accumulate_dw` + `scatter_dw_columns` inside the per-shard iteration. Parallelizing requires worker-local gradient temporaries and a post-loop reduction step.
 
-#### [MODIFY] [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs)
+#### [MODIFY] [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs)
 
 **Changes to `ShardedFfnBackwardWorker` (L724):**
 
@@ -162,7 +162,7 @@ Replace the serial `for` loop (L1655–1768) with `thread::scope` + barrier. Eac
 
 ### Phase 2 verification
 
-#### [NEW] [test_sharded_ffn_backward_correctness.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/tests/test_sharded_ffn_backward_correctness.rs)
+#### [NEW] [test_sharded_ffn_backward_correctness.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/tests/test_sharded_ffn_backward_correctness.rs)
 
 > [!IMPORTANT]
 > **Sharding is NOT a schedule-only change.** Unlike the `auto_move_dw2` and `auto_fuse_qbwd` optimizations (which rearrange identical FP operations), sharding changes ANE tile sizes — each shard does `shard_hidden`-wide matmuls instead of `hidden`-wide. The ANE compiler may tile/quantize differently, producing non-identical FP results. **Bit-exact comparison between sharded and non-sharded paths is not achievable.**
@@ -176,7 +176,7 @@ Replace the serial `for` loop (L1655–1768) with `thread::scope` + barrier. Eac
 - Mean abs diff ≤ 5e-3
 - Cosine similarity ≥ 0.999
 
-Compares **all** gradient fields: `dx`, `dw1/dw2/dw3`, `dwo/dwq/dwk/dwv`, `dgamma1/dgamma2` (FFN backward feeds attention via RMSNorm2 at [L2097](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L2097)).
+Compares **all** gradient fields: `dx`, `dw1/dw2/dw3`, `dwo/dwq/dwk/dwv`, `dgamma1/dgamma2` (FFN backward feeds attention via RMSNorm2 at [L2097](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L2097)).
 
 **Tier 2 — Bit-exact idempotency.** Two consecutive runs of the sharded path with fresh `LayerGrads` produce **bit-identical** output (`to_bits()` comparison). This catches:
 - Write races from incorrect parallelization
@@ -213,7 +213,7 @@ Re-run Phase 1 harness after Phase 2 lands. Key metrics to compare:
 
 Same pattern as Phase 2. Key differences:
 
-#### [MODIFY] [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs)
+#### [MODIFY] [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs)
 
 **`ShardedAttentionBackwardWorker` additions:**
 
@@ -225,7 +225,7 @@ dwo_local: Vec<f32>,   // [q_dim_shard * dim], ROW-sharded (not column!)
 ```
 
 > [!CAUTION]
-> **`dwo` is `[q_dim × dim]`, row-sharded by `q_col_start`.** The baseline computes it at [L2163](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L2163) as `accumulate_dw(attn_out, q_dim, dx2_scaled, dim, seq, dwo)`. Each shard sees `attn_out_shard [q_dim_shard × seq]`, producing `dwo_local [q_dim_shard × dim]` — contiguous row slices. Needs `scatter_dw_rows` (simple memcpy), not `scatter_dw_columns`.
+> **`dwo` is `[q_dim × dim]`, row-sharded by `q_col_start`.** The baseline computes it at [L2163](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L2163) as `accumulate_dw(attn_out, q_dim, dx2_scaled, dim, seq, dwo)`. Each shard sees `attn_out_shard [q_dim_shard × seq]`, producing `dwo_local [q_dim_shard × dim]` — contiguous row slices. Needs `scatter_dw_rows` (simple memcpy), not `scatter_dw_columns`.
 
 > [!IMPORTANT]
 > The current sharded attention backward (L1792–2010) **never computes `dwo`**. Phase 4 must add per-worker `dwo_local` computation.

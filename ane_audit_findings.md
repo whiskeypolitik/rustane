@@ -8,7 +8,7 @@ This audit compared:
 - the root note in `fp16-ane-changes.md`,
 - the currently pinned `ane` dependency in Rustane,
 - the local updated `ane` checkout at:
-  `/Users/andrewgordon/Other projects/ane`
+  `/Users/USER/Other projects/ane`
 - the documented upstream update:
   commit `855c025` on branch `codex/fp16-ane-io-perf-stats`
 
@@ -46,7 +46,7 @@ This does not match the documented updated commit:
 
 ## What The Updated Local `ane` Repo Adds
 
-The local updated `ane` repo at `/Users/andrewgordon/Other projects/ane` does contain the documented work from `fp16-ane-changes.md`.
+The local updated `ane` repo at `/Users/USER/Other projects/ane` does contain the documented work from `fp16-ane-changes.md`.
 
 Confirmed additions include:
 

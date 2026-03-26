@@ -6,18 +6,18 @@
 
 ## P0-A: FFN backward transpose reuse
 
-#### [MODIFY] [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs)
+#### [MODIFY] [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs)
 
-`BackwardWorkspace` already has `w1t`/`w3t` fields ([L1266–1267](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1266)) — transient shared scratch, reused across layers, zero new memory.
+`BackwardWorkspace` already has `w1t`/`w3t` fields ([L1266–1267](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1266)) — transient shared scratch, reused across layers, zero new memory.
 
-In `run_sharded_ffn_backward_into` ([L2827](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L2827)), before `thread::scope`:
+In `run_sharded_ffn_backward_into` ([L2827](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L2827)), before `thread::scope`:
 
 ```rust
 vdsp::mtrans(&weights.w1, hidden, &mut ws.w1t, dim, dim, hidden);
 vdsp::mtrans(&weights.w3, hidden, &mut ws.w3t, dim, dim, hidden);
 ```
 
-Pass `ws.w1t`/`ws.w3t` as shared read-only refs into workers. In `run_sharded_ffn_backward_worker` ([L2704](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L2704)), replace:
+Pass `ws.w1t`/`ws.w3t` as shared read-only refs into workers. In `run_sharded_ffn_backward_worker` ([L2704](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L2704)), replace:
 
 ```diff
 -stage_transposed_weight_columns(buf, &weights.w1, dim, hidden, col_start, shard_hidden, w13t_sp, 2*seq);
@@ -28,7 +28,7 @@ Pass `ws.w1t`/`ws.w3t` as shared read-only refs into workers. In `run_sharded_ff
 +stage_spatial(buf, shard_hidden, w13t_sp, &w3t[w3t_start..w3t_start + shard_hidden*dim], dim, 2*seq+dim);
 ```
 
-Same pattern as attention backward's `ws.wot` at [L3377](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L3377).
+Same pattern as attention backward's `ws.wot` at [L3377](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L3377).
 
 **Verification:**
 - Bit-exact parallel vs `#[doc(hidden)]` serial reference
@@ -40,16 +40,16 @@ Same pattern as attention backward's `ws.wot` at [L3377](file:///Users/andrewgor
 
 ## P0-B: Extract reusable forward-mode runtime from `parallel_bench.rs`
 
-#### [NEW] Production forward-mode runtime structs in [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs)
+#### [NEW] Production forward-mode runtime structs in [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs)
 
-Extract from [parallel_bench.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs):
-- `ShardedAttentionForwardRuntime` — does not exist in production today, only in bench code at [L1380](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs#L1380)
+Extract from [parallel_bench.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs):
+- `ShardedAttentionForwardRuntime` — does not exist in production today, only in bench code at [L1380](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs#L1380)
 - Forward-mode shard layout resolution (baseline / attn-only / FFN-only / attn+FFN)
 - Layer-dispatch composition (which runner to call per component)
 
 **Do not carry over:**
-- Layer-by-layer `x_buf.clone()` ([parallel_bench.rs L1457](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs#L1457))
-- Benchmark config, retry policy, reporting ([L144](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs#L144))
+- Layer-by-layer `x_buf.clone()` ([parallel_bench.rs L1457](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs#L1457))
+- Benchmark config, retry policy, reporting ([L144](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs#L144))
 
 After extraction, `parallel_bench.rs` should call the new production runtime.
 
@@ -57,9 +57,9 @@ After extraction, `parallel_bench.rs` should call the new production runtime.
 
 ## P1-A: Wire extracted forward runtime into forward-only
 
-#### [MODIFY] [full_model.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/full_model.rs)
+#### [MODIFY] [full_model.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/full_model.rs)
 
-Add `forward_only_ws_with_options` alongside existing `forward_only_ws` ([L286](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/full_model.rs#L286)). Support all four forward modes: baseline, attn-only, FFN-only, combined.
+Add `forward_only_ws_with_options` alongside existing `forward_only_ws` ([L286](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/full_model.rs#L286)). Support all four forward modes: baseline, attn-only, FFN-only, combined.
 
 **Verification:**
 - Layer-level correctness tests (toleranced sharded vs baseline)
@@ -69,11 +69,11 @@ Add `forward_only_ws_with_options` alongside existing `forward_only_ws` ([L286](
 
 ## P1-B: Wire forward runtime into training
 
-#### [MODIFY] [full_model.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/full_model.rs)
+#### [MODIFY] [full_model.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/full_model.rs)
 
-1. Stop forcing `forward_attn_request: None` at [L133](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/full_model.rs#L133)
-2. Extend `ModelForwardWorkspace` ([L223](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/full_model.rs#L223)) to hold combined forward runtime (not only `training_ffn_sharded`)
-3. Make `forward_ws_with_options` ([L495](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/full_model.rs#L495)) handle all four forward modes
+1. Stop forcing `forward_attn_request: None` at [L133](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/full_model.rs#L133)
+2. Extend `ModelForwardWorkspace` ([L223](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/full_model.rs#L223)) to hold combined forward runtime (not only `training_ffn_sharded`)
+3. Make `forward_ws_with_options` ([L495](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/full_model.rs#L495)) handle all four forward modes
 
 **Verification:**
 - Layer-level bit-exact + toleranced tests

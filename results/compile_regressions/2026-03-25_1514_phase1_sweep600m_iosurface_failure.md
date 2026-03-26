@@ -3,7 +3,7 @@
 - Timestamp: `2026-03-25 15:14`
 - Branch: `codex/latency-parallel-research`
 - HEAD commit: `9e36f9a5bbb2d4304fbb914a1ea23b933f439550`
-- Local `ane` dependency: path dependency to `/Users/andrewgordon/other-projects/ane/crates/ane`
+- Local `ane` dependency: path dependency to `/Users/USER/other-projects/ane/crates/ane`
 - Local `ane` branch/rev: `compile-fixed` @ `900a70607eac249b1cfbf622439ab1db2589164f`
 - Phase: Phase 1 extraction verification
 
@@ -43,7 +43,7 @@ make sweep-600m
   600m-A — 1536d/4096h/20L/seq512 — ~579M params — h/d=2.67x
 ============================================================
 
-thread 'sweep_600m_a' (997502) panicked at /Users/andrewgordon/other-projects/ane/crates/ane/src/io_surface.rs:55:14:
+thread 'sweep_600m_a' (997502) panicked at /Users/USER/other-projects/ane/crates/ane/src/io_surface.rs:55:14:
 IOSurface creation failed
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
   [1/4] Compiling ANE kernels... test sweep_600m_a ... FAILED

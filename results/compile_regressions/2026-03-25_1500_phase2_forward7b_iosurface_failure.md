@@ -3,7 +3,7 @@
 - Timestamp: `2026-03-25 15:00`
 - Branch: `codex/latency-parallel-research`
 - HEAD commit: `9e36f9a5bbb2d4304fbb914a1ea23b933f439550`
-- Local `ane` dependency: path dependency to `/Users/andrewgordon/other-projects/ane/crates/ane`
+- Local `ane` dependency: path dependency to `/Users/USER/other-projects/ane/crates/ane`
 - Local `ane` branch/rev: `compile-fixed` @ `900a70607eac249b1cfbf622439ab1db2589164f`
 - Phase: forward benchmark rollout verification
 
@@ -37,7 +37,7 @@ make forward-7b
   7B — 4096d/11008h/32L/seq512 — 6.51B params — est. 26.8GB
 ======================================================================
 
-thread 'main' (955869) panicked at /Users/andrewgordon/other-projects/ane/crates/ane/src/io_surface.rs:55:14:
+thread 'main' (955869) panicked at /Users/USER/other-projects/ane/crates/ane/src/io_surface.rs:55:14:
 IOSurface creation failed
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 

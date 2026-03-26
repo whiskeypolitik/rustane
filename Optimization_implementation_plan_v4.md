@@ -6,7 +6,7 @@
 
 ## P0-A: FFN backward transpose reuse
 
-Transpose `weights.w1/w3` into existing `ws.w1t/ws.w3t` ([L1266–1267](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1266)) once before `thread::scope` in `run_sharded_ffn_backward_into` ([L2827](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L2827)). Workers stage shard rows via `stage_spatial` instead of `stage_transposed_weight_columns` ([L2704](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L2704)). Zero new memory. Same pattern as `ws.wot` at [L3377](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L3377).
+Transpose `weights.w1/w3` into existing `ws.w1t/ws.w3t` ([L1266–1267](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1266)) once before `thread::scope` in `run_sharded_ffn_backward_into` ([L2827](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L2827)). Workers stage shard rows via `stage_spatial` instead of `stage_transposed_weight_columns` ([L2704](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L2704)). Zero new memory. Same pattern as `ws.wot` at [L3377](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L3377).
 
 **Verify:** bit-exact parallel vs serial reference, `make sweep-600m` all four configs.
 
@@ -16,7 +16,7 @@ Transpose `weights.w1/w3` into existing `ws.w1t/ws.w3t` ([L1266–1267](file:///
 
 ### P0-B.1: Shared mode resolution for both directions
 
-Today: monolithic parsing at [full_model.rs L99](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/full_model.rs#L99), hardcoded `forward_attn_request: None` at [L133](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/full_model.rs#L133). Bench has its own mode enum at [parallel_bench.rs L252](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs#L252).
+Today: monolithic parsing at [full_model.rs L99](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/full_model.rs#L99), hardcoded `forward_attn_request: None` at [L133](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/full_model.rs#L133). Bench has its own mode enum at [parallel_bench.rs L252](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs#L252).
 
 Add to production (new `sharding.rs` module or top of `layer.rs`):
 
@@ -40,7 +40,7 @@ Single `resolve_modes_from_env(cfg) -> Result<(ResolvedForwardMode, ResolvedBack
 
 ### P0-B.2: `CombinedForwardRuntime`
 
-Extract from [parallel_bench.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs):
+Extract from [parallel_bench.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs):
 
 ```rust
 pub struct CombinedForwardRuntime {
@@ -54,7 +54,7 @@ pub struct CombinedForwardRuntime {
 > [!IMPORTANT]
 > `LayerScratch` is an **internal temporary** — not the source of truth for training state. The production API (P0-B.4) writes final results into `ForwardCache`. Bench code may use scratch-only since it has no backward.
 
-Do NOT carry over from bench: `x_buf.clone()` ([L1457](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs#L1457)), retry policy, reporting ([L144](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs#L144)).
+Do NOT carry over from bench: `x_buf.clone()` ([L1457](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs#L1457)), retry policy, reporting ([L144](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs#L144)).
 
 ### P0-B.3: ForwardCache write contract
 
@@ -77,9 +77,9 @@ Sharded FFN forward already fills `h1`, `h3`, `gate` via `store_shard_channels` 
 ### P0-B.4: Production layer-level forward API
 
 > [!IMPORTANT]
-> Today's only production training-forward entrypoint is [forward_into_with_training_ffn L4704](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L4704) — it keeps attention baseline and only optionally shards FFN. Without a new layer API, `full_model.rs` would duplicate bench orchestration or reach into runtime internals.
+> Today's only production training-forward entrypoint is [forward_into_with_training_ffn L4704](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L4704) — it keeps attention baseline and only optionally shards FFN. Without a new layer API, `full_model.rs` would duplicate bench orchestration or reach into runtime internals.
 
-Add to [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs):
+Add to [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs):
 
 ```rust
 pub fn forward_into_combined(

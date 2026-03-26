@@ -5,7 +5,7 @@
 `FFN_SHARDS=4` forward regresses to 911ms vs 259ms baseline (3.5×). Per-layer timing:
 - FFN wall: ~51ms, ANE wall: ~7.6ms (15%)
 - **`w2` staging: 7.5–8.3ms per shard** — dominant cost
-- Root cause: `stage_transposed_weight_columns` ([L1393](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1393)) does element-by-element gather with stride-`hidden` reads across 24MB `weights.w2`
+- Root cause: `stage_transposed_weight_columns` ([L1393](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1393)) does element-by-element gather with stride-`hidden` reads across 24MB `weights.w2`
 
 ## Phases
 
@@ -23,15 +23,15 @@
 
 ### Key insight
 
-The non-sharded forward already caches a full transpose of `weights.w2` into `cache.w2t_scratch` ([L4152–4163](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L4152)), keyed by `w2t_generation`. `ForwardCache` is **per-layer** (one per `ws.caches[l]` in the training loop), so the generation tracking is correct — each layer's cache tracks its own layer's weights.
+The non-sharded forward already caches a full transpose of `weights.w2` into `cache.w2t_scratch` ([L4152–4163](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L4152)), keyed by `w2t_generation`. `ForwardCache` is **per-layer** (one per `ws.caches[l]` in the training loop), so the generation tracking is correct — each layer's cache tracks its own layer's weights.
 
-The sharded forward path at [L1611](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1611) ignores this and calls `stage_transposed_weight_columns` from raw `weights.w2` every call. The fix: transpose once into `cache.w2t_scratch`, then stage each shard from **contiguous rows** of the transposed matrix.
+The sharded forward path at [L1611](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1611) ignores this and calls `stage_transposed_weight_columns` from raw `weights.w2` every call. The fix: transpose once into `cache.w2t_scratch`, then stage each shard from **contiguous rows** of the transposed matrix.
 
 In the transposed layout `[hidden × dim]`, shard columns `col_start..col_start+shard_hidden` of the original `[dim × hidden]` become contiguous rows — a single `stage_spatial` call at memcpy speed.
 
 ### Changes
 
-#### [MODIFY] [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs)
+#### [MODIFY] [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs)
 
 In `run_sharded_ffn_forward_into` (L1542), add before the shard loop:
 
@@ -61,7 +61,7 @@ stage_spatial(buf, shard_hidden, w2_sp, w2t_shard, dim, seq);
 - Total: ~5ms vs current ~32ms
 
 > [!NOTE]
-> `cache.w2t_generation` initializes to `u64::MAX` ([L122](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L122)), guaranteeing the first call always transposes. `LayerWeights.w2_generation` starts at 0 ([L1307](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1307)). No init-skip bug.
+> `cache.w2t_generation` initializes to `u64::MAX` ([L122](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L122)), guaranteeing the first call always transposes. `LayerWeights.w2_generation` starts at 0 ([L1307](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1307)). No init-skip bug.
 
 ### Phase A verification
 
@@ -77,11 +77,11 @@ make sweep-600m FFN_SHARDS=4
 
 ## Phase B — Parallelize forward shard loop
 
-After Phase A, each shard is ~4ms of cache-local work. Parallelize with `thread::scope` + barrier, following the existing bench pattern at [bench_ffn_latency_parallel_full_model.rs L743](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/tests/bench_ffn_latency_parallel_full_model.rs#L743).
+After Phase A, each shard is ~4ms of cache-local work. Parallelize with `thread::scope` + barrier, following the existing bench pattern at [bench_ffn_latency_parallel_full_model.rs L743](file:///Users/USER/RustRover-Projects/rustane/crates/engine/tests/bench_ffn_latency_parallel_full_model.rs#L743).
 
 ### Changes
 
-#### [MODIFY] [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs)
+#### [MODIFY] [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs)
 
 Preserve serial reference as `#[doc(hidden)] pub`.
 

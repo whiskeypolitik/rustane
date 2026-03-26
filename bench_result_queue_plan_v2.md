@@ -8,7 +8,7 @@ Replace single-file overwrite (`target/bench-result.json`) with directory queue 
 
 ## Changes
 
-### [MODIFY] [bench_result.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/bench_result.rs)
+### [MODIFY] [bench_result.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/bench_result.rs)
 
 Change `write_result` (L96):
 - Filename: `<YYYYMMDD_HHMMSS>_<benchmark-slug>_<fingerprint[..8]>.json` (e.g. `20260326_111500_train-600m_a3f7c012.json`). The 8-char fingerprint prefix guarantees uniqueness even for same-second results.
@@ -20,7 +20,7 @@ No changes to `BenchResult` struct, callers, fingerprint, or any other function.
 
 ---
 
-### [MODIFY] [Makefile](file:///Users/andrewgordon/RustRover-Projects/rustane/Makefile) — `submit` target (L111–149)
+### [MODIFY] [Makefile](file:///Users/USER/RustRover-Projects/rustane/Makefile) — `submit` target (L111–149)
 
 Replace the current single-file submit with a loop:
 

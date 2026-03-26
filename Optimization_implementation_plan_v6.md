@@ -6,7 +6,7 @@
 
 ## P0-A: FFN backward transpose reuse
 
-Transpose `weights.w1/w3` into existing `ws.w1t/ws.w3t` ([L1266–1267](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1266)) once before `thread::scope` in `run_sharded_ffn_backward_into` ([L2827](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L2827)). Workers stage shard rows via `stage_spatial` instead of `stage_transposed_weight_columns` ([L2704](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L2704)). Zero new memory.
+Transpose `weights.w1/w3` into existing `ws.w1t/ws.w3t` ([L1266–1267](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1266)) once before `thread::scope` in `run_sharded_ffn_backward_into` ([L2827](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L2827)). Workers stage shard rows via `stage_spatial` instead of `stage_transposed_weight_columns` ([L2704](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L2704)). Zero new memory.
 
 **Verify:** bit-exact parallel vs serial reference, `make sweep-600m` all four configs.
 
@@ -47,14 +47,14 @@ pub fn resolve_modes(
 
 - Training/sweeps: `FailFast` — invalid shard counts are hard errors
 - Ladder/ceiling: `AutoAdjustNearest` — rounds to nearest valid, records adjustment
-- `ModeResolution.adjustments` carries structured metadata: bench uses it for labels, suffixes, and reporting (replaces current `requested_*`/`applied_*`/`notes` in [parallel_bench.rs L47](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs#L47)). Training callers print adjustments to stdout.
+- `ModeResolution.adjustments` carries structured metadata: bench uses it for labels, suffixes, and reporting (replaces current `requested_*`/`applied_*`/`notes` in [parallel_bench.rs L47](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs#L47)). Training callers print adjustments to stdout.
 - `parallel_bench.rs` delegates to `resolve_modes` with `AutoAdjustNearest`, reads `adjustments` for machine-readable output
 - Env parsing is a thin wrapper over `resolve_modes`; not the resolver itself
 
 ### P0-B.2: `CombinedForwardRuntime`
 
 > [!IMPORTANT]
-> FFN forward: **wrap the existing production `ShardedFfnForwardRuntime`** ([layer.rs L715](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L715)), not re-extracted from bench. Only extract the missing **attention-forward** and **composition** pieces from bench code. Two FFN-forward implementations must not coexist.
+> FFN forward: **wrap the existing production `ShardedFfnForwardRuntime`** ([layer.rs L715](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L715)), not re-extracted from bench. Only extract the missing **attention-forward** and **composition** pieces from bench code. Two FFN-forward implementations must not coexist.
 
 `LayerScratch` is **internal temporary only**, not the training state source of truth.
 
@@ -73,7 +73,7 @@ pub struct CombinedForwardRuntime {
 
 | Field | Source | Notes |
 | --- | --- | --- |
-| **`x`** | layer input | **Copy before any computation** ([L4769](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L4769)) — backward RMSNorm1 needs it ([L4216](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L4216)) |
+| **`x`** | layer input | **Copy before any computation** ([L4769](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L4769)) — backward RMSNorm1 needs it ([L4216](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L4216)) |
 | `xnorm`, `rms_inv1` | RMSNorm1 output | Direct write |
 | `q_rope` | worker `sdpa.q_rope_out` | Scatter by `q_col_start` |
 | `k_rope` | worker `sdpa.k_rope_out` | Scatter by `kv_col_start` |
@@ -131,9 +131,9 @@ Add `forward_only_ws_with_options`. Runtime compiled once, stored persistently.
 
 ## P1-B: Wire into training forward + backward migration
 
-1. Stop forcing `forward_attn_request: None` at [L133](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/full_model.rs#L133)
+1. Stop forcing `forward_attn_request: None` at [L133](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/full_model.rs#L133)
 2. `forward_ws_with_options` dispatches: baseline → pipelined, sharded → `forward_into_combined` writing into per-layer `ForwardCache`
-3. **Backward wiring migration:** `backward_ws_with_options` ([L572](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/full_model.rs#L572)) currently branches on `options.backward_ffn_request: Option<usize>` and `options.backward_attn_request: Option<usize>`. Migrate to branch on `ResolvedBackwardMode` from `TrainingParallelOptions`. Update runtime compile/reuse checks to match resolved mode variants, not raw `Option<usize>` fields.
+3. **Backward wiring migration:** `backward_ws_with_options` ([L572](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/full_model.rs#L572)) currently branches on `options.backward_ffn_request: Option<usize>` and `options.backward_attn_request: Option<usize>`. Migrate to branch on `ResolvedBackwardMode` from `TrainingParallelOptions`. Update runtime compile/reuse checks to match resolved mode variants, not raw `Option<usize>` fields.
 
 **Verify:** bit-exact + toleranced layer tests, `make sweep-600m` all four combinations.
 

@@ -10,7 +10,7 @@ cargo test -p engine --test bench_sharded_forward_timing --release -- --ignored 
 
 Artifacts:
 
-- JSON: [results/sharded_forward_timing/600m_sharded_forward_timing.json](/Users/andrewgordon/RustRover-Projects/rustane/results/sharded_forward_timing/600m_sharded_forward_timing.json)
+- JSON: [results/sharded_forward_timing/600m_sharded_forward_timing.json](/Users/USER/RustRover-Projects/rustane/results/sharded_forward_timing/600m_sharded_forward_timing.json)
 
 ## Key result
 

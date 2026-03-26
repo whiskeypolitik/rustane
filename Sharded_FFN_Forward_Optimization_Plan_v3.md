@@ -2,7 +2,7 @@
 
 ## Problem
 
-`FFN_SHARDS=4` forward: 911ms vs 259ms baseline (3.5×). Per-layer: FFN wall ~51ms, ANE ~7.6ms (15%), **w2 staging ~8ms/shard** (dominant). Root cause: `stage_transposed_weight_columns` ([L1393](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1393)) does element-by-element gather across 24MB `weights.w2`.
+`FFN_SHARDS=4` forward: 911ms vs 259ms baseline (3.5×). Per-layer: FFN wall ~51ms, ANE ~7.6ms (15%), **w2 staging ~8ms/shard** (dominant). Root cause: `stage_transposed_weight_columns` ([L1393](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1393)) does element-by-element gather across 24MB `weights.w2`.
 
 ## Phases
 
@@ -17,9 +17,9 @@ Phase A first — eliminates cache-hostile staging before parallelization adds c
 
 ## Phase A — Use `cache.w2t_scratch` for sharded W2 staging
 
-The non-sharded path already caches `vdsp::mtrans(weights.w2)` into per-layer `cache.w2t_scratch` ([L4152](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L4152)), keyed by `w2t_generation` (init `u64::MAX` at [L122](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L122)). The sharded path ignores this.
+The non-sharded path already caches `vdsp::mtrans(weights.w2)` into per-layer `cache.w2t_scratch` ([L4152](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L4152)), keyed by `w2t_generation` (init `u64::MAX` at [L122](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L122)). The sharded path ignores this.
 
-#### [MODIFY] [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs)
+#### [MODIFY] [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs)
 
 In `run_sharded_ffn_forward_into` (L1542), before shard loop:
 
@@ -48,15 +48,15 @@ stage_spatial(buf, shard_hidden, w2_sp, w2t_shard, dim, seq);
 
 **Test 2 (toleranced):** sharded vs non-sharded `forward_into`. All fields. Max abs ≤ 2e-2, cosine ≥ 0.999.
 
-Serial reference: `#[doc(hidden)] pub` wrapper matching `forward_into_with_training_ffn` ([L4232](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L4232)) signature, delegating to the pre-optimization serial loop internally. Integration tests call this directly.
+Serial reference: `#[doc(hidden)] pub` wrapper matching `forward_into_with_training_ffn` ([L4232](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L4232)) signature, delegating to the pre-optimization serial loop internally. Integration tests call this directly.
 
 ---
 
 ## Phase B — Parallelize forward shard loop
 
-After Phase A, each shard is ~4ms of cache-local work. Pattern: `thread::scope` + barrier per [bench_ffn_latency_parallel_full_model.rs L743](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/tests/bench_ffn_latency_parallel_full_model.rs#L743).
+After Phase A, each shard is ~4ms of cache-local work. Pattern: `thread::scope` + barrier per [bench_ffn_latency_parallel_full_model.rs L743](file:///Users/USER/RustRover-Projects/rustane/crates/engine/tests/bench_ffn_latency_parallel_full_model.rs#L743).
 
-#### [MODIFY] [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs)
+#### [MODIFY] [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs)
 
 ```rust
 fn run_sharded_ffn_forward_into(...) {

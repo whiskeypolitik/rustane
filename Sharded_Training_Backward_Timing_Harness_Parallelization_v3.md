@@ -20,7 +20,7 @@ Sharding regressions from `sweep-600m` show backward time ballooning from 710ms 
 
 ### Timing structs
 
-#### [MODIFY] [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs)
+#### [MODIFY] [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs)
 
 Add new public structs alongside the existing `ForwardTimings` (L3304) and `BackwardTimings` (L3640).
 
@@ -100,15 +100,15 @@ pub fn backward_into_sharded_timed(
 This wraps the same logic as `backward_into_with_training_ffn` (L2014) but calls the `_with_stats` variants internally and returns `ShardedBackwardTimings`.
 
 > [!IMPORTANT]
-> `run_cached_with_stats` has measurable overhead vs `run_cached_direct` (see [bench_hw_execution_time.rs L47–66](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/tests/bench_hw_execution_time.rs#L47-L66)). The harness should run two passes: one with `run_cached_direct` + `Instant` for production-equivalent wall timing, and one with `run_cached_with_stats` for HW ns. Report both.
+> `run_cached_with_stats` has measurable overhead vs `run_cached_direct` (see [bench_hw_execution_time.rs L47–66](file:///Users/USER/RustRover-Projects/rustane/crates/engine/tests/bench_hw_execution_time.rs#L47-L66)). The harness should run two passes: one with `run_cached_direct` + `Instant` for production-equivalent wall timing, and one with `run_cached_with_stats` for HW ns. Report both.
 
 ### Benchmark test
 
-#### [NEW] [bench_sharded_backward_timing.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/tests/bench_sharded_backward_timing.rs)
+#### [NEW] [bench_sharded_backward_timing.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/tests/bench_sharded_backward_timing.rs)
 
-An `#[ignore]`d test following the pattern of [bench_hw_execution_time.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/tests/bench_hw_execution_time.rs):
+An `#[ignore]`d test following the pattern of [bench_hw_execution_time.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/tests/bench_hw_execution_time.rs):
 
-1. Use the 600M config (dim=1536, hidden=4096, heads=20, seq=512 — from [Makefile L101](file:///Users/andrewgordon/RustRover-Projects/rustane/Makefile#L101))
+1. Use the 600M config (dim=1536, hidden=4096, heads=20, seq=512 — from [Makefile L101](file:///Users/USER/RustRover-Projects/rustane/Makefile#L101))
 2. Compile baseline kernels + sharded runtimes for FFN_SHARDS ∈ {2,4} and ATTN_SHARDS ∈ {2}
    - Construct runtimes explicitly via `ShardedFfnBackwardRuntime::compile()` and `ShardedAttentionBackwardRuntime::compile()`, not via env vars
 3. For each config, run 2 warmup + 5 timed steps calling `backward_into_sharded_timed`
@@ -144,7 +144,7 @@ cargo test -p engine --test bench_sharded_backward_timing --release -- --ignored
 > [!WARNING]
 > The current serial loop at L1655 writes into shared `grads.dw1/dw2/dw3` via `accumulate_dw` + `scatter_dw_columns` inside the per-shard iteration. Parallelizing requires worker-local gradient temporaries and a post-loop reduction step, otherwise there will be write races and nondeterministic gradients.
 
-#### [MODIFY] [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs)
+#### [MODIFY] [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs)
 
 **Changes to `ShardedFfnBackwardWorker` (L724):**
 
@@ -225,10 +225,10 @@ for worker in &workers {
 
 ### Phase 2 verification
 
-#### [NEW] [test_sharded_ffn_backward_correctness.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/tests/test_sharded_ffn_backward_correctness.rs)
+#### [NEW] [test_sharded_ffn_backward_correctness.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/tests/test_sharded_ffn_backward_correctness.rs)
 
 > [!IMPORTANT]
-> Phase 2 is a **schedule-only** change: the parallel path does the same per-shard operations as the existing serial path, just concurrently. Per repo precedent at [auto_move_dw2_to_sdpabwd1.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/tests/auto_move_dw2_to_sdpabwd1.rs) and [auto_fuse_qbwd_kvbwd.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/tests/auto_fuse_qbwd_kvbwd.rs), schedule-only rewrites use **bit-exact** (`to_bits()`) checks, not toleranced comparisons. The sharded path already exists serially and produces correct results; the parallel rewrite must not change any output bit.
+> Phase 2 is a **schedule-only** change: the parallel path does the same per-shard operations as the existing serial path, just concurrently. Per repo precedent at [auto_move_dw2_to_sdpabwd1.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/tests/auto_move_dw2_to_sdpabwd1.rs) and [auto_fuse_qbwd_kvbwd.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/tests/auto_fuse_qbwd_kvbwd.rs), schedule-only rewrites use **bit-exact** (`to_bits()`) checks, not toleranced comparisons. The sharded path already exists serially and produces correct results; the parallel rewrite must not change any output bit.
 
 Three non-`#[ignore]`d tests, constructing runtimes explicitly via `ShardedFfnBackwardRuntime::compile(cfg, shard_count)` passed into `backward_into_with_training_ffn` (L2014) — **no env vars**, safe for parallel `cargo test`:
 
@@ -237,7 +237,7 @@ Three non-`#[ignore]`d tests, constructing runtimes explicitly via `ShardedFfnBa
 2. Run `backward_into_with_training_ffn` with `Some(&mut sharded_ffn)` for `FFN_SHARDS=4`
 3. Compare **all** gradient fields bit-exactly against a reference run:
    - `dx`, `dw1`, `dw2`, `dw3` (directly affected by FFN sharding)
-   - `dwo`, `dwq`, `dwk`, `dwv`, `dgamma1`, `dgamma2` (downstream of FFN via RMSNorm2 backward at [L2097](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L2097))
+   - `dwo`, `dwq`, `dwk`, `dwv`, `dgamma1`, `dgamma2` (downstream of FFN via RMSNorm2 backward at [L2097](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L2097))
 
 > [!NOTE]
 > The FFN backward section feeds `dx_ffn` into the attention half through RMSNorm2 backward (L2097–2109). Any error in `dx_ffn` will cascade into `dx2` → `dx2_scaled` → all attention gradients. Checking only FFN-local outputs would miss this.
@@ -246,7 +246,7 @@ Three non-`#[ignore]`d tests, constructing runtimes explicitly via `ShardedFfnBa
 Two consecutive backward calls with fresh `LayerGrads` produce bit-identical results. Catches stale IOSurface buffer issues.
 
 **Test 3 — Gradient accumulation:**
-Two backward calls into the same `grads` produce `2× single_call` within `1e-4` relative tolerance (same as [auto_move_dw2_to_sdpabwd1.rs L154](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/tests/auto_move_dw2_to_sdpabwd1.rs#L154)). Verifies `accumulate_dw` `beta=1.0` additivity works correctly with worker-local buffers.
+Two backward calls into the same `grads` produce `2× single_call` within `1e-4` relative tolerance (same as [auto_move_dw2_to_sdpabwd1.rs L154](file:///Users/USER/RustRover-Projects/rustane/crates/engine/tests/auto_move_dw2_to_sdpabwd1.rs#L154)). Verifies `accumulate_dw` `beta=1.0` additivity works correctly with worker-local buffers.
 
 Then use `sweep-600m` as the secondary timing gate:
 ```bash
@@ -272,7 +272,7 @@ cargo test -p engine --test bench_sharded_backward_timing --release -- --ignored
 
 Same `thread::scope` + barrier + worker-local-grad + post-loop-reduction pattern as Phase 2, applied to `run_sharded_attention_backward_into` (L1771).
 
-#### [MODIFY] [layer.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs)
+#### [MODIFY] [layer.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs)
 
 **Changes to `ShardedAttentionBackwardWorker` (L748):**
 
@@ -289,7 +289,7 @@ pub struct ShardedAttentionBackwardWorker {
 ```
 
 > [!CAUTION]
-> **`dwo` is row-sharded, not column-sharded.** The baseline `dwo` computation at [L2163](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L2163) is `accumulate_dw(attn_out, q_dim, dx2_scaled, dim, seq, &mut grads.dwo)`, producing `[q_dim × dim]`. When attention is sharded by heads, each worker sees only `attn_out_shard` of shape `[q_dim_shard × seq]`, so `dwo_local` is `[q_dim_shard × dim]` — a contiguous **row slice** of the full `[q_dim × dim]` gradient.
+> **`dwo` is row-sharded, not column-sharded.** The baseline `dwo` computation at [L2163](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L2163) is `accumulate_dw(attn_out, q_dim, dx2_scaled, dim, seq, &mut grads.dwo)`, producing `[q_dim × dim]`. When attention is sharded by heads, each worker sees only `attn_out_shard` of shape `[q_dim_shard × seq]`, so `dwo_local` is `[q_dim_shard × dim]` — a contiguous **row slice** of the full `[q_dim × dim]` gradient.
 >
 > This means the post-loop reduction needs a **row-oriented scatter** (simple `memcpy` of contiguous row blocks), **not** the column-oriented `scatter_dw_columns` used for `dwq/dwk/dwv`. Add a `scatter_dw_rows` helper:
 > ```rust
@@ -303,7 +303,7 @@ pub struct ShardedAttentionBackwardWorker {
 > ```
 
 > [!IMPORTANT]
-> The current sharded attention backward path (L1792–2010) **never computes `dwo`** — it only handles `dwq`, `dwk`, `dwv`. The baseline non-sharded path computes `dwo` at [L2163](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L2163) via `accumulate_dw(attn_out, q_dim, dx2_scaled, dim, seq, dwo)`. Phase 4 must add this computation inside each worker:
+> The current sharded attention backward path (L1792–2010) **never computes `dwo`** — it only handles `dwq`, `dwk`, `dwv`. The baseline non-sharded path computes `dwo` at [L2163](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L2163) via `accumulate_dw(attn_out, q_dim, dx2_scaled, dim, seq, dwo)`. Phase 4 must add this computation inside each worker:
 > ```rust
 > worker.dwo_local.fill(0.0);
 > // attn_out_shard = cache.attn_out[q_col_start*seq .. (q_col_start+q_dim_shard)*seq]
@@ -320,7 +320,7 @@ pub struct ShardedAttentionBackwardWorker {
 
 ### Phase 4 verification
 
-#### [NEW] [test_sharded_attn_backward_correctness.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/tests/test_sharded_attn_backward_correctness.rs)
+#### [NEW] [test_sharded_attn_backward_correctness.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/tests/test_sharded_attn_backward_correctness.rs)
 
 Same structure as Phase 2 test: bit-exact, explicit runtime construction, all gradient fields compared, idempotency + accumulation checks.
 

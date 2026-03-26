@@ -6,12 +6,12 @@
 
 ## OPT-1: Use existing `ws.w1t`/`ws.w3t` for sharded FFN backward [P0 — TRAINING]
 
-**Where:** [run_sharded_ffn_backward_worker L2704–2723](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L2704)
+**Where:** [run_sharded_ffn_backward_worker L2704–2723](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L2704)
 
 **Problem:** Each backward shard calls `stage_transposed_weight_columns` for W1^T and W3^T — ~8ms/shard cache-hostile gather.
 
-**Fix:** `BackwardWorkspace` already has `w1t: Vec<f32>` and `w3t: Vec<f32>` ([L1266–1267](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1266)), allocated once, reused across layers. The non-sharded backward path already transposes into them. The sharded path just needs to:
-1. Transpose `weights.w1` → `ws.w1t` and `weights.w3` → `ws.w3t` **before** `thread::scope` (same as attention does with `ws.wot/wqt/wkt/wvt` at [L3377–3380](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L3377))
+**Fix:** `BackwardWorkspace` already has `w1t: Vec<f32>` and `w3t: Vec<f32>` ([L1266–1267](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1266)), allocated once, reused across layers. The non-sharded backward path already transposes into them. The sharded path just needs to:
+1. Transpose `weights.w1` → `ws.w1t` and `weights.w3` → `ws.w3t` **before** `thread::scope` (same as attention does with `ws.wot/wqt/wkt/wvt` at [L3377–3380](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L3377))
 2. Each worker stages from contiguous rows of `ws.w1t`/`ws.w3t` via `stage_spatial` instead of `stage_transposed_weight_columns`
 
 **Memory cost:** Zero. `w1t`/`w3t` already exist. They're transient per-layer scratch, not per-layer cache — reused across all 96 layers at 30B.
@@ -22,7 +22,7 @@
 
 ## OPT-6: Productize sharded forward-only for 122B [P0 — INFERENCE]
 
-**Where:** Main inference path in [full_model.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/full_model.rs) vs existing bench paths in [parallel_bench.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs) and [bench_fwd_only_scale.rs](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/tests/bench_fwd_only_scale.rs)
+**Where:** Main inference path in [full_model.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/full_model.rs) vs existing bench paths in [parallel_bench.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/parallel_bench.rs) and [bench_fwd_only_scale.rs](file:///Users/USER/RustRover-Projects/rustane/crates/engine/tests/bench_fwd_only_scale.rs)
 
 **Problem:** At 122B the non-sharded forward hits ANE spatial width limits. The sharded forward machinery already exists in bench form but isn't integrated into the main inference runtime.
 
@@ -56,7 +56,7 @@ Eliminates CPU round-trip between W13 and W2 dispatches in FFN forward. Compiler
 
 ## OPT-8: Remove redundant `cache.h1/h3/gate.fill(0.0)` [P3]
 
-[L1751–1753](file:///Users/andrewgordon/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1751) — shards cover full column range, zeroing is redundant. ~0.5ms.
+[L1751–1753](file:///Users/USER/RustRover-Projects/rustane/crates/engine/src/layer.rs#L1751) — shards cover full column range, zeroing is redundant. ~0.5ms.
 
 ---
 
