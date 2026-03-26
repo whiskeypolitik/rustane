@@ -107,11 +107,14 @@ impl TrainingParallelOptions {
             .transpose()?;
 
         if let Some(attn) = attn_request {
-            if attn > 1 {
-                return Err(
-                    "ATTN_SHARDS training path is deferred for Phase 4; omit it or set it to 1"
-                        .to_string(),
-                );
+            if attn == 0 {
+                return Err("ATTN_SHARDS must be positive".to_string());
+            }
+            if cfg.heads % attn != 0 || cfg.kv_heads % attn != 0 {
+                return Err(format!(
+                    "ATTN_SHARDS={attn} is invalid for heads={} kv_heads={} in the training path",
+                    cfg.heads, cfg.kv_heads
+                ));
             }
         }
         if let Some(ffn) = ffn_request {
@@ -127,9 +130,9 @@ impl TrainingParallelOptions {
         }
 
         Ok(Self {
-            forward_attn_request: attn_request.filter(|&v| v > 1),
+            forward_attn_request: None,
             forward_ffn_request: ffn_request,
-            backward_attn_request: None,
+            backward_attn_request: attn_request.filter(|&v| v > 1),
             backward_ffn_request: ffn_request,
         })
     }
@@ -195,6 +198,7 @@ pub struct ModelBackwardWorkspace {
     pub dy_buf: Vec<f32>,        // [DIM * SEQ] swap buffer for backward_into
     pub rms_dot_buf: Vec<f32>,   // [SEQ]
     pub layer_ws: BackwardWorkspace,
+    pub training_attn_sharded: Option<layer::ShardedAttentionBackwardRuntime>,
     pub training_ffn_sharded: Option<layer::ShardedFfnBackwardRuntime>,
 }
 
@@ -207,6 +211,7 @@ impl ModelBackwardWorkspace {
             dy_buf: vec![0.0; cfg.dim * cfg.seq],
             rms_dot_buf: vec![0.0; cfg.seq],
             layer_ws: BackwardWorkspace::new(cfg),
+            training_attn_sharded: None,
             training_ffn_sharded: None,
         }
     }
@@ -565,17 +570,28 @@ pub fn backward_ws_with_options(
     bwd_ws: &mut ModelBackwardWorkspace,
     options: &TrainingParallelOptions,
 ) -> f32 {
-    if let Some(ffn_shards) = options.backward_ffn_request {
+    if options.backward_ffn_request.is_some() || options.backward_attn_request.is_some() {
+        if bwd_ws
+            .training_attn_sharded
+            .as_ref()
+            .map(|runtime| runtime.shard_count())
+            != options.backward_attn_request
+        {
+            bwd_ws.training_attn_sharded = options.backward_attn_request.map(|attn_shards| {
+                layer::ShardedAttentionBackwardRuntime::compile(cfg, attn_shards)
+                    .expect("compile training sharded attention backward runtime")
+            });
+        }
         if bwd_ws
             .training_ffn_sharded
             .as_ref()
             .map(|runtime| runtime.shard_count())
-            != Some(ffn_shards)
+            != options.backward_ffn_request
         {
-            bwd_ws.training_ffn_sharded = Some(
+            bwd_ws.training_ffn_sharded = options.backward_ffn_request.map(|ffn_shards| {
                 layer::ShardedFfnBackwardRuntime::compile(cfg, ffn_shards)
-                    .expect("compile training sharded FFN backward runtime"),
-            );
+                    .expect("compile training sharded FFN backward runtime")
+            });
         }
 
         let dim = cfg.dim;
@@ -630,10 +646,6 @@ pub fn backward_ws_with_options(
             );
 
             for l in (0..cfg.nlayers).rev() {
-                let sharded_runtime = bwd_ws
-                    .training_ffn_sharded
-                    .as_mut()
-                    .expect("training sharded FFN backward runtime present");
                 layer::backward_into_with_training_ffn(
                     cfg,
                     kernels,
@@ -643,7 +655,8 @@ pub fn backward_ws_with_options(
                     &mut grads.layers[l],
                     &mut bwd_ws.layer_ws,
                     &mut bwd_ws.dy_buf,
-                    Some(sharded_runtime),
+                    bwd_ws.training_attn_sharded.as_mut(),
+                    bwd_ws.training_ffn_sharded.as_mut(),
                 );
                 std::mem::swap(&mut bwd_ws.dy, &mut bwd_ws.dy_buf);
             }

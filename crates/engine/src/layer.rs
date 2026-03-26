@@ -691,6 +691,16 @@ struct ShardedFfnLayout {
     col_count: usize,
 }
 
+#[derive(Clone, Copy)]
+struct ShardedAttentionLayout {
+    q_head_count: usize,
+    kv_head_count: usize,
+    q_col_start: usize,
+    q_col_count: usize,
+    kv_col_start: usize,
+    kv_col_count: usize,
+}
+
 pub struct ShardedFfnForwardWorker {
     w13_exe: Executable,
     w2_exe: Executable,
@@ -732,6 +742,44 @@ pub struct ShardedFfnBackwardRuntime {
     layouts: Vec<ShardedFfnLayout>,
     workers: Vec<ShardedFfnBackwardWorker>,
     dx_ffn: Vec<f32>,
+    merge_tmp: Vec<f32>,
+}
+
+pub struct ShardedAttentionBackwardWorker {
+    cfg: ModelConfig,
+    layout: ShardedAttentionLayout,
+    rope: RopeTable,
+    wot_exe: Executable,
+    sdpa_bwd1_exe: Executable,
+    sdpa_bwd2_exe: Executable,
+    q_bwd_exe: Executable,
+    kv_bwd_exe: Executable,
+    wot_in: TensorData,
+    wot_out: TensorData,
+    sdpa_bwd1_in: TensorData,
+    sdpa_bwd1_out: TensorData,
+    sdpa_bwd2_in: TensorData,
+    sdpa_bwd2_out: TensorData,
+    q_bwd_in: TensorData,
+    q_bwd_out: TensorData,
+    kv_bwd_in: TensorData,
+    kv_bwd_out: TensorData,
+    da: Vec<f32>,
+    dv: Vec<f32>,
+    probs_flat: Vec<f32>,
+    dp_flat: Vec<f32>,
+    dq: Vec<f32>,
+    dk: Vec<f32>,
+    dx_attn: Vec<f32>,
+    dx_kv: Vec<f32>,
+    dw_tmp: Vec<f32>,
+}
+
+pub struct ShardedAttentionBackwardRuntime {
+    shard_count: usize,
+    layouts: Vec<ShardedAttentionLayout>,
+    workers: Vec<ShardedAttentionBackwardWorker>,
+    dx_merged: Vec<f32>,
     merge_tmp: Vec<f32>,
 }
 
@@ -878,6 +926,47 @@ fn sharded_ffn_layouts(cfg: &ModelConfig, shard_count: usize) -> Vec<ShardedFfnL
         .collect()
 }
 
+fn sharded_attention_layouts(cfg: &ModelConfig, shard_count: usize) -> Vec<ShardedAttentionLayout> {
+    assert!(
+        cfg.heads % shard_count == 0 && cfg.kv_heads % shard_count == 0,
+        "heads and kv_heads must be divisible by ATTN_SHARDS"
+    );
+    let q_head_count = cfg.heads / shard_count;
+    let kv_head_count = cfg.kv_heads / shard_count;
+    let q_col_count = q_head_count * cfg.hd;
+    let kv_col_count = kv_head_count * cfg.hd;
+    (0..shard_count)
+        .map(|i| ShardedAttentionLayout {
+            q_head_count,
+            kv_head_count,
+            q_col_start: i * q_col_count,
+            q_col_count,
+            kv_col_start: i * kv_col_count,
+            kv_col_count,
+        })
+        .collect()
+}
+
+fn attention_group_cfg(
+    cfg: &ModelConfig,
+    q_heads: usize,
+    kv_heads: usize,
+) -> ModelConfig {
+    ModelConfig {
+        dim: cfg.dim,
+        hidden: cfg.hidden,
+        heads: q_heads,
+        kv_heads,
+        hd: cfg.hd,
+        seq: cfg.seq,
+        nlayers: cfg.nlayers,
+        vocab: cfg.vocab,
+        q_dim: q_heads * cfg.hd,
+        kv_dim: kv_heads * cfg.hd,
+        gqa_ratio: q_heads / kv_heads,
+    }
+}
+
 impl ShardedFfnForwardRuntime {
     pub fn compile(cfg: &ModelConfig, shard_count: usize) -> Result<Self, AneError> {
         let qos = NSQualityOfService::UserInteractive;
@@ -1014,6 +1103,95 @@ impl ShardedFfnBackwardRuntime {
             layouts,
             workers,
             dx_ffn: vec![0.0; cfg.dim * cfg.seq],
+            merge_tmp: vec![0.0; cfg.dim * cfg.seq],
+        })
+    }
+
+    pub fn shard_count(&self) -> usize {
+        self.shard_count
+    }
+}
+
+impl ShardedAttentionBackwardRuntime {
+    pub fn compile(cfg: &ModelConfig, shard_count: usize) -> Result<Self, AneError> {
+        let qos = NSQualityOfService::UserInteractive;
+        let layouts = sharded_attention_layouts(cfg, shard_count);
+        let workers = layouts
+            .iter()
+            .map(|layout| {
+                let worker_cfg = attention_group_cfg(cfg, layout.q_head_count, layout.kv_head_count);
+                let q_dim = worker_cfg.q_dim;
+                let kv_dim = worker_cfg.kv_dim;
+                let score_ch = worker_cfg.heads * worker_cfg.seq;
+                let wot_sp = dyn_matmul::spatial_width(cfg.seq, q_dim);
+                let kv_bwd_sp = dyn_matmul::dual_spatial_width(cfg.seq, cfg.dim);
+                Ok(ShardedAttentionBackwardWorker {
+                    cfg: worker_cfg.clone(),
+                    layout: *layout,
+                    rope: RopeTable::compute(worker_cfg.hd, worker_cfg.seq),
+                    wot_exe: dyn_matmul::build(cfg.dim, q_dim, cfg.seq).compile(qos)?,
+                    sdpa_bwd1_exe: sdpa_bwd::build_bwd1(&worker_cfg).compile(qos)?,
+                    sdpa_bwd2_exe: sdpa_bwd::build_bwd2(&worker_cfg).compile(qos)?,
+                    q_bwd_exe: dyn_matmul::build(q_dim, cfg.dim, cfg.seq).compile(qos)?,
+                    kv_bwd_exe: dyn_matmul::build_dual(kv_dim, cfg.dim, cfg.seq).compile(qos)?,
+                    wot_in: tensor_data_new_logged(
+                        "training_sharded_attn_wot_in",
+                        Shape { batch: 1, channels: cfg.dim, height: 1, width: wot_sp },
+                    ),
+                    wot_out: tensor_data_new_logged(
+                        "training_sharded_attn_wot_out",
+                        Shape { batch: 1, channels: q_dim, height: 1, width: cfg.seq },
+                    ),
+                    sdpa_bwd1_in: tensor_data_new_logged(
+                        "training_sharded_attn_bwd1_in",
+                        Shape { batch: 1, channels: sdpa_bwd::bwd1_input_channels(&worker_cfg), height: 1, width: cfg.seq },
+                    ),
+                    sdpa_bwd1_out: tensor_data_new_logged(
+                        "training_sharded_attn_bwd1_out",
+                        Shape { batch: 1, channels: sdpa_bwd::bwd1_output_channels(&worker_cfg), height: 1, width: cfg.seq },
+                    ),
+                    sdpa_bwd2_in: tensor_data_new_logged(
+                        "training_sharded_attn_bwd2_in",
+                        Shape { batch: 1, channels: sdpa_bwd::bwd2_input_channels(&worker_cfg), height: 1, width: cfg.seq },
+                    ),
+                    sdpa_bwd2_out: tensor_data_new_logged(
+                        "training_sharded_attn_bwd2_out",
+                        Shape { batch: 1, channels: sdpa_bwd::bwd2_output_channels(&worker_cfg), height: 1, width: cfg.seq },
+                    ),
+                    q_bwd_in: tensor_data_new_logged(
+                        "training_sharded_attn_qbwd_in",
+                        Shape { batch: 1, channels: q_dim, height: 1, width: dyn_matmul::spatial_width(cfg.seq, cfg.dim) },
+                    ),
+                    q_bwd_out: tensor_data_new_logged(
+                        "training_sharded_attn_qbwd_out",
+                        Shape { batch: 1, channels: cfg.dim, height: 1, width: cfg.seq },
+                    ),
+                    kv_bwd_in: tensor_data_new_logged(
+                        "training_sharded_attn_kvbwd_in",
+                        Shape { batch: 1, channels: kv_dim, height: 1, width: kv_bwd_sp },
+                    ),
+                    kv_bwd_out: tensor_data_new_logged(
+                        "training_sharded_attn_kvbwd_out",
+                        Shape { batch: 1, channels: cfg.dim, height: 1, width: cfg.seq },
+                    ),
+                    da: vec![0.0; q_dim * cfg.seq],
+                    dv: vec![0.0; kv_dim * cfg.seq],
+                    probs_flat: vec![0.0; score_ch * cfg.seq],
+                    dp_flat: vec![0.0; score_ch * cfg.seq],
+                    dq: vec![0.0; q_dim * cfg.seq],
+                    dk: vec![0.0; kv_dim * cfg.seq],
+                    dx_attn: vec![0.0; cfg.dim * cfg.seq],
+                    dx_kv: vec![0.0; cfg.dim * cfg.seq],
+                    dw_tmp: vec![0.0; cfg.dim * q_dim.max(kv_dim)],
+                })
+            })
+            .collect::<Result<Vec<_>, AneError>>()?;
+
+        Ok(Self {
+            shard_count,
+            layouts,
+            workers,
+            dx_merged: vec![0.0; cfg.dim * cfg.seq],
             merge_tmp: vec![0.0; cfg.dim * cfg.seq],
         })
     }
@@ -1585,8 +1763,251 @@ fn run_sharded_ffn_backward_into(
                 &locked[..runtime.dx_ffn.len()],
                 &mut runtime.merge_tmp,
             );
-            runtime.dx_ffn.copy_from_slice(&runtime.merge_tmp);
         }
+        runtime.dx_ffn.copy_from_slice(&runtime.merge_tmp);
+    }
+}
+
+fn run_sharded_attention_backward_into(
+    cfg: &ModelConfig,
+    weights: &LayerWeights,
+    cache: &ForwardCache,
+    ws: &mut BackwardWorkspace,
+    grads: &mut LayerGrads,
+    runtime: &mut ShardedAttentionBackwardRuntime,
+) {
+    let dim = cfg.dim;
+    let seq = cfg.seq;
+    let q_dim = cfg.q_dim;
+    let kv_dim = cfg.kv_dim;
+    let hd = cfg.hd;
+
+    vdsp::mtrans(&weights.wo, dim, &mut ws.wot, q_dim, q_dim, dim);
+    vdsp::mtrans(&weights.wq, q_dim, &mut ws.wqt, dim, dim, q_dim);
+    vdsp::mtrans(&weights.wk, kv_dim, &mut ws.wkt, dim, dim, kv_dim);
+    vdsp::mtrans(&weights.wv, kv_dim, &mut ws.wvt, dim, dim, kv_dim);
+
+    runtime.dx_merged.fill(0.0);
+
+    for worker in &mut runtime.workers {
+        let q_dim_shard = worker.cfg.q_dim;
+        let kv_dim_shard = worker.cfg.kv_dim;
+        let score_ch = worker.cfg.heads * seq;
+        let wot_sp = dyn_matmul::spatial_width(seq, q_dim_shard);
+        let q_bwd_sp = dyn_matmul::spatial_width(seq, dim);
+        let kv_bwd_sp = dyn_matmul::dual_spatial_width(seq, dim);
+
+        {
+            let mut locked = worker.wot_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            stage_spatial(buf, dim, wot_sp, &ws.dx2_scaled, seq, 0);
+            stage_weight_columns(
+                buf,
+                dim,
+                wot_sp,
+                &ws.wot,
+                q_dim,
+                worker.layout.q_col_start,
+                q_dim_shard,
+                seq,
+            );
+        }
+        worker
+            .wot_exe
+            .run_cached_direct(&[&worker.wot_in], &[&worker.wot_out])
+            .expect("ANE sharded attention wot failed");
+        {
+            let locked = worker.wot_out.as_f32_slice();
+            worker.da.copy_from_slice(&locked[..q_dim_shard * seq]);
+        }
+
+        {
+            let mut locked = worker.sdpa_bwd1_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            pack_channels(
+                buf,
+                sdpa_bwd::bwd1_input_channels(&worker.cfg),
+                seq,
+                &cache.q_rope[worker.layout.q_col_start * seq..(worker.layout.q_col_start + q_dim_shard) * seq],
+                q_dim_shard,
+                0,
+            );
+            pack_channels(
+                buf,
+                sdpa_bwd::bwd1_input_channels(&worker.cfg),
+                seq,
+                &cache.k_rope[worker.layout.kv_col_start * seq..(worker.layout.kv_col_start + kv_dim_shard) * seq],
+                kv_dim_shard,
+                q_dim_shard,
+            );
+            pack_channels(
+                buf,
+                sdpa_bwd::bwd1_input_channels(&worker.cfg),
+                seq,
+                &cache.v[worker.layout.kv_col_start * seq..(worker.layout.kv_col_start + kv_dim_shard) * seq],
+                kv_dim_shard,
+                q_dim_shard + kv_dim_shard,
+            );
+            pack_channels(
+                buf,
+                sdpa_bwd::bwd1_input_channels(&worker.cfg),
+                seq,
+                &worker.da,
+                q_dim_shard,
+                q_dim_shard + 2 * kv_dim_shard,
+            );
+        }
+        worker
+            .sdpa_bwd1_exe
+            .run_cached_direct(&[&worker.sdpa_bwd1_in], &[&worker.sdpa_bwd1_out])
+            .expect("ANE sharded attention bwd1 failed");
+        {
+            let locked = worker.sdpa_bwd1_out.as_f32_slice();
+            read_channels_into(&locked, sdpa_bwd::bwd1_output_channels(&worker.cfg), seq, 0, kv_dim_shard, &mut worker.dv);
+            read_channels_into(
+                &locked,
+                sdpa_bwd::bwd1_output_channels(&worker.cfg),
+                seq,
+                kv_dim_shard,
+                score_ch,
+                &mut worker.probs_flat,
+            );
+            read_channels_into(
+                &locked,
+                sdpa_bwd::bwd1_output_channels(&worker.cfg),
+                seq,
+                kv_dim_shard + score_ch,
+                score_ch,
+                &mut worker.dp_flat,
+            );
+        }
+
+        {
+            let mut locked = worker.sdpa_bwd2_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            pack_channels(buf, sdpa_bwd::bwd2_input_channels(&worker.cfg), seq, &worker.probs_flat, score_ch, 0);
+            pack_channels(buf, sdpa_bwd::bwd2_input_channels(&worker.cfg), seq, &worker.dp_flat, score_ch, score_ch);
+            pack_channels(
+                buf,
+                sdpa_bwd::bwd2_input_channels(&worker.cfg),
+                seq,
+                &cache.q_rope[worker.layout.q_col_start * seq..(worker.layout.q_col_start + q_dim_shard) * seq],
+                q_dim_shard,
+                2 * score_ch,
+            );
+            pack_channels(
+                buf,
+                sdpa_bwd::bwd2_input_channels(&worker.cfg),
+                seq,
+                &cache.k_rope[worker.layout.kv_col_start * seq..(worker.layout.kv_col_start + kv_dim_shard) * seq],
+                kv_dim_shard,
+                2 * score_ch + q_dim_shard,
+            );
+        }
+        worker
+            .sdpa_bwd2_exe
+            .run_cached_direct(&[&worker.sdpa_bwd2_in], &[&worker.sdpa_bwd2_out])
+            .expect("ANE sharded attention bwd2 failed");
+        {
+            let locked = worker.sdpa_bwd2_out.as_f32_slice();
+            read_channels_into(&locked, sdpa_bwd::bwd2_output_channels(&worker.cfg), seq, 0, q_dim_shard, &mut worker.dq);
+            read_channels_into(
+                &locked,
+                sdpa_bwd::bwd2_output_channels(&worker.cfg),
+                seq,
+                q_dim_shard,
+                kv_dim_shard,
+                &mut worker.dk,
+            );
+        }
+
+        rope_backward_inplace(&mut worker.dq, worker.cfg.heads, hd, seq, &worker.rope);
+        rope_backward_inplace(&mut worker.dk, worker.cfg.kv_heads, hd, seq, &worker.rope);
+
+        {
+            let mut locked = worker.q_bwd_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            stage_spatial(buf, q_dim_shard, q_bwd_sp, &worker.dq, seq, 0);
+            stage_weight_columns(
+                buf,
+                q_dim_shard,
+                q_bwd_sp,
+                &ws.wqt,
+                dim,
+                0,
+                dim,
+                seq,
+            );
+        }
+        worker
+            .q_bwd_exe
+            .run_cached_direct(&[&worker.q_bwd_in], &[&worker.q_bwd_out])
+            .expect("ANE sharded attention qbwd failed");
+        {
+            let locked = worker.q_bwd_out.as_f32_slice();
+            worker.dx_attn.copy_from_slice(&locked[..dim * seq]);
+        }
+
+        {
+            let mut locked = worker.kv_bwd_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            for c in 0..kv_dim_shard {
+                let row = c * kv_bwd_sp;
+                buf[row..row + seq].copy_from_slice(&worker.dk[c * seq..c * seq + seq]);
+                buf[row + seq..row + 2 * seq].copy_from_slice(&worker.dv[c * seq..c * seq + seq]);
+                let wkt_offset = (worker.layout.kv_col_start + c) * dim;
+                buf[row + 2 * seq..row + 2 * seq + dim]
+                    .copy_from_slice(&ws.wkt[wkt_offset..wkt_offset + dim]);
+                let wvt_offset = (worker.layout.kv_col_start + c) * dim;
+                buf[row + 2 * seq + dim..row + 2 * seq + 2 * dim]
+                    .copy_from_slice(&ws.wvt[wvt_offset..wvt_offset + dim]);
+            }
+        }
+        worker
+            .kv_bwd_exe
+            .run_cached_direct(&[&worker.kv_bwd_in], &[&worker.kv_bwd_out])
+            .expect("ANE sharded attention kvbwd failed");
+        {
+            let locked = worker.kv_bwd_out.as_f32_slice();
+            worker.dx_kv.copy_from_slice(&locked[..dim * seq]);
+        }
+
+        worker.dw_tmp.fill(0.0);
+        accumulate_dw(&cache.xnorm, dim, &worker.dq, q_dim_shard, seq, &mut worker.dw_tmp[..dim * q_dim_shard]);
+        scatter_dw_columns(
+            &mut grads.dwq,
+            dim,
+            q_dim,
+            &worker.dw_tmp[..dim * q_dim_shard],
+            q_dim_shard,
+            worker.layout.q_col_start,
+        );
+
+        worker.dw_tmp.fill(0.0);
+        accumulate_dw(&cache.xnorm, dim, &worker.dk, kv_dim_shard, seq, &mut worker.dw_tmp[..dim * kv_dim_shard]);
+        scatter_dw_columns(
+            &mut grads.dwk,
+            dim,
+            kv_dim,
+            &worker.dw_tmp[..dim * kv_dim_shard],
+            kv_dim_shard,
+            worker.layout.kv_col_start,
+        );
+
+        worker.dw_tmp.fill(0.0);
+        accumulate_dw(&cache.xnorm, dim, &worker.dv, kv_dim_shard, seq, &mut worker.dw_tmp[..dim * kv_dim_shard]);
+        scatter_dw_columns(
+            &mut grads.dwv,
+            dim,
+            kv_dim,
+            &worker.dw_tmp[..dim * kv_dim_shard],
+            kv_dim_shard,
+            worker.layout.kv_col_start,
+        );
+
+        vdsp::vadd(&worker.dx_attn, &worker.dx_kv, &mut runtime.merge_tmp);
+        vdsp::vadd(&runtime.dx_merged, &runtime.merge_tmp, &mut worker.dx_attn);
+        runtime.dx_merged.copy_from_slice(&worker.dx_attn);
     }
 }
 
@@ -1599,9 +2020,10 @@ pub fn backward_into_with_training_ffn(
     grads: &mut LayerGrads,
     ws: &mut BackwardWorkspace,
     dx_out: &mut [f32],
+    sharded_attn: Option<&mut ShardedAttentionBackwardRuntime>,
     sharded_ffn: Option<&mut ShardedFfnBackwardRuntime>,
 ) {
-    if sharded_ffn.is_none() {
+    if sharded_ffn.is_none() && sharded_attn.is_none() {
         backward_into(cfg, kernels, weights, cache, dy, grads, ws, dx_out);
         return;
     }
@@ -1614,9 +2036,63 @@ pub fn backward_into_with_training_ffn(
     let hd = cfg.hd;
     let alpha = 1.0 / (2.0 * cfg.nlayers as f32).sqrt();
 
-    let sharded_ffn = sharded_ffn.expect("training sharded FFN backward runtime present");
-    run_sharded_ffn_backward_into(cfg, weights, cache, dy, grads, ws, sharded_ffn);
-    ws.dx_ffn.copy_from_slice(&sharded_ffn.dx_ffn);
+    if let Some(sharded_ffn) = sharded_ffn {
+        run_sharded_ffn_backward_into(cfg, weights, cache, dy, grads, ws, sharded_ffn);
+        ws.dx_ffn.copy_from_slice(&sharded_ffn.dx_ffn);
+    } else {
+        // Baseline FFN backward section only.
+        let hidden = cfg.hidden;
+        let w2t_sp = dyn_matmul::spatial_width(seq, hidden);
+        {
+            let mut locked = kernels.bufs.ffn_bwd_w2t_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            stage_spatial(buf, dim, w2t_sp, &ws.dffn, seq, 0);
+            stage_spatial(buf, dim, w2t_sp, &weights.w2, hidden, seq);
+        }
+        kernels
+            .ffn_bwd_w2t
+            .run_cached_direct(
+                &[&kernels.bufs.ffn_bwd_w2t_in],
+                &[&kernels.bufs.ffn_bwd_w2t_out],
+            )
+            .expect("ANE eval failed");
+        {
+            let locked = kernels.bufs.ffn_bwd_w2t_out.as_f32_slice();
+            ws.dsilu_raw.copy_from_slice(&locked[..hidden * seq]);
+        }
+        for i in 0..ws.dsilu_raw.len() {
+            let sig = 1.0 / (1.0 + (-cache.h1[i]).exp());
+            let silu_val = cache.h1[i] * sig;
+            let silu_deriv = sig * (1.0 + cache.h1[i] * (1.0 - sig));
+            ws.dh3[i] = ws.dsilu_raw[i] * silu_val;
+            ws.dh1[i] = ws.dsilu_raw[i] * cache.h3[i] * silu_deriv;
+        }
+        accumulate_dw(&ws.dffn, dim, &cache.gate, hidden, seq, &mut grads.dw2);
+        accumulate_dw(&cache.x2norm, dim, &ws.dh1, hidden, seq, &mut grads.dw1);
+        accumulate_dw(&cache.x2norm, dim, &ws.dh3, hidden, seq, &mut grads.dw3);
+        let w13t_sp = dyn_matmul::dual_spatial_width(seq, dim);
+        {
+            vdsp::mtrans(&weights.w1, hidden, &mut ws.w1t, dim, dim, hidden);
+            vdsp::mtrans(&weights.w3, hidden, &mut ws.w3t, dim, dim, hidden);
+            let mut locked = kernels.bufs.ffn_bwd_w13t_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            stage_spatial(buf, hidden, w13t_sp, &ws.dh1, seq, 0);
+            stage_spatial(buf, hidden, w13t_sp, &ws.dh3, seq, seq);
+            stage_spatial(buf, hidden, w13t_sp, &ws.w1t, dim, 2 * seq);
+            stage_spatial(buf, hidden, w13t_sp, &ws.w3t, dim, 2 * seq + dim);
+        }
+        kernels
+            .ffn_bwd_w13t
+            .run_cached_direct(
+                &[&kernels.bufs.ffn_bwd_w13t_in],
+                &[&kernels.bufs.ffn_bwd_w13t_out],
+            )
+            .expect("ANE eval failed");
+        {
+            let locked = kernels.bufs.ffn_bwd_w13t_out.as_f32_slice();
+            ws.dx_ffn.copy_from_slice(&locked[..dim * seq]);
+        }
+    }
 
     rmsnorm::backward_channel_first(
         &ws.dx_ffn,
@@ -1633,176 +2109,181 @@ pub fn backward_into_with_training_ffn(
     ws.dx2.copy_from_slice(&ws.dx2_tmp);
 
     vdsp::vsmul(&ws.dx2, alpha, &mut ws.dx2_scaled);
-    let wot_sp = dyn_matmul::spatial_width(seq, q_dim);
-    {
-        vdsp::mtrans(&weights.wo, dim, &mut ws.wot, q_dim, q_dim, dim);
-        let mut locked = kernels.bufs.wot_bwd_in.as_f32_slice_mut();
-        let buf = &mut *locked;
-        stage_spatial(buf, dim, wot_sp, &ws.dx2_scaled, seq, 0);
-        stage_spatial(buf, dim, wot_sp, &ws.wot, q_dim, seq);
-    }
-    let bwd1_in_ch = sdpa_bwd::bwd1_input_channels(cfg);
-    let bwd1_out_ch = sdpa_bwd::bwd1_output_channels(cfg);
-    std::thread::scope(|s| {
-        let ane_handle = s.spawn(|| {
-            kernels
-                .wot_bwd
-                .run_cached_direct(&[&kernels.bufs.wot_bwd_in], &[&kernels.bufs.wot_bwd_out])
-                .expect("ANE eval failed");
+    if let Some(sharded_attn) = sharded_attn {
+        run_sharded_attention_backward_into(cfg, weights, cache, ws, grads, sharded_attn);
+        ws.dx_merged.copy_from_slice(&sharded_attn.dx_merged);
+    } else {
+        let wot_sp = dyn_matmul::spatial_width(seq, q_dim);
+        {
+            vdsp::mtrans(&weights.wo, dim, &mut ws.wot, q_dim, q_dim, dim);
+            let mut locked = kernels.bufs.wot_bwd_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            stage_spatial(buf, dim, wot_sp, &ws.dx2_scaled, seq, 0);
+            stage_spatial(buf, dim, wot_sp, &ws.wot, q_dim, seq);
+        }
+        let bwd1_in_ch = sdpa_bwd::bwd1_input_channels(cfg);
+        let bwd1_out_ch = sdpa_bwd::bwd1_output_channels(cfg);
+        std::thread::scope(|s| {
+            let ane_handle = s.spawn(|| {
+                kernels
+                    .wot_bwd
+                    .run_cached_direct(&[&kernels.bufs.wot_bwd_in], &[&kernels.bufs.wot_bwd_out])
+                    .expect("ANE eval failed");
+            });
+            {
+                let mut locked = kernels.bufs.sdpa_bwd1_in.as_f32_slice_mut();
+                let buf = &mut *locked;
+                pack_channels(buf, bwd1_in_ch, seq, &cache.q_rope, q_dim, 0);
+                pack_channels(buf, bwd1_in_ch, seq, &cache.k_rope, q_dim, q_dim);
+                pack_channels(buf, bwd1_in_ch, seq, &cache.v, q_dim, 2 * q_dim);
+            }
+            ane_handle.join().expect("ANE thread panicked");
         });
+        {
+            let locked = kernels.bufs.wot_bwd_out.as_f32_slice();
+            ws.da.copy_from_slice(&locked[..q_dim * seq]);
+        }
+
         {
             let mut locked = kernels.bufs.sdpa_bwd1_in.as_f32_slice_mut();
             let buf = &mut *locked;
-            pack_channels(buf, bwd1_in_ch, seq, &cache.q_rope, q_dim, 0);
-            pack_channels(buf, bwd1_in_ch, seq, &cache.k_rope, q_dim, q_dim);
-            pack_channels(buf, bwd1_in_ch, seq, &cache.v, q_dim, 2 * q_dim);
+            pack_channels(buf, bwd1_in_ch, seq, &ws.da, q_dim, 3 * q_dim);
         }
-        ane_handle.join().expect("ANE thread panicked");
-    });
-    {
-        let locked = kernels.bufs.wot_bwd_out.as_f32_slice();
-        ws.da.copy_from_slice(&locked[..q_dim * seq]);
-    }
 
-    {
-        let mut locked = kernels.bufs.sdpa_bwd1_in.as_f32_slice_mut();
-        let buf = &mut *locked;
-        pack_channels(buf, bwd1_in_ch, seq, &ws.da, q_dim, 3 * q_dim);
-    }
-
-    std::thread::scope(|s| {
-        let ane_handle = s.spawn(|| {
-            kernels
-                .sdpa_bwd1
-                .run_cached_direct(
-                    &[&kernels.bufs.sdpa_bwd1_in],
-                    &[&kernels.bufs.sdpa_bwd1_out],
-                )
-                .expect("ANE eval failed");
+        std::thread::scope(|s| {
+            let ane_handle = s.spawn(|| {
+                kernels
+                    .sdpa_bwd1
+                    .run_cached_direct(
+                        &[&kernels.bufs.sdpa_bwd1_in],
+                        &[&kernels.bufs.sdpa_bwd1_out],
+                    )
+                    .expect("ANE eval failed");
+            });
+            accumulate_dw(
+                &cache.attn_out,
+                q_dim,
+                &ws.dx2_scaled,
+                dim,
+                seq,
+                &mut grads.dwo,
+            );
+            ane_handle.join().expect("ANE thread panicked");
         });
-        accumulate_dw(
-            &cache.attn_out,
-            q_dim,
-            &ws.dx2_scaled,
-            dim,
-            seq,
-            &mut grads.dwo,
-        );
-        ane_handle.join().expect("ANE thread panicked");
-    });
 
-    let score_ch = heads * seq;
-    {
-        let locked = kernels.bufs.sdpa_bwd1_out.as_f32_slice();
-        read_channels_into(&locked, bwd1_out_ch, seq, 0, q_dim, &mut ws.dv_full);
-        read_channels_into(
-            &locked,
-            bwd1_out_ch,
-            seq,
-            q_dim,
-            score_ch,
-            &mut ws.probs_flat,
-        );
-        read_channels_into(
-            &locked,
-            bwd1_out_ch,
-            seq,
-            q_dim + score_ch,
-            score_ch,
-            &mut ws.dp_flat,
-        );
-    }
-
-    let bwd2_in_ch = sdpa_bwd::bwd2_input_channels(cfg);
-    let bwd2_out_ch = sdpa_bwd::bwd2_output_channels(cfg);
-    {
-        let mut locked = kernels.bufs.sdpa_bwd2_in.as_f32_slice_mut();
-        let buf = &mut *locked;
-        pack_channels(buf, bwd2_in_ch, seq, &ws.probs_flat, score_ch, 0);
-        pack_channels(buf, bwd2_in_ch, seq, &ws.dp_flat, score_ch, score_ch);
-        pack_channels(buf, bwd2_in_ch, seq, &cache.q_rope, q_dim, 2 * score_ch);
-        pack_channels(
-            buf,
-            bwd2_in_ch,
-            seq,
-            &cache.k_rope,
-            q_dim,
-            2 * score_ch + q_dim,
-        );
-    }
-    std::thread::scope(|s| {
-        let ane_handle = s.spawn(|| {
-            kernels
-                .sdpa_bwd2
-                .run_cached_direct(
-                    &[&kernels.bufs.sdpa_bwd2_in],
-                    &[&kernels.bufs.sdpa_bwd2_out],
-                )
-                .expect("ANE eval failed");
-        });
-        vdsp::mtrans(&weights.wq, q_dim, &mut ws.wqt, dim, dim, q_dim);
-        vdsp::mtrans(&weights.wk, kv_dim, &mut ws.wkt, dim, dim, kv_dim);
-        vdsp::mtrans(&weights.wv, kv_dim, &mut ws.wvt, dim, dim, kv_dim);
-        ane_handle.join().expect("ANE thread panicked");
-    });
-    {
-        let locked = kernels.bufs.sdpa_bwd2_out.as_f32_slice();
-        read_channels_into(&locked, bwd2_out_ch, seq, 0, q_dim, &mut ws.dq);
-        read_channels_into(&locked, bwd2_out_ch, seq, q_dim, q_dim, &mut ws.dk);
-    }
-
-    rope_backward_inplace(&mut ws.dq, heads, hd, seq, &kernels.rope);
-    rope_backward_inplace(&mut ws.dk, heads, hd, seq, &kernels.rope);
-
-    let kv_bwd_sp = dyn_matmul::dual_spatial_width(seq, dim);
-    {
-        let mut locked = kernels.bufs.kv_bwd_in.as_f32_slice_mut();
-        let buf = &mut *locked;
-        for c in 0..kv_dim {
-            let row = c * kv_bwd_sp;
-            buf[row..row + seq].copy_from_slice(&ws.dk[c * seq..c * seq + seq]);
-            buf[row + seq..row + 2 * seq].copy_from_slice(&ws.dv_full[c * seq..c * seq + seq]);
-            buf[row + 2 * seq..row + 2 * seq + dim]
-                .copy_from_slice(&ws.wkt[c * dim..c * dim + dim]);
-            buf[row + 2 * seq + dim..row + 2 * seq + 2 * dim]
-                .copy_from_slice(&ws.wvt[c * dim..c * dim + dim]);
+        let score_ch = heads * seq;
+        {
+            let locked = kernels.bufs.sdpa_bwd1_out.as_f32_slice();
+            read_channels_into(&locked, bwd1_out_ch, seq, 0, q_dim, &mut ws.dv_full);
+            read_channels_into(
+                &locked,
+                bwd1_out_ch,
+                seq,
+                q_dim,
+                score_ch,
+                &mut ws.probs_flat,
+            );
+            read_channels_into(
+                &locked,
+                bwd1_out_ch,
+                seq,
+                q_dim + score_ch,
+                score_ch,
+                &mut ws.dp_flat,
+            );
         }
-    }
 
-    let q_bwd_sp = dyn_matmul::spatial_width(seq, dim);
-    {
-        let mut locked = kernels.bufs.q_bwd_in.as_f32_slice_mut();
-        let buf = &mut *locked;
-        stage_spatial(buf, q_dim, q_bwd_sp, &ws.dq, seq, 0);
-        stage_spatial(buf, q_dim, q_bwd_sp, &ws.wqt, dim, seq);
-    }
-
-    std::thread::scope(|s| {
-        let ane_handle = s.spawn(|| {
-            kernels
-                .q_bwd
-                .run_cached_direct(&[&kernels.bufs.q_bwd_in], &[&kernels.bufs.q_bwd_out])
-                .expect("ANE eval failed");
-            kernels
-                .kv_bwd
-                .run_cached_direct(&[&kernels.bufs.kv_bwd_in], &[&kernels.bufs.kv_bwd_out])
-                .expect("ANE eval failed");
+        let bwd2_in_ch = sdpa_bwd::bwd2_input_channels(cfg);
+        let bwd2_out_ch = sdpa_bwd::bwd2_output_channels(cfg);
+        {
+            let mut locked = kernels.bufs.sdpa_bwd2_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            pack_channels(buf, bwd2_in_ch, seq, &ws.probs_flat, score_ch, 0);
+            pack_channels(buf, bwd2_in_ch, seq, &ws.dp_flat, score_ch, score_ch);
+            pack_channels(buf, bwd2_in_ch, seq, &cache.q_rope, q_dim, 2 * score_ch);
+            pack_channels(
+                buf,
+                bwd2_in_ch,
+                seq,
+                &cache.k_rope,
+                q_dim,
+                2 * score_ch + q_dim,
+            );
+        }
+        std::thread::scope(|s| {
+            let ane_handle = s.spawn(|| {
+                kernels
+                    .sdpa_bwd2
+                    .run_cached_direct(
+                        &[&kernels.bufs.sdpa_bwd2_in],
+                        &[&kernels.bufs.sdpa_bwd2_out],
+                    )
+                    .expect("ANE eval failed");
+            });
+            vdsp::mtrans(&weights.wq, q_dim, &mut ws.wqt, dim, dim, q_dim);
+            vdsp::mtrans(&weights.wk, kv_dim, &mut ws.wkt, dim, dim, kv_dim);
+            vdsp::mtrans(&weights.wv, kv_dim, &mut ws.wvt, dim, dim, kv_dim);
+            ane_handle.join().expect("ANE thread panicked");
         });
-        accumulate_dw(&cache.xnorm, dim, &ws.dq, q_dim, seq, &mut grads.dwq);
-        accumulate_dw(&cache.xnorm, dim, &ws.dk, kv_dim, seq, &mut grads.dwk);
-        accumulate_dw(&cache.xnorm, dim, &ws.dv_full, kv_dim, seq, &mut grads.dwv);
-        ane_handle.join().expect("ANE thread panicked");
-    });
-    {
-        let locked = kernels.bufs.q_bwd_out.as_f32_slice();
-        ws.dx_attn.copy_from_slice(&locked[..dim * seq]);
-    }
-    {
-        let locked = kernels.bufs.kv_bwd_out.as_f32_slice();
-        ws.dx_kv.copy_from_slice(&locked[..dim * seq]);
-    }
+        {
+            let locked = kernels.bufs.sdpa_bwd2_out.as_f32_slice();
+            read_channels_into(&locked, bwd2_out_ch, seq, 0, q_dim, &mut ws.dq);
+            read_channels_into(&locked, bwd2_out_ch, seq, q_dim, q_dim, &mut ws.dk);
+        }
 
-    vdsp::vadd(&ws.dx_attn, &ws.dx_kv, &mut ws.dx_merged);
+        rope_backward_inplace(&mut ws.dq, heads, hd, seq, &kernels.rope);
+        rope_backward_inplace(&mut ws.dk, heads, hd, seq, &kernels.rope);
+
+        let kv_bwd_sp = dyn_matmul::dual_spatial_width(seq, dim);
+        {
+            let mut locked = kernels.bufs.kv_bwd_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            for c in 0..kv_dim {
+                let row = c * kv_bwd_sp;
+                buf[row..row + seq].copy_from_slice(&ws.dk[c * seq..c * seq + seq]);
+                buf[row + seq..row + 2 * seq].copy_from_slice(&ws.dv_full[c * seq..c * seq + seq]);
+                buf[row + 2 * seq..row + 2 * seq + dim]
+                    .copy_from_slice(&ws.wkt[c * dim..c * dim + dim]);
+                buf[row + 2 * seq + dim..row + 2 * seq + 2 * dim]
+                    .copy_from_slice(&ws.wvt[c * dim..c * dim + dim]);
+            }
+        }
+
+        let q_bwd_sp = dyn_matmul::spatial_width(seq, dim);
+        {
+            let mut locked = kernels.bufs.q_bwd_in.as_f32_slice_mut();
+            let buf = &mut *locked;
+            stage_spatial(buf, q_dim, q_bwd_sp, &ws.dq, seq, 0);
+            stage_spatial(buf, q_dim, q_bwd_sp, &ws.wqt, dim, seq);
+        }
+
+        std::thread::scope(|s| {
+            let ane_handle = s.spawn(|| {
+                kernels
+                    .q_bwd
+                    .run_cached_direct(&[&kernels.bufs.q_bwd_in], &[&kernels.bufs.q_bwd_out])
+                    .expect("ANE eval failed");
+                kernels
+                    .kv_bwd
+                    .run_cached_direct(&[&kernels.bufs.kv_bwd_in], &[&kernels.bufs.kv_bwd_out])
+                    .expect("ANE eval failed");
+            });
+            accumulate_dw(&cache.xnorm, dim, &ws.dq, q_dim, seq, &mut grads.dwq);
+            accumulate_dw(&cache.xnorm, dim, &ws.dk, kv_dim, seq, &mut grads.dwk);
+            accumulate_dw(&cache.xnorm, dim, &ws.dv_full, kv_dim, seq, &mut grads.dwv);
+            ane_handle.join().expect("ANE thread panicked");
+        });
+        {
+            let locked = kernels.bufs.q_bwd_out.as_f32_slice();
+            ws.dx_attn.copy_from_slice(&locked[..dim * seq]);
+        }
+        {
+            let locked = kernels.bufs.kv_bwd_out.as_f32_slice();
+            ws.dx_kv.copy_from_slice(&locked[..dim * seq]);
+        }
+
+        vdsp::vadd(&ws.dx_attn, &ws.dx_kv, &mut ws.dx_merged);
+    }
     rmsnorm::backward_channel_first(
         &ws.dx_merged,
         &cache.x,
