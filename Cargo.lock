@@ -40,6 +40,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 [[package]]
 name = "ane"
 version = "0.1.0"
+source = "git+https://github.com/ncdrone/ane#15a41afbf5ac106e05853035b50a45cc598f62a3"
 dependencies = [
  "half",
  "hf-hub",

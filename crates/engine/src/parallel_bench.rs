@@ -136,8 +136,8 @@ fn compile_with_iosurface_retry<T>(
     for attempt in 1..=max_attempts {
         match f() {
             Ok(result) => return Ok(result),
-            Err(err) => match err {
-                AneError::IOSurfaceAlloc { .. } => {
+            Err(err) => {
+                if is_iosurface_retryable(&err) {
                     if attempt == max_attempts {
                         eprintln!(
                             "      ✗ {label} failed after {max_attempts} attempts, giving up"
@@ -148,12 +148,17 @@ fn compile_with_iosurface_retry<T>(
                         "      ⚠ {label}: IOSurface allocation failed (attempt {attempt}/{max_attempts}), retrying in 2s..."
                     );
                     thread::sleep(Duration::from_secs(2));
+                } else {
+                    return Err(err);
                 }
-                _ => return Err(err),
-            },
+            }
         }
     }
     unreachable!()
+}
+
+fn is_iosurface_retryable(err: &AneError) -> bool {
+    matches!(err, AneError::SurfaceWrap) || err.to_string().contains("IOSurface")
 }
 
 impl ParallelBenchRunner {
